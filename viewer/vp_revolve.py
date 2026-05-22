@@ -12,7 +12,7 @@ Expects self to have:
 """
 
 from __future__ import annotations
-
+from PyQt6.QtCore import pyqtSlot
 
 class RevolveMixin:
 
@@ -86,6 +86,8 @@ class RevolveMixin:
         self._revolve_face_active   = False
         self._revolve_body_active   = False
         self._revolve_preview_mesh  = None
+        self._revolve_cage_wires    = None
+        self._revolve_cage_key      = None
         self._revolve_arrow_origin  = None
         self._revolve_arrow_dir     = None
         self._revolve_face_centroid = None
@@ -99,10 +101,9 @@ class RevolveMixin:
 
     def _on_revolve_preview(self, angle: float, axis_point, axis_dir):
         import numpy as np
-        from cad.operations.revolve import _do_revolve_solid
 
         if axis_point is None or axis_dir is None or angle == 0:
-            self._revolve_preview_mesh = None
+            self._revolve_cage_wires   = None
             self._revolve_arrow_origin = None
             self._revolve_arrow_dir    = None
             self.update()
@@ -131,21 +132,128 @@ class RevolveMixin:
                     faces.append(all_f[fi])
 
         if not faces:
-            self._revolve_preview_mesh = None
+            self._revolve_cage_wires   = None
             self._revolve_arrow_origin = None
             self._revolve_arrow_dir    = None
-            self.update(); return
+            self.update()
+            return
 
-        try:
-            self._revolve_preview_mesh = [
-                _do_revolve_solid(f, axis_pt, axis_d, angle) for f in faces
-            ]
-        except Exception as ex:
-            print(f"[Revolve preview] {ex}")
-            self._revolve_preview_mesh = None
+        # Re-extract cage wires only when axis or faces change, not every angle tick.
+        cache_key = (tuple(axis_pt), tuple(axis_d), tuple(id(f) for f in faces))
+        if cache_key != getattr(self, '_revolve_cage_key', None):
+            self._revolve_cage_wires = _extract_face_wires(faces)
+            self._revolve_cage_key   = cache_key
+            self._revolve_preview_mesh = None  # axis/face changed — old mesh is wrong
+
+        # Store for use by mesh compute on release.
+        self._revolve_last_preview_params = (faces, axis_pt, axis_d, angle)
 
         self._update_revolve_arrow(faces, axis_pt, axis_d, angle)
+
+        # During arrow drag show cage only. When not dragging (spinbox, axis pick)
+        # kick off a mesh compute so the user sees a proper solid preview.
+        if not (getattr(self, '_drag_arrow_active', False)
+                and getattr(self, '_drag_arrow_op', None) == 'revolve'):
+            self._revolve_compute_mesh(faces, axis_pt, axis_d, angle)
+
         self.update()
+
+    def _revolve_compute_mesh(self, faces, axis_pt, axis_d, angle):
+        """Spawn a background worker to build the mesh. One at a time — newer
+        params overwrite pending; stale results are dropped via gen counter."""
+        gen = getattr(self, '_revolve_mesh_gen', 0) + 1
+        self._revolve_mesh_gen     = gen
+        self._revolve_mesh_pending = (faces, axis_pt, axis_d, angle, gen)
+        if getattr(self, '_revolve_mesh_inflight', False):
+            return
+        self._revolve_mesh_inflight = True
+        self._revolve_mesh_gen      = gen
+
+        def _compute():
+            from cad.operations.revolve import _do_revolve_solid
+            from OCP.BRepMesh import BRepMesh_IncrementalMesh
+            from OCP.BRep import BRep_Tool
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
+            from OCP.TopoDS import TopoDS
+            from OCP.TopLoc import TopLoc_Location
+            from OCP.BRepAdaptor import BRepAdaptor_Curve
+            from OCP.GCPnts import GCPnts_UniformAbscissa
+            solids   = [_do_revolve_solid(f, axis_pt, axis_d, angle) for f in faces]
+            tris_list  = []
+            edges_list = []
+            identity   = TopLoc_Location()
+            for solid in solids:
+                wrapped = solid.wrapped
+                BRepMesh_IncrementalMesh(wrapped, 1.0)
+                tris = []
+                exp = TopExp_Explorer(wrapped, TopAbs_FACE)
+                while exp.More():
+                    face = TopoDS.Face_s(exp.Current())
+                    tri  = BRep_Tool.Triangulation_s(face, identity)
+                    if tri is not None:
+                        for i in range(1, tri.NbTriangles() + 1):
+                            n1, n2, n3 = tri.Triangle(i).Get()
+                            for ni in (n1, n2, n3):
+                                p = tri.Node(ni)
+                                tris.append((p.X(), p.Y(), p.Z()))
+                    exp.Next()
+                tris_list.append(tris)
+                edges = []
+                exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
+                while exp2.More():
+                    edge = TopoDS.Edge_s(exp2.Current())
+                    try:
+                        adp  = BRepAdaptor_Curve(edge)
+                        disc = GCPnts_UniformAbscissa()
+                        disc.Initialize(adp, 16)
+                        if disc.IsDone() and disc.NbPoints() >= 2:
+                            pts = []
+                            for pi in range(1, disc.NbPoints() + 1):
+                                p = adp.Value(disc.Parameter(pi))
+                                pts.append((p.X(), p.Y(), p.Z()))
+                            edges.append(pts)
+                    except Exception:
+                        pass
+                    exp2.Next()
+                edges_list.append(edges)
+            return tris_list, edges_list
+
+        def _deliver(result, finished_gen):
+            self._revolve_mesh_inflight = False
+            if getattr(self, '_revolve_mesh_gen', 0) == finished_gen:
+                self._revolve_preview_mesh = result
+                self.update()
+            # Fire once more if newer params arrived while we were computing.
+            pending = getattr(self, '_revolve_mesh_pending', None)
+            if pending is not None and pending[4] != finished_gen:
+                pfaces, ppt, pd, pangle, _ = pending
+                self._revolve_compute_mesh(pfaces, ppt, pd, pangle)
+
+        def _worker():
+            try:
+                result = _compute()
+                err    = None
+            except Exception as ex:
+                result = None
+                err    = ex
+            if err is not None:
+                print(f"[Revolve preview] {err}")
+            from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+            QMetaObject.invokeMethod(
+                self, "_revolve_mesh_deliver",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG(object, _deliver),
+                Q_ARG(object, result),
+                Q_ARG(object, gen),
+            )
+
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @pyqtSlot(object, object, object)
+    def _revolve_mesh_deliver(self, deliver_fn, result, finished_gen):
+        deliver_fn(result, finished_gen)
 
     def _update_revolve_arrow(self, faces, axis_pt, axis_d, angle_deg: float):
         """Compute arrow position at the swept tip of the revolve."""
@@ -204,75 +312,116 @@ class RevolveMixin:
         self._revolve_arrow_dir    = tan_rot
 
     def _draw_revolve_preview(self):
-        solids = getattr(self, '_revolve_preview_mesh', None)
-        if solids:
-            from OCP.BRep import BRep_Tool
-            from OCP.BRepMesh import BRepMesh_IncrementalMesh
-            from OCP.TopExp import TopExp_Explorer
-            from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
-            from OCP.TopoDS import TopoDS
-            from OCP.TopLoc import TopLoc_Location
-            from OCP.BRepAdaptor import BRepAdaptor_Curve
-            from OCP.GCPnts import GCPnts_UniformAbscissa
-            from OpenGL.GL import (glDisable, glEnable, glColor4f, glBegin, glEnd,
-                                   glVertex3f, glLineWidth, glBlendFunc,
-                                   GL_LIGHTING, GL_DEPTH_TEST, GL_CULL_FACE,
-                                   GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-                                   GL_TRIANGLES, GL_LINE_STRIP)
-            from cad.prefs import prefs as _prefs
-            r, g, b = _prefs.op_preview_color
-            op = _prefs.op_preview_opacity
-            fill_color = (r, g, b, op)
-            edge_color = (min(r+0.23, 1.0), min(g+0.30, 1.0), min(b+0.15, 1.0), min(op+0.35, 1.0))
+        from OpenGL.GL import (glDisable, glEnable, glColor4f, glBegin, glEnd,
+                               glVertex3f, glLineWidth, glBlendFunc,
+                               GL_LIGHTING, GL_DEPTH_TEST, GL_CULL_FACE,
+                               GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                               GL_TRIANGLES, GL_LINE_STRIP)
+        from cad.prefs import prefs as _prefs
+        r, g, b = _prefs.op_preview_color
+        op = _prefs.op_preview_opacity
+        edge_color = (min(r+0.23, 1.0), min(g+0.30, 1.0), min(b+0.15, 1.0), min(op+0.35, 1.0))
 
-            glDisable(GL_LIGHTING)
-            glEnable(GL_DEPTH_TEST)
-            glDisable(GL_CULL_FACE)
-            glEnable(GL_BLEND)
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDisable(GL_LIGHTING)
+        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-            for solid in solids:
-                try:
-                    wrapped = solid.wrapped
-                    BRepMesh_IncrementalMesh(wrapped, 0.15)
-                    _identity = TopLoc_Location()
-                    glColor4f(*fill_color)
-                    exp = TopExp_Explorer(wrapped, TopAbs_FACE)
-                    while exp.More():
-                        face = TopoDS.Face_s(exp.Current())
-                        tri  = BRep_Tool.Triangulation_s(face, _identity)
-                        if tri is not None:
-                            glBegin(GL_TRIANGLES)
-                            for i in range(1, tri.NbTriangles() + 1):
-                                n1, n2, n3 = tri.Triangle(i).Get()
-                                for ni in (n1, n2, n3):
-                                    p = tri.Node(ni)
-                                    glVertex3f(p.X(), p.Y(), p.Z())
-                            glEnd()
-                        exp.Next()
-                    glColor4f(*edge_color)
-                    glLineWidth(1.4)
-                    exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
-                    while exp2.More():
-                        edge = exp2.Current()
-                        try:
-                            adp  = BRepAdaptor_Curve(edge)
-                            disc = GCPnts_UniformAbscissa()
-                            disc.Initialize(adp, 24)
-                            if disc.IsDone() and disc.NbPoints() >= 2:
-                                glBegin(GL_LINE_STRIP)
-                                for pi in range(1, disc.NbPoints() + 1):
-                                    p = adp.Value(disc.Parameter(pi))
-                                    glVertex3f(p.X(), p.Y(), p.Z())
-                                glEnd()
-                        except Exception:
-                            pass
-                        exp2.Next()
-                    glLineWidth(1.0)
-                except Exception as ex:
-                    print(f"[Revolve preview draw] {ex}")
+        mesh_data = getattr(self, '_revolve_preview_mesh', None)
+        if mesh_data:
+            tris_list, edges_list = mesh_data
+            glColor4f(r, g, b, op)
+            for tris in tris_list:
+                if tris:
+                    glBegin(GL_TRIANGLES)
+                    for (x, y, z) in tris:
+                        glVertex3f(x, y, z)
+                    glEnd()
+            glColor4f(*edge_color)
+            glLineWidth(1.4)
+            for edges in edges_list:
+                for pts in edges:
+                    glBegin(GL_LINE_STRIP)
+                    for (x, y, z) in pts:
+                        glVertex3f(x, y, z)
+                    glEnd()
+            glLineWidth(1.0)
+        else:
+            self._draw_revolve_cage(edge_color)
 
         self._draw_revolve_arrow()
+
+    def _draw_revolve_cage(self, edge_color):
+        """Instant wireframe cage: profile at 0°, profile at angle°, arc lines
+        per vertex. Pure python math — no OCCT, no tessellation."""
+        import math
+        import numpy as np
+        from OpenGL.GL import (glColor4f, glBegin, glEnd, glVertex3f,
+                               glLineWidth, GL_LINE_STRIP)
+
+        wires    = getattr(self, '_revolve_cage_wires', None)
+        angle    = getattr(self, '_revolve_preview_angle', 0.0)
+        axis_pt  = getattr(self, '_revolve_axis_point',   None)
+        axis_d   = getattr(self, '_revolve_axis_dir',     None)
+        if not wires or axis_pt is None or axis_d is None or angle == 0:
+            return
+
+        ap = np.asarray(axis_pt, dtype=float)
+        ad = np.asarray(axis_d,  dtype=float)
+        a  = math.radians(angle)
+
+        def rotate_pt(p):
+            """Rodrigues rotation of point p around axis by angle a."""
+            v   = p - ap
+            par = np.dot(v, ad) * ad
+            perp = v - par
+            if np.linalg.norm(perp) < 1e-12:
+                return p
+            perp_rot = (math.cos(a) * perp
+                        + math.sin(a) * np.cross(ad, perp))
+            return ap + par + perp_rot
+
+        ARC_STEPS = 12
+
+        glColor4f(*edge_color)
+        glLineWidth(1.2)
+
+        for wire in wires:
+            # Profile at angle=0
+            if len(wire) >= 2:
+                glBegin(GL_LINE_STRIP)
+                for p in wire:
+                    glVertex3f(*p)
+                glEnd()
+
+            # Profile at current angle (rotate each point)
+            rotated = [rotate_pt(np.asarray(p)) for p in wire]
+            if len(rotated) >= 2:
+                glBegin(GL_LINE_STRIP)
+                for p in rotated:
+                    glVertex3f(float(p[0]), float(p[1]), float(p[2]))
+                glEnd()
+
+            # Arc lines from each wire vertex, sweeping 0→angle
+            for p in wire:
+                pv   = np.asarray(p, dtype=float)
+                v    = pv - ap
+                par  = np.dot(v, ad) * ad
+                perp = v - par
+                r    = np.linalg.norm(perp)
+                if r < 1e-10:
+                    continue
+                glBegin(GL_LINE_STRIP)
+                for i in range(ARC_STEPS + 1):
+                    t = a * i / ARC_STEPS
+                    perp_rot = (math.cos(t) * perp
+                                + math.sin(t) * np.cross(ad, perp))
+                    q = ap + par + perp_rot
+                    glVertex3f(float(q[0]), float(q[1]), float(q[2]))
+                glEnd()
+
+        glLineWidth(1.0)
 
     def _draw_revolve_arrow(self):
         from viewer.drag_arrow import DragArrow
@@ -717,3 +866,38 @@ class RevolveMixin:
 
         self._rebuild_all_meshes()
         self.history_changed.emit()
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _extract_face_wires(faces) -> list:
+    """Discretize the boundary edges of each face into point lists.
+    Returns a list of polylines: [ [(x,y,z), ...], ... ]
+    Called on the main thread — no revolve, just edge sampling."""
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopoDS import TopoDS
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GCPnts import GCPnts_UniformAbscissa
+
+    wires = []
+    for face in faces:
+        exp = TopExp_Explorer(face.wrapped, TopAbs_EDGE)
+        while exp.More():
+            edge = TopoDS.Edge_s(exp.Current())
+            try:
+                adp  = BRepAdaptor_Curve(edge)
+                disc = GCPnts_UniformAbscissa()
+                disc.Initialize(adp, 24)
+                if disc.IsDone() and disc.NbPoints() >= 2:
+                    pts = []
+                    for i in range(1, disc.NbPoints() + 1):
+                        p = adp.Value(disc.Parameter(i))
+                        pts.append((p.X(), p.Y(), p.Z()))
+                    wires.append(pts)
+            except Exception:
+                pass
+            exp.Next()
+    return wires

@@ -626,6 +626,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._drag_arrow_axis_origin = np.asarray(arrow_origin, dtype=float)
         self._drag_arrow_active      = True
         self._drag_arrow_op          = 'revolve'
+        self._revolve_preview_mesh   = None  # drop mesh so cage shows during drag
         return True
 
     def _hit_fillet3d_arrow(self, mx: int, my: int) -> bool:
@@ -1440,8 +1441,14 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self._drag_arrow_active:
+            was_revolve = (self._drag_arrow_op == 'revolve')
             self._drag_arrow_active      = False
             self._drag_arrow_axis_origin = None
+            if was_revolve:
+                params = getattr(self, '_revolve_last_preview_params', None)
+                if params is not None:
+                    self._revolve_preview_mesh = None  # drop stale mesh, show cage until new one lands
+                    self._revolve_compute_mesh(*params)
             return
         if e.button() == Qt.MouseButton.LeftButton and self._dragging_label is not None:
             mx, my = int(e.position().x()), int(e.position().y())
