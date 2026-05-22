@@ -50,19 +50,21 @@ _BORDER_DIVERGED = "#6e5a20"
 _BORDER_ERROR  = "#8a2020"
 
 _OP_ACCENT = {
-    "import":  "#505050",
-    "extrude": "#3a6e44",
-    "cut":     "#6e3a3a",
-    "sketch":  "#4a6e8a",
+    "import":      "#505050",
+    "extrude":     "#3a6e44",
+    "cut":         "#6e3a3a",
+    "sketch":      "#4a6e8a",
+    "revolve_cut": "#6e3a3a",
 }
 
 
 def _op_icon(op: str) -> str:
     return {
-        "import":  "⬡",
-        "extrude": "▲",
-        "cut":     "▼",
-        "sketch":  "⬜",
+        "import":      "⬡",
+        "extrude":     "▲",
+        "cut":         "▼",
+        "sketch":      "⬜",
+        "revolve_cut": "▼",
     }.get(op, "•")
 
 
@@ -205,7 +207,8 @@ class _EntryWidget(QFrame):
 
         from cad.units import format_op_label
         lbl_text = (format_op_label(entry.operation, entry.params)
-                    if entry.operation in ("extrude", "cut")
+                    if entry.operation in ("extrude", "cut",
+                                            "revolve", "revolve_cut")
                     else entry.label)
         if entry.editing:
             lbl_text = "✎ " + lbl_text
@@ -546,8 +549,8 @@ class HistoryPanel(QWidget):
             self.reopen_thicken_requested.emit(index)
             return
 
-        # Revolve: reopen RevolvePanel
-        if entry.operation == "revolve":
+        # Revolve / revolve-cut: reopen RevolvePanel
+        if entry.operation in ("revolve", "revolve_cut"):
             if index > self._history.cursor:
                 QMessageBox.information(
                     self, "Can't edit future entry",

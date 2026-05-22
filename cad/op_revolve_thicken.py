@@ -2,7 +2,7 @@
 cad/op_revolve_thicken.py
 
 Revolve and thicken operation types:
-  ThickenOp, FaceRevolveOp, SketchRevolveOp
+  ThickenOp, FaceRevolveOp, SketchRevolveOp, CrossBodyRevolveCutOp
 """
 
 from __future__ import annotations
@@ -689,4 +689,285 @@ class SketchRevolveOp(Op):
             merge_body_id  = params.get("merge_body_id"),
             face_indices   = params.get("face_indices"),
             face_centroids = params.get("face_centroids"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# CrossBodyRevolveCutOp  —  revolve a sketch profile and cut another body
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CrossBodyRevolveCutOp(Op):
+    """
+    Revolve a sketch profile around an axis to form a tool solid, then
+    BRepAlgoAPI_Cut it from *cut_body_id*.  Mirrors CrossBodyCutOp for the
+    revolve operation.
+
+    cut_body_id      : body being cut
+    source_sketch_id : entry_id of the sketch entry whose profile is revolved
+                       (sketch-driven cuts only — face-driven revolve cuts go
+                       through this same op with source_sketch_id=None and a
+                       source_body_id+source_face_idx pair, for symmetry with
+                       CrossBodyCutOp; unimplemented for now)
+    source_body_id   : sketch's parent body (informational; not used for cut)
+    angle_deg        : revolution arc in degrees
+    axis_point       : world-space point on the rotation axis
+    axis_dir         : unit direction of the rotation axis
+    """
+    cut_body_id      : str
+    source_body_id   : str  | None       = None
+    source_sketch_id : str  | None       = None
+    angle_deg        : float = 360.0
+    axis_point       : list[float] | None = None
+    axis_dir         : list[float] | None = None
+    face_indices     : list[int]   | None = None
+    face_centroids   : list[list[float]] | None = None
+
+    # Used by Op._push_failed_entry to tag the failed history entry correctly
+    # (the base class's fallback otherwise produces "crossbodyrevolvecut").
+    _op_str = "revolve_cut"
+
+    def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
+        import numpy as np
+        from cad.operations.revolve import _do_revolve_solid
+        from build123d import Compound
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+        from OCP.TopTools import TopTools_ListOfShape
+
+        if self.source_sketch_id is None:
+            raise RuntimeError("CrossBodyRevolveCutOp: no source_sketch_id")
+        sketch_idx = history.id_to_index(self.source_sketch_id)
+        if sketch_idx is None:
+            raise RuntimeError(
+                f"CrossBodyRevolveCutOp: sketch entry '{self.source_sketch_id}' not found")
+        sketch_rec = history._entries[sketch_idx]
+        if sketch_rec.error:
+            raise RuntimeError(
+                "CrossBodyRevolveCutOp: source sketch entry is in an error state")
+        se = sketch_rec.params.get("sketch_entry")
+        if se is None:
+            raise RuntimeError(
+                f"CrossBodyRevolveCutOp: no sketch_entry at id '{self.source_sketch_id}'")
+
+        # Reproject the sketch's plane at *this* op's history position so
+        # intervening edits on the parent face move the profile with it.
+        if se.plane_source is not None:
+            from cad.history import _replay_sketch_entry
+            ok, err = _replay_sketch_entry(se, history, before_index=entry_index)
+            if not ok:
+                raise RuntimeError(
+                    f"CrossBodyRevolveCutOp: sketch reprojection failed: {err}")
+
+        all_faces, all_regions = se.build_faces()
+        if not all_faces:
+            raise RuntimeError("CrossBodyRevolveCutOp: sketch has no closed loops")
+
+        if self.face_centroids:
+            from cad.op_base import _match_face_by_centroid
+            centroids = np.array(self.face_centroids, dtype=float)
+            faces = [_match_face_by_centroid(t, all_faces, all_regions,
+                                             "CrossBodyRevolveCutOp")
+                     for t in centroids]
+        elif self.face_indices is not None:
+            faces = [all_faces[i] for i in self.face_indices if i < len(all_faces)]
+            if not faces:
+                raise RuntimeError("CrossBodyRevolveCutOp: stored face indices out of range")
+        else:
+            faces = all_faces
+
+        axis_pt  = np.array(self.axis_point, dtype=float)
+        axis_dir = np.array(self.axis_dir,   dtype=float)
+
+        tool = None
+        for face in faces:
+            s = _do_revolve_solid(face, axis_pt, axis_dir, self.angle_deg)
+            if tool is None:
+                tool = s
+            else:
+                lst_a = TopTools_ListOfShape(); lst_a.Append(tool.wrapped)
+                lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
+                fu = BRepAlgoAPI_Fuse()
+                fu.SetArguments(lst_a); fu.SetTools(lst_b)
+                fu.SetRunParallel(True); fu.Build()
+                if fu.IsDone():
+                    tool = Compound(fu.Shape())
+
+        lst_a = TopTools_ListOfShape(); lst_a.Append(shape.wrapped)
+        lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
+        op = BRepAlgoAPI_Cut()
+        op.SetArguments(lst_a); op.SetTools(lst_b)
+        op.SetRunParallel(True); op.Build()
+        if not op.IsDone():
+            raise RuntimeError("CrossBodyRevolveCutOp: boolean cut failed")
+        return Compound(op.Shape())
+
+    def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
+        try:
+            compute, finalize = self._split_commit(viewport, extra_params)
+        except Exception as ex:
+            print(f"[Op] FAILED: {ex}")
+            self._push_failed_entry(viewport, str(ex), extra_params)
+            return None
+        try:
+            shape_after = compute()
+        except Exception as ex:
+            print(f"[Op] FAILED: {ex}")
+            shape_after = None
+            viewport._pending_op_error = str(ex)
+        else:
+            viewport._pending_op_error = None
+        try:
+            finalize(shape_after)
+        finally:
+            viewport._pending_op_error = None
+        return shape_after
+
+    def _split_commit(self, viewport: Any, extra_params: dict | None = None):
+        import numpy as np
+        from cad.operations.revolve import _do_revolve_solid
+        from build123d import Compound
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+        from OCP.TopTools import TopTools_ListOfShape
+
+        if self.source_sketch_id is None:
+            raise RuntimeError("[Revolve cut] No source_sketch_id.")
+        entries = viewport.history.entries
+        sketch_idx = viewport.history.id_to_index(self.source_sketch_id)
+        if sketch_idx is None:
+            raise RuntimeError(
+                f"[Revolve cut] Sketch entry '{self.source_sketch_id}' not found.")
+        se = entries[sketch_idx].params.get("sketch_entry")
+        if se is None:
+            raise RuntimeError("[Revolve cut] No sketch_entry.")
+        all_sketch = viewport._sketch_faces.get(sketch_idx, [])
+        if not all_sketch:
+            raise RuntimeError("[Revolve cut] Sketch has no faces.")
+
+        fidx = viewport._selected_sketch_face
+        if fidx is not None:
+            face_indices = [i for i in fidx if 0 <= i < len(all_sketch)]
+        else:
+            face_indices = list(range(len(all_sketch)))
+        faces = [all_sketch[i][0] for i in face_indices]
+
+        def _uv_centroid(outer_uvs):
+            arr = np.array(outer_uvs)
+            return arr.mean(axis=0).tolist()
+        face_centroids = [_uv_centroid(all_sketch[i][1]) for i in face_indices]
+
+        target_shape = viewport.workspace.current_shape(self.cut_body_id)
+        if target_shape is None:
+            raise RuntimeError("[Revolve cut] Target body has no shape.")
+        original_solid_count = len(list(target_shape.solids()))
+        target_occ = target_shape.wrapped
+
+        axis_pt  = np.array(self.axis_point, dtype=float)
+        axis_dir = np.array(self.axis_dir,   dtype=float)
+        angle    = self.angle_deg
+
+        op_params = self.to_params()
+        op_params["face_indices"]   = face_indices
+        op_params["face_centroids"] = face_centroids
+        if extra_params:
+            op_params.update(extra_params)
+
+        def compute():
+            tool = None
+            for face in faces:
+                s = _do_revolve_solid(face, axis_pt, axis_dir, angle)
+                if tool is None:
+                    tool = s
+                else:
+                    lst_a = TopTools_ListOfShape(); lst_a.Append(tool.wrapped)
+                    lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
+                    fu = BRepAlgoAPI_Fuse()
+                    fu.SetArguments(lst_a); fu.SetTools(lst_b)
+                    fu.SetRunParallel(True); fu.Build()
+                    if fu.IsDone():
+                        tool = Compound(fu.Shape())
+            lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
+            lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
+            op = BRepAlgoAPI_Cut()
+            op.SetArguments(lst_a); op.SetTools(lst_b)
+            op.SetRunParallel(True); op.Build()
+            if not op.IsDone():
+                raise RuntimeError("Revolve cut failed.")
+            return Compound(op.Shape())
+
+        def finalize(result):
+            _push_result(viewport, "revolve_cut", op_params, self.cut_body_id,
+                         None, target_shape, result, original_solid_count,
+                         split_key="split_from")
+            viewport._selected_sketch_entry = None
+            viewport._selected_sketch_face  = None
+
+        return compute, finalize
+
+    def reopen(self, viewport: Any, history_idx: int) -> None:
+        import numpy as np
+        entry      = viewport.history.entries[history_idx]
+        vp         = viewport
+        sketch_idx = (vp.history.id_to_index(self.source_sketch_id)
+                      if self.source_sketch_id is not None else None)
+
+        if history_idx > 0:
+            vp.history.seek(history_idx - 1)
+            vp._rebuild_all_meshes()
+        vp.history_changed.emit()
+
+        if sketch_idx is not None:
+            vp._selected_sketch_entry = sketch_idx
+            vp._selected_sketch_face  = (list(self.face_indices)
+                                          if self.face_indices else None)
+
+        vp._show_revolve_panel(sketch_idx=sketch_idx, editing_entry=entry)
+
+        panel = vp._revolve_panel
+        if panel is None:
+            return
+
+        if self.axis_point is not None and self.axis_dir is not None:
+            panel.set_axis(
+                np.array(self.axis_point, dtype=float),
+                np.array(self.axis_dir,   dtype=float))
+        panel._angle_spinbox.set_mm(abs(self.angle_deg))
+
+        panel._radio_cut.setChecked(True)
+        panel._on_mode_changed(1)
+
+        if self.cut_body_id in vp.workspace.bodies:
+            panel.set_merge_body(
+                self.cut_body_id,
+                vp.workspace.bodies[self.cut_body_id].name)
+
+        panel._emit_preview()
+
+    def to_params(self) -> dict:
+        p: dict[str, Any] = {
+            "angle_deg":   self.angle_deg,
+            "cut_body_id": self.cut_body_id,
+            "axis_point":  self.axis_point,
+            "axis_dir":    self.axis_dir,
+        }
+        if self.source_body_id is not None:
+            p["source_body_id"] = self.source_body_id
+        if self.source_sketch_id is not None:
+            p["source_sketch_id"] = self.source_sketch_id
+        if self.face_indices is not None:
+            p["face_indices"] = self.face_indices
+        if self.face_centroids is not None:
+            p["face_centroids"] = self.face_centroids
+        return p
+
+    @classmethod
+    def _from_params(cls, params: dict) -> "CrossBodyRevolveCutOp":
+        return cls(
+            cut_body_id      = params.get("cut_body_id", ""),
+            source_body_id   = params.get("source_body_id"),
+            source_sketch_id = params.get("source_sketch_id"),
+            angle_deg        = float(params.get("angle_deg", 360.0)),
+            axis_point       = params.get("axis_point"),
+            axis_dir         = params.get("axis_dir"),
+            face_indices     = params.get("face_indices"),
+            face_centroids   = params.get("face_centroids"),
         )

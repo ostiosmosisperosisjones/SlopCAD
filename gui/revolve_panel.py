@@ -93,8 +93,8 @@ _SEP_STYLE = "background: #333;"
 
 
 class RevolvePanel(QWidget):
-    revolve_requested    = pyqtSignal(float, object, object, object, object)
-    # (angle_deg, axis_point|None, axis_dir|None, merge_body_id|None, "__new_body__")
+    # (angle_deg, axis_point|None, axis_dir|None, merge_body_id|None|"__new_body__", is_cut)
+    revolve_requested    = pyqtSignal(float, object, object, object, bool)
     cancelled            = pyqtSignal()
     picking_axis_changed = pyqtSignal(bool)   # True while user picks an axis edge/line
     picking_face_changed = pyqtSignal(bool)
@@ -123,6 +123,7 @@ class RevolvePanel(QWidget):
         self._axis_point     : np.ndarray | None = None   # world-space point on axis
         self._axis_dir       : np.ndarray | None = None   # stored unit axis (unflipped)
         self._merge_body_id  : str | None = None
+        self._self_cut       : bool = True   # cleared once user picks a target body
 
         self._preview_timer      = QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -144,7 +145,7 @@ class RevolvePanel(QWidget):
         root.setSpacing(10)
         root.setContentsMargins(14, 12, 14, 12)
 
-        title = QLabel("Revolve")
+        title = QLabel("Revolve / Cut")
         title.setObjectName("title")
         root.addWidget(title)
 
@@ -165,6 +166,23 @@ class RevolvePanel(QWidget):
         self._face_list = SelectionList(empty_text="No profile selected")
         self._face_list.entry_removed.connect(self.face_entry_removed)
         root.addWidget(self._face_list)
+
+        root.addWidget(self._separator())
+
+        # ── Mode (Revolve / Cut) ──────────────────────────────────────
+        root.addWidget(self._section_label("Mode"))
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        self._radio_revolve = QRadioButton("Revolve")
+        self._radio_cut     = QRadioButton("Cut")
+        self._radio_revolve.setChecked(True)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self._radio_revolve, 0)
+        self._mode_group.addButton(self._radio_cut,     1)
+        self._mode_group.idClicked.connect(self._on_mode_changed)
+        mode_row.addWidget(self._radio_revolve)
+        mode_row.addWidget(self._radio_cut)
+        root.addLayout(mode_row)
 
         root.addWidget(self._separator())
 
@@ -212,8 +230,16 @@ class RevolvePanel(QWidget):
 
         root.addWidget(self._separator())
 
-        # ── Operation (New Body / Merge with) ─────────────────────────
-        root.addWidget(self._section_label("Operation"))
+        # ── Operation (Revolve: New Body / Merge with) ────────────────
+        self._op_section_label = self._section_label("Operation")
+        root.addWidget(self._op_section_label)
+
+        # Revolve operation widget
+        self._revolve_op_widget = QWidget()
+        revolve_op_layout = QVBoxLayout(self._revolve_op_widget)
+        revolve_op_layout.setContentsMargins(0, 0, 0, 0)
+        revolve_op_layout.setSpacing(6)
+
         self._radio_new   = QRadioButton("New Body")
         self._radio_merge = QRadioButton("Merge with")
         self._radio_new.setChecked(True)
@@ -221,7 +247,7 @@ class RevolvePanel(QWidget):
         self._op_group.addButton(self._radio_new,   0)
         self._op_group.addButton(self._radio_merge, 1)
         self._op_group.idClicked.connect(self._on_op_changed)
-        root.addWidget(self._radio_new)
+        revolve_op_layout.addWidget(self._radio_new)
 
         merge_row = QHBoxLayout()
         merge_row.setSpacing(6)
@@ -236,7 +262,25 @@ class RevolvePanel(QWidget):
         self._body_label.setStyleSheet(
             "color: #888; font-size: 11px; font-family: monospace;")
         merge_row.addWidget(self._body_label)
-        root.addLayout(merge_row)
+        revolve_op_layout.addLayout(merge_row)
+        root.addWidget(self._revolve_op_widget)
+
+        # Cut operation widget — "Cut from: <pick body>" (blank = no-target)
+        self._cut_op_widget = QWidget()
+        cut_op_layout = QHBoxLayout(self._cut_op_widget)
+        cut_op_layout.setContentsMargins(0, 0, 0, 0)
+        cut_op_layout.setSpacing(6)
+        self._pick_cut_body_btn = QPushButton("Pick Body")
+        self._pick_cut_body_btn.setObjectName("pick_body")
+        self._pick_cut_body_btn.setCheckable(True)
+        self._pick_cut_body_btn.clicked.connect(self._on_pick_body_toggle)
+        cut_op_layout.addWidget(self._pick_cut_body_btn)
+        self._cut_body_label = QLabel("—")
+        self._cut_body_label.setStyleSheet(
+            "color: #888; font-size: 11px; font-family: monospace;")
+        cut_op_layout.addWidget(self._cut_body_label)
+        root.addWidget(self._cut_op_widget)
+        self._cut_op_widget.hide()
 
         root.addWidget(self._separator())
 
@@ -293,10 +337,15 @@ class RevolvePanel(QWidget):
         self._emit_preview()
 
     def set_merge_body(self, body_id: str, body_name: str):
+        """Called by viewport when the user picks a target body for merge/cut."""
         self._merge_body_id = body_id
+        self._self_cut = False
         self._end_pick_body()
         self._body_label.setText(body_name)
         self._body_label.setStyleSheet(
+            "color: #7ab3d4; font-size: 11px; font-family: monospace;")
+        self._cut_body_label.setText(body_name)
+        self._cut_body_label.setStyleSheet(
             "color: #7ab3d4; font-size: 11px; font-family: monospace;")
 
     # ------------------------------------------------------------------
@@ -323,6 +372,21 @@ class RevolvePanel(QWidget):
         if angle is None:
             return
         self.preview_changed.emit(float(angle), self._axis_point, self._effective_axis_dir)
+
+    def _on_mode_changed(self, btn_id: int):
+        is_cut = btn_id == 1
+        self._revolve_op_widget.setVisible(not is_cut)
+        self._cut_op_widget.setVisible(is_cut)
+        # Reset target body so the user must re-pick (or accept self-cut)
+        self._merge_body_id = None
+        self._self_cut = True
+        self._body_label.setText("—")
+        self._body_label.setStyleSheet(
+            "color: #888; font-size: 11px; font-family: monospace;")
+        self._cut_body_label.setText("—")
+        self._cut_body_label.setStyleSheet(
+            "color: #888; font-size: 11px; font-family: monospace;")
+        self._emit_preview()
 
     def _on_op_changed(self, btn_id: int):
         self._pick_body_btn.setEnabled(btn_id == 1)
@@ -406,20 +470,26 @@ class RevolvePanel(QWidget):
         if angle is None or angle == 0:
             return
 
-        op_id = self._op_group.checkedId()
-        if op_id == 1:
-            if self._merge_body_id is None:
-                return
-            merge_body_id = self._merge_body_id
+        is_cut = self._mode_group.checkedId() == 1
+        if is_cut:
+            # Cross-body cut requires a picked target; self-cut/no-target is
+            # allowed (merge_body_id=None signals fan-out across intersections).
+            merge_body_id = self._merge_body_id  # None for self/no-target
         else:
-            merge_body_id = "__new_body__"
+            op_id = self._op_group.checkedId()
+            if op_id == 1:
+                if self._merge_body_id is None:
+                    return
+                merge_body_id = self._merge_body_id
+            else:
+                merge_body_id = "__new_body__"
 
         self.revolve_requested.emit(
             float(angle),
             self._axis_point,
             self._effective_axis_dir,
             merge_body_id,
-            None,
+            is_cut,
         )
 
     # ------------------------------------------------------------------

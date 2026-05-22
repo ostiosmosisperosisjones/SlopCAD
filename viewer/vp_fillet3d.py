@@ -485,7 +485,14 @@ class Fillet3DMixin:
             self.history_changed.emit()
             return
 
-        removable = group_body_ids - {body_id}
+        # Only remove bodies *created* by this op group (split children).
+        # The source body and any unrelated bodies must stay.
+        group_entry_ids = {entries[j].entry_id for j in group_indices}
+        removable = set()
+        for bid in group_body_ids:
+            body = self.workspace.bodies.get(bid)
+            if body is not None and body.created_at_entry_id in group_entry_ids:
+                removable.add(bid)
         for j in reversed(group_indices):
             self.history.delete(j)
         for bid in removable:

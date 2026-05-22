@@ -58,4 +58,7 @@ def format_op_label(operation: str, params: dict) -> str:
     if operation == "revolve":
         angle = params.get("angle_deg", 360)
         return f"Revolve  {angle:.1f}°"
+    if operation == "revolve_cut":
+        angle = params.get("angle_deg", 360)
+        return f"Revolve cut  {angle:.1f}°"
     return operation.capitalize()

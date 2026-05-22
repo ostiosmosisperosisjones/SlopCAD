@@ -589,7 +589,8 @@ class ExtrudeMixin:
                 group_indices.append(j)
                 group_body_ids.add(e.body_id)
 
-        # Determine which bodies are "sources" that should NOT be removed.
+        # Source bodies — used only by the pre-commit guard below to ensure
+        # the op's input still has a valid shape at idx-1.
         body_id  = face_pairs[0][0] if face_pairs else None
         face_idx = face_pairs[0][1] if face_pairs else None
         if sketch_idx is not None:
@@ -615,8 +616,18 @@ class ExtrudeMixin:
                     return
 
         # --- Step 3: delete group entries back-to-front + remove created bodies.
+        # A body is removable only if it was *created* by this op group —
+        # i.e. its workspace.Body.created_at_entry_id points to one of the
+        # group entries. Pre-existing bodies (cut targets, extrude sources,
+        # STEP imports) must never be removed, even when they appear in
+        # group_body_ids because the op was logged under them.
         child_body_ids = entry.params.get("child_body_ids", [])
-        removable_bodies = (group_body_ids - src_bodies) | set(child_body_ids)
+        group_entry_ids = {entries[j].entry_id for j in group_indices}
+        removable_bodies = set()
+        for bid in group_body_ids | set(child_body_ids):
+            body = self.workspace.bodies.get(bid)
+            if body is not None and body.created_at_entry_id in group_entry_ids:
+                removable_bodies.add(bid)
         for j in reversed(group_indices):
             self.history.delete(j)
         for bid in removable_bodies:
@@ -629,6 +640,20 @@ class ExtrudeMixin:
 
         sketch_id = (self.history.index_to_id(sketch_idx)
                      if sketch_idx is not None else None)
+
+        if is_cut and merge_body_id is None:
+            # No-target cut: fan out one CrossBodyCutOp per intersecting body.
+            # Mirrors the fresh-commit path in _on_extrude_panel_ok so an edit
+            # that lands on "self-cut" mode behaves like the original tool.
+            self._do_cut_all_intersecting(dist, direction, sketch_idx,
+                                          body_id, face_idx, extra)
+            new_idx = self.history.cursor
+            ok, err, _ = self.history.replay_all_from(new_idx + 1)
+            if not ok:
+                print(f"[Edit] Downstream replay failed: {err}")
+            self._rebuild_all_meshes()
+            self.history_changed.emit()
+            return
 
         if is_cut and merge_body_id not in (None, "__new_body__"):
             src_body_for_cut = (original_op.source_body_id
@@ -797,17 +822,13 @@ class ExtrudeMixin:
     def _do_cut_all_intersecting(self, dist, direction, sketch_idx,
                                  body_id, face_idx, extra):
         """
-        No-target cut: build the tool solid once, then push a CrossBodyCutOp
-        entry for every workspace body the tool intersects.
-
-        Bodies whose bbox doesn't overlap the tool's are skipped cheaply.
-        Bodies where the boolean Cut produces no real volume change have
-        their just-pushed entry rolled back so the history panel stays clean.
+        No-target cut: build the extrude tool solid once, then fan out one
+        CrossBodyCutOp per workspace body it intersects (see cad.cut_all).
         """
         import numpy as np
         from cad.op_types import CrossBodyCutOp
         from cad.operations.extrude import _do_extrude_solid
-        from cad.cut_all import bboxes_overlap
+        from cad.cut_all import fan_out_cut
         from build123d import Plane, Compound
         from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
         from OCP.TopTools import TopTools_ListOfShape
@@ -868,33 +889,12 @@ class ExtrudeMixin:
         except Exception as ex:
             print(f"[Cut] Tool construction failed: {ex}"); return
 
-        tool_bbox = tool_solid.bounding_box()
-        candidates: list[str] = []
-        for bid in self.workspace.bodies.keys():
-            bshape = self.workspace.current_shape(bid)
-            if bshape is None:
-                continue
-            try:
-                if bboxes_overlap(bshape.bounding_box(), tool_bbox):
-                    candidates.append(bid)
-            except Exception:
-                candidates.append(bid)   # bbox failed — let the cut decide
-
-        if not candidates:
-            print("[Cut] No-target cut: tool doesn't intersect any body."); return
-
         sketch_id = (self.history.index_to_id(sketch_idx)
                      if sketch_idx is not None else None)
         dir_list = direction.tolist() if direction is not None else None
 
-        # ---- Fan out: one CrossBodyCutOp.commit per candidate body ---------
-        n_cut = 0
-        for bid in candidates:
-            shape_before = self.workspace.current_shape(bid)
-            vol_before   = (sum(s.volume for s in shape_before.solids())
-                            if shape_before is not None else 0.0)
-
-            op = CrossBodyCutOp(
+        def build_op(bid: str):
+            return CrossBodyCutOp(
                 cut_body_id      = bid,
                 source_body_id   = src_body_id,
                 source_face_idx  = face_idx,
@@ -905,23 +905,8 @@ class ExtrudeMixin:
                 start_offset     = start_off,
                 end_offset       = end_off,
             )
-            op.commit(self, extra)
 
-            # Roll back if the bbox prefilter was a false positive.
-            shape_after = self.workspace.current_shape(bid)
-            vol_after   = (sum(s.volume for s in shape_after.solids())
-                           if shape_after is not None else 0.0)
-            if abs(vol_after - vol_before) < 1e-3 and self.history.entries:
-                last_idx = len(self.history.entries) - 1
-                if self.history.entries[last_idx].body_id == bid:
-                    self.history.delete(last_idx)
-            else:
-                n_cut += 1
-
-        if n_cut == 0:
-            print("[Cut] No-target cut: tool didn't actually intersect any body.")
-        else:
-            print(f"[Cut] No-target cut applied to {n_cut} body/bodies.")
+        fan_out_cut(self, tool_solid, build_op, extra, op_label="Cut")
 
     def do_extrude(self, face_pairs, distance: float,
                    direction=None, merge_body_id: str | None = None,

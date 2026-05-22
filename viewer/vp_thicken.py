@@ -400,7 +400,15 @@ class ThickenMixin:
             self.history_changed.emit()
             return
 
-        removable_bodies = group_body_ids - {body_id}
+        # Only remove bodies *created* by this op group (split children).
+        # The source body and any unrelated bodies in group_body_ids must
+        # stay — they existed before this op.
+        group_entry_ids = {entries[j].entry_id for j in group_indices}
+        removable_bodies = set()
+        for bid in group_body_ids:
+            body = self.workspace.bodies.get(bid)
+            if body is not None and body.created_at_entry_id in group_entry_ids:
+                removable_bodies.add(bid)
         for j in reversed(group_indices):
             self.history.delete(j)
         for bid in removable_bodies:
