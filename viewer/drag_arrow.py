@@ -4,6 +4,9 @@ viewer/drag_arrow.py
 DragArrow — a 3-D arrow rendered on top of everything (depth test off)
 that can be hit-tested against a ray for mouse dragging.
 
+Pass the surface/anchor point as `origin`.  The disc sits at `origin` on
+the surface; the shaft and cone extend outward along `direction`.
+
 Usage:
     arrow = DragArrow()
     arrow.draw(origin, direction, scale)          # call from paintGL
@@ -24,7 +27,7 @@ _SHAFT_RADIUS  = 0.045
 _SHAFT_LENGTH  = 0.62
 _CONE_RADIUS   = 0.11
 _CONE_LENGTH   = 0.30
-_BASE_DISC_RADIUS = 0.13   # flat disc at the base for easier clicking
+_BASE_DISC_RADIUS = 0.13   # flat disc at the base, sits on the surface
 
 
 def _rotation_to(direction: np.ndarray):
@@ -61,8 +64,9 @@ def _circle_pts(radius: float, n: int) -> list[tuple[float, float]]:
 
 class DragArrow:
     """
-    Stateless helper — all geometry is derived from (origin, direction, scale)
-    passed per-draw.  Thread-safe (no mutable state).
+    Stateless helper — all geometry is derived from (origin, direction, scale).
+    The disc sits at `origin` on the surface; shaft and cone extend along
+    `direction`. Thread-safe (no mutable state).
     """
 
     # ------------------------------------------------------------------
@@ -70,10 +74,11 @@ class DragArrow:
     # ------------------------------------------------------------------
 
     def draw(self, origin: np.ndarray, direction: np.ndarray,
-             scale: float, color: tuple[float, float, float] = (0.95, 0.85, 0.15)):
+             scale: float, color: tuple[float, float, float] = (0.95, 0.85, 0.15),
+             surface_clearance: float = 0.0):
         """
-        Draw the arrow at `origin` pointing along `direction`.
-        `scale` is the total arrow length in world units.
+        Draw the arrow with its disc at `origin`, shaft and cone extending along `direction`.
+        `surface_clearance` (in units of `scale`) shifts the whole arrow outward if needed.
         Renders with depth test OFF so it is always on top.
         """
         from OpenGL.GL import (
@@ -84,8 +89,13 @@ class DragArrow:
             GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, glBlendFunc,
         )
 
+        d_unit = np.asarray(direction, dtype=float)
+        d_unit = d_unit / np.linalg.norm(d_unit)
+
+        # lz=0 (disc, shaft base) sits at origin + clearance offset; cone tip further out.
+        o = np.asarray(origin, dtype=float) + d_unit * surface_clearance * scale
+
         R = _rotation_to(direction)
-        o = np.asarray(origin, dtype=float)
 
         def xf(lx, ly, lz):
             p = o + R @ np.array([lx, ly, lz]) * scale
@@ -147,23 +157,23 @@ class DragArrow:
             xf(cx * cr, cy * cr, sl)
         glEnd()
 
-        # ── Base disc (click target at origin) ─────────────────────────
-        bd = _BASE_DISC_RADIUS
+        # ── Base disc (sits on the surface at lz=0) ────────────────────
+        td = _BASE_DISC_RADIUS
         glColor4f(r, g, b, 0.55)
         glBegin(GL_TRIANGLE_FAN)
         xf(0, 0, 0)
         for cx, cy in circle + [circle[0]]:
-            xf(cx * bd, cy * bd, 0.0)
+            xf(cx * td, cy * td, 0.0)
         glEnd()
 
-        # Outline rings for clarity
+        # Outline ring for clarity
         glColor4f(0.0, 0.0, 0.0, 0.55)
         glLineWidth(1.0)
         glBegin(GL_LINES)
         prev = circle[-1]
         for cx, cy in circle:
-            xf(prev[0] * bd, prev[1] * bd, 0.0)
-            xf(cx * bd, cy * bd, 0.0)
+            xf(prev[0] * td, prev[1] * td, 0.0)
+            xf(cx * td, cy * td, 0.0)
             prev = (cx, cy)
         glEnd()
 
@@ -176,36 +186,27 @@ class DragArrow:
     # ------------------------------------------------------------------
 
     def hit_test(self, ray_origin: np.ndarray, ray_dir: np.ndarray,
-                 arrow_origin: np.ndarray, arrow_dir: np.ndarray,
-                 scale: float) -> float | None:
+                 origin: np.ndarray, direction: np.ndarray,
+                 scale: float, surface_clearance: float = 0.0) -> float | None:
         """
-        Test whether `ray` hits the arrow's clickable cylinder
-        (shaft + cone together, plus the base disc).
-
-        Returns the signed scalar `t` along `arrow_dir` at the closest
-        hit point if within the hit radius, else None.
-        `t` corresponds to the fraction of `scale` travelled: multiply
-        by the current distance to get the drag delta.
+        Test whether `ray` hits the arrow.
+        `origin`, `direction`, `scale`, `surface_clearance` must match draw().
+        Returns signed scalar `t` along `direction` if hit, else None.
         """
-        o = np.asarray(ray_origin, dtype=float)
-        d = np.asarray(ray_dir,    dtype=float)
-        a = np.asarray(arrow_origin, dtype=float)
-        ax = np.asarray(arrow_dir,   dtype=float)
+        o  = np.asarray(ray_origin,  dtype=float)
+        d  = np.asarray(ray_dir,     dtype=float)
+        ax = np.asarray(direction,   dtype=float)
         ax = ax / np.linalg.norm(ax)
+
+        # shaft base = origin + clearance * scale * ax  (same as draw())
+        a = np.asarray(origin, dtype=float) + ax * surface_clearance * scale
 
         # Hit radius = cone radius in world units (generous for usability)
         hit_r = _CONE_RADIUS * scale * 1.5
         total_len = (_SHAFT_LENGTH + _CONE_LENGTH) * scale
 
-        # Build local frame: ax is local Z; pick an orthonormal X, Y.
-        R = _rotation_to(ax)
-        rx, ry = R[:, 0], R[:, 1]
-
         # Relative ray origin in local frame
         rel = o - a
-        # Project ray onto the plane perpendicular to ax
-        # Ray in local: p(t) = rel + d*t
-        # Perpendicular component (x,y in local): p_xy(t) = (rel - dot(rel,ax)*ax) + (d - dot(d,ax)*ax)*t
         d_ax   = float(np.dot(d,   ax))
         rel_ax = float(np.dot(rel, ax))
 
@@ -218,19 +219,16 @@ class DragArrow:
         c_coef = float(np.dot(rel_perp,  rel_perp)) - hit_r ** 2
 
         if a_coef < 1e-14:
-            # Ray parallel to arrow axis — check if it's inside the cylinder
             if c_coef > 0:
                 return None
-            # Use closest point on axis
             ray_t = -rel_ax / d_ax if abs(d_ax) > 1e-10 else 0.0
         else:
             disc = b_coef * b_coef - 4.0 * a_coef * c_coef
             if disc < 0:
-                return None  # ray misses cylinder
+                return None
             ray_t = (-b_coef - math.sqrt(disc)) / (2.0 * a_coef)
 
         if ray_t < 0:
-            # Try the far intersection
             if a_coef > 1e-14:
                 disc = b_coef * b_coef - 4.0 * a_coef * c_coef
                 ray_t = (-b_coef + math.sqrt(max(0.0, disc))) / (2.0 * a_coef)
@@ -238,15 +236,9 @@ class DragArrow:
                 return None
 
         hit_world = o + d * ray_t
-        # Local Z of hit point (position along arrow axis)
         local_z = float(np.dot(hit_world - a, ax))
 
         if local_z < -hit_r or local_z > total_len + hit_r:
-            return None  # outside arrow length
+            return None
 
-        # Also accept hits on the base disc (local_z ~ 0, any angle within disc)
-        # — already covered by the cylinder test above.
-
-        # Return local_z in scale units (fraction) — caller can use this
-        # to position their "drag origin" or just return the arrow tip position.
         return local_z / scale

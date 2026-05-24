@@ -6,6 +6,7 @@ Modelled after ExtrudePanel / ThickenPanel.
 """
 
 from __future__ import annotations
+from cad.prefs import prefs
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
@@ -95,8 +96,8 @@ class Fillet3DPanel(QWidget):
             Qt.WindowType.WindowStaysOnTopHint)
         self._viewport = parent
         self.setObjectName("Fillet3DPanel")
-        self.setStyleSheet(_PANEL_STYLE)
-        self.setFixedWidth(240)
+        self.setStyleSheet(prefs.scale_stylesheet(_PANEL_STYLE))
+        self.setMinimumWidth(prefs.scaled_px(240))
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         self._workspace     = workspace

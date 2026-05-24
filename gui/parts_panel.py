@@ -16,6 +16,7 @@ sketch_on_plane_requested(axis: str)
 """
 
 from __future__ import annotations
+from cad.prefs import prefs
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QScrollArea, QFrame, QSizePolicy, QMenu
@@ -72,23 +73,23 @@ class _PlaneRow(QFrame):
 
         self._eye = QPushButton(_EYE_ON if self._visible else _EYE_OFF)
         self._eye.setFixedSize(20, 20)
-        self._eye.setStyleSheet("""
+        self._eye.setStyleSheet(prefs.scale_stylesheet("""
             QPushButton { background: transparent; border: none;
                           color: #666; font-size: 13px; padding: 0; }
             QPushButton:hover { color: #aaa; }
-        """)
+        """))
         self._eye.clicked.connect(self._toggle)
         row.addWidget(self._eye)
 
         lbl = QLabel(_PLANE_LABEL[self._axis])
-        lbl.setStyleSheet(
+        lbl.setStyleSheet(prefs.scale_stylesheet(
             f"color: {_PLANE_COLOR[self._axis]}; font-size: 11px; "
-            "background: transparent; border: none;")
+            "background: transparent; border: none;"))
         lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         row.addWidget(lbl)
 
         hint = QLabel("✏")
-        hint.setStyleSheet("color: #333; font-size: 10px; background: transparent; border: none;")
+        hint.setStyleSheet(prefs.scale_stylesheet("color: #333; font-size: 10px; background: transparent; border: none;"))
         hint.setToolTip("Double-click to sketch on this plane")
         row.addWidget(hint)
 
@@ -140,11 +141,11 @@ class _WorldPlanesSection(QWidget):
 
         self._toggle_btn = QPushButton("▾")
         self._toggle_btn.setFixedSize(16, 16)
-        self._toggle_btn.setStyleSheet("""
+        self._toggle_btn.setStyleSheet(prefs.scale_stylesheet("""
             QPushButton { background: transparent; border: none;
                           color: #666; font-size: 10px; padding: 0; }
             QPushButton:hover { color: #aaa; }
-        """)
+        """))
         self._toggle_btn.clicked.connect(self._toggle_collapse)
         hdr_row.addWidget(self._toggle_btn)
 
@@ -152,18 +153,18 @@ class _WorldPlanesSection(QWidget):
         self._all_visible = True
         self._eye_all = QPushButton(_EYE_ON)
         self._eye_all.setFixedSize(20, 20)
-        self._eye_all.setStyleSheet("""
+        self._eye_all.setStyleSheet(prefs.scale_stylesheet("""
             QPushButton { background: transparent; border: none;
                           color: #666; font-size: 13px; padding: 0; }
             QPushButton:hover { color: #aaa; }
-        """)
+        """))
         self._eye_all.clicked.connect(self._toggle_all_visibility)
         hdr_row.addWidget(self._eye_all)
 
         title = QLabel("World Planes")
-        title.setStyleSheet(
+        title.setStyleSheet(prefs.scale_stylesheet(
             "color: #555; font-size: 11px; font-weight: bold; "
-            "letter-spacing: 1px; background: transparent; border: none;")
+            "letter-spacing: 1px; background: transparent; border: none;"))
         hdr_row.addWidget(title)
         hdr_row.addStretch()
         self._root.addWidget(hdr)
@@ -228,7 +229,7 @@ class _BodyRow(QFrame):
         # Visibility toggle
         self._eye_btn = QPushButton(_EYE_ON if self._visible else _EYE_OFF)
         self._eye_btn.setFixedSize(20, 20)
-        self._eye_btn.setStyleSheet("""
+        self._eye_btn.setStyleSheet(prefs.scale_stylesheet("""
             QPushButton {
                 background: transparent;
                 border: none;
@@ -237,21 +238,21 @@ class _BodyRow(QFrame):
                 padding: 0;
             }
             QPushButton:hover { color: #aaa; }
-        """)
+        """))
         self._eye_btn.clicked.connect(self._toggle_visibility)
         layout.addWidget(self._eye_btn)
 
         # Body icon
         icon = QLabel(_BODY_ICON)
-        icon.setStyleSheet(
-            "color: #4a90d9; font-size: 11px; background: transparent; border: none;")
+        icon.setStyleSheet(prefs.scale_stylesheet(
+            "color: #4a90d9; font-size: 11px; background: transparent; border: none;"))
         layout.addWidget(icon)
 
         # Name
         self._name_lbl = QLabel(name)
-        self._name_lbl.setStyleSheet(
+        self._name_lbl.setStyleSheet(prefs.scale_stylesheet(
             f"color: {_TEXT if self._visible else _TEXT_DIM}; "
-            f"font-size: 12px; background: transparent; border: none;")
+            f"font-size: 12px; background: transparent; border: none;"))
         self._name_lbl.setSizePolicy(QSizePolicy.Policy.Expanding,
                                      QSizePolicy.Policy.Preferred)
         layout.addWidget(self._name_lbl)
@@ -271,9 +272,9 @@ class _BodyRow(QFrame):
     def _toggle_visibility(self):
         self._visible = not self._visible
         self._eye_btn.setText(_EYE_ON if self._visible else _EYE_OFF)
-        self._name_lbl.setStyleSheet(
+        self._name_lbl.setStyleSheet(prefs.scale_stylesheet(
             f"color: {_TEXT if self._visible else _TEXT_DIM}; "
-            f"font-size: 12px; background: transparent; border: none;")
+            f"font-size: 12px; background: transparent; border: none;"))
         self.visibility_toggled.emit(self._body_id, self._visible)
 
     def set_selected(self, selected: bool):
@@ -343,15 +344,15 @@ class PartsPanel(QWidget):
         root.setSpacing(0)
 
         header = QLabel("  Parts")
-        header.setFixedHeight(28)
-        header.setStyleSheet("""
+        header.setFixedHeight(prefs.scaled_px(28))
+        header.setStyleSheet(prefs.scale_stylesheet("""
             background: #161616;
             color: #555;
             font-size: 11px;
             font-weight: bold;
             letter-spacing: 1px;
             border-bottom: 1px solid #2a2a2a;
-        """)
+        """))
         root.addWidget(header)
 
         # Pinned world-planes section

@@ -97,8 +97,8 @@ class ThickenPanel(QWidget):
             Qt.WindowType.WindowStaysOnTopHint)
         self._viewport = parent
         self.setObjectName("ThickenPanel")
-        self.setStyleSheet(_PANEL_STYLE)
-        self.setFixedWidth(240)
+        self.setStyleSheet(prefs.scale_stylesheet(_PANEL_STYLE))
+        self.setMinimumWidth(prefs.scaled_px(240))
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         self._picking_face : bool = False

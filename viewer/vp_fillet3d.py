@@ -21,24 +21,33 @@ class Fillet3DMixin:
 
     def _try_fillet(self):
         """Open the 3D fillet panel, pre-populated with the current selection."""
+        edges = self.selection.edges
         faces = self.selection.faces
-        if faces:
+
+        if edges:
+            body_id     = edges[0].body_id
+            edge_indices = [e.edge_idx for e in edges if e.body_id == body_id]
+            face_indices = []
+        elif faces:
             body_id = faces[0].body_id
             if any(f.body_id != body_id for f in faces):
                 print("[Fillet] All selected faces must be on the same body.")
                 return
             face_indices = [f.face_idx for f in faces]
+            edge_indices = []
         else:
             body_id      = None
             face_indices = []
-        self._show_fillet3d_panel(body_id, face_indices)
+            edge_indices = []
+        self._show_fillet3d_panel(body_id, face_indices, edge_indices=edge_indices)
 
     # ------------------------------------------------------------------
     # Panel lifecycle
     # ------------------------------------------------------------------
 
     def _show_fillet3d_panel(self, body_id: str | None, face_indices: list,
-                              editing_entry=None, radius: float = 1.0):
+                              editing_entry=None, radius: float = 1.0,
+                              edge_indices: list | None = None):
         from gui.fillet3d_panel import Fillet3DPanel
 
         if getattr(self, '_fillet3d_panel', None) is not None:
@@ -53,7 +62,7 @@ class Fillet3DMixin:
 
         self._fillet3d_body_id        = body_id
         self._fillet3d_face_indices   = list(face_indices)
-        self._fillet3d_edge_indices   = []
+        self._fillet3d_edge_indices   = list(edge_indices) if edge_indices else []
         self._fillet3d_preview_token  = None
         self._fillet3d_preview_mesh   = None
         self._fillet3d_computing      = False   # True while worker thread is running
@@ -70,13 +79,17 @@ class Fillet3DMixin:
         panel = Fillet3DPanel(self.workspace, parent=self)
         panel.set_radius(radius)
 
-        # Pre-populate face list from initial selection
+        # Pre-populate face and edge lists from initial selection
         if body_id is not None:
+            body = self.workspace.bodies.get(body_id)
+            name = body.name if body else body_id
             shape = self.workspace.current_shape(body_id)
             all_faces = list(shape.faces()) if shape is not None else []
             for fi in face_indices:
                 label = self._fillet3d_face_label(body_id, fi, all_faces)
                 panel.add_face_entry(body_id, fi, label)
+            for ei in self._fillet3d_edge_indices:
+                panel.add_edge_entry(body_id, ei, f"{name}  ·  edge {ei}")
 
         panel.confirmed.connect(self._on_fillet3d_ok)
         panel.cancelled.connect(self._close_fillet3d_panel)

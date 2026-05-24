@@ -5,6 +5,7 @@ OffsetPanel — small floating panel shown when the offset tool has a selection.
 """
 
 from __future__ import annotations
+from cad.prefs import prefs
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
 from PyQt6.QtCore import pyqtSignal, Qt
 
@@ -52,8 +53,8 @@ class OffsetPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("OffsetPanel")
-        self.setStyleSheet(_STYLE)
-        self.setFixedWidth(220)
+        self.setStyleSheet(prefs.scale_stylesheet(_STYLE))
+        self.setMinimumWidth(prefs.scaled_px(220))
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._build_ui()
 

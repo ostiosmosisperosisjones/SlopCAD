@@ -104,6 +104,16 @@ def main():
     app.setStyle("Fusion")   # Fusion renders cleanly with a custom palette
     apply_dark_palette(app)
 
+    from cad.prefs import prefs
+    import cad.prefs as _prefs_mod
+    _prefs_mod._BASE_FONT_PT = app.font().pointSize()
+
+    if prefs.ui_scale_offset != 0:
+        from PyQt6.QtGui import QFont
+        f = app.font()
+        f.setPointSize(max(1, _prefs_mod._BASE_FONT_PT + prefs.ui_scale_offset))
+        app.setFont(f)
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

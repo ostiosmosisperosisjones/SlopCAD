@@ -6,6 +6,7 @@ ExtrudePanel — floating non-modal panel for the extrude/cut operation.
 
 from __future__ import annotations
 import numpy as np
+from cad.prefs import prefs
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -114,8 +115,8 @@ class ExtrudePanel(QWidget):
             Qt.WindowType.WindowStaysOnTopHint)
         self._viewport = parent  # keep reference for positioning
         self.setObjectName("ExtrudePanel")
-        self.setStyleSheet(_PANEL_STYLE)
-        self.setFixedWidth(260)
+        self.setStyleSheet(prefs.scale_stylesheet(_PANEL_STYLE))
+        self.setMinimumWidth(prefs.scaled_px(260))
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         self._workspace      = workspace
@@ -222,8 +223,8 @@ class ExtrudePanel(QWidget):
         vtx_row = QHBoxLayout()
         vtx_row.setSpacing(6)
         self._vtx_label = QLabel("No vertex selected")
-        self._vtx_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._vtx_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         self._vtx_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         vtx_row.addWidget(self._vtx_label)
@@ -233,13 +234,13 @@ class ExtrudePanel(QWidget):
         self._pick_vtx_btn.clicked.connect(self._on_pick_vertex_toggle)
         vtx_row.addWidget(self._pick_vtx_btn)
         reset_vtx_btn = QPushButton("✕")
-        reset_vtx_btn.setFixedWidth(24)
+        reset_vtx_btn.setFixedWidth(prefs.scaled_px(24))
         reset_vtx_btn.clicked.connect(self._reset_vertex)
         vtx_row.addWidget(reset_vtx_btn)
         vtx_layout.addLayout(vtx_row)
         self._vtx_dist_label = QLabel("—")
-        self._vtx_dist_label.setStyleSheet(
-            "color: #666; font-size: 11px; font-family: monospace;")
+        self._vtx_dist_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #666; font-size: 11px; font-family: monospace;"))
         vtx_layout.addWidget(self._vtx_dist_label)
         root.addWidget(self._vertex_widget)
         self._vertex_widget.hide()
@@ -273,8 +274,8 @@ class ExtrudePanel(QWidget):
         dir_row = QHBoxLayout()
         dir_row.setSpacing(6)
         self._dir_label = QLabel("Normal")
-        self._dir_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._dir_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         self._dir_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         dir_row.addWidget(self._dir_label)
@@ -290,7 +291,7 @@ class ExtrudePanel(QWidget):
         self._pick_btn.clicked.connect(self._on_pick_edge_toggle)
         dir_row.addWidget(self._pick_btn)
         reset_dir_btn = QPushButton("✕")
-        reset_dir_btn.setFixedWidth(24)
+        reset_dir_btn.setFixedWidth(prefs.scaled_px(24))
         reset_dir_btn.clicked.connect(self._reset_direction)
         dir_row.addWidget(reset_dir_btn)
         root.addLayout(dir_row)
@@ -325,8 +326,8 @@ class ExtrudePanel(QWidget):
         self._pick_body_btn.clicked.connect(self._on_pick_body_toggle)
         merge_row.addWidget(self._pick_body_btn)
         self._body_label = QLabel("—")
-        self._body_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         merge_row.addWidget(self._body_label)
         extrude_op_layout.addLayout(merge_row)
         root.addWidget(self._extrude_op_widget)
@@ -342,8 +343,8 @@ class ExtrudePanel(QWidget):
         self._pick_cut_body_btn.clicked.connect(self._on_pick_body_toggle)
         cut_op_layout.addWidget(self._pick_cut_body_btn)
         self._cut_body_label = QLabel("—")
-        self._cut_body_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._cut_body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         cut_op_layout.addWidget(self._cut_body_label)
         root.addWidget(self._cut_op_widget)
         self._cut_op_widget.hide()
@@ -417,8 +418,8 @@ class ExtrudePanel(QWidget):
         self._direction = vec / np.linalg.norm(vec)
         x, y, z = self._direction
         self._dir_label.setText(f"{x:+.2f}, {y:+.2f}, {z:+.2f}")
-        self._dir_label.setStyleSheet(
-            "color: #8dcc5a; font-size: 11px; font-family: monospace;")
+        self._dir_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #8dcc5a; font-size: 11px; font-family: monospace;"))
         self._end_pick_edge()
         self._recompute_vertex_dist()
         self._emit_preview()
@@ -427,8 +428,8 @@ class ExtrudePanel(QWidget):
         self._target_vertex = vertex.copy()
         x, y, z = vertex
         self._vtx_label.setText(f"{x:.2f}, {y:.2f}, {z:.2f}")
-        self._vtx_label.setStyleSheet(
-            "color: #cc8dff; font-size: 11px; font-family: monospace;")
+        self._vtx_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #cc8dff; font-size: 11px; font-family: monospace;"))
         self._end_pick_vertex()
         self._recompute_vertex_dist()
         self._emit_preview()
@@ -440,11 +441,11 @@ class ExtrudePanel(QWidget):
         self._end_pick_body()
         # Update both the merge and cut body labels
         self._body_label.setText(body_name)
-        self._body_label.setStyleSheet(
-            "color: #7ab3d4; font-size: 11px; font-family: monospace;")
+        self._body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #7ab3d4; font-size: 11px; font-family: monospace;"))
         self._cut_body_label.setText(body_name)
-        self._cut_body_label.setStyleSheet(
-            "color: #7ab3d4; font-size: 11px; font-family: monospace;")
+        self._cut_body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #7ab3d4; font-size: 11px; font-family: monospace;"))
         self._emit_preview()
 
     # ------------------------------------------------------------------
@@ -553,11 +554,11 @@ class ExtrudePanel(QWidget):
         # Reset body pick when switching modes
         self._merge_body_id = None
         self._body_label.setText("—")
-        self._body_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         self._cut_body_label.setText("—")
-        self._cut_body_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._cut_body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         self._emit_preview()
 
     def _on_target_mode_changed(self, btn_id: int):
@@ -582,8 +583,8 @@ class ExtrudePanel(QWidget):
         if btn_id == 0:
             self._merge_body_id = None
             self._body_label.setText("—")
-            self._body_label.setStyleSheet(
-                "color: #888; font-size: 11px; font-family: monospace;")
+            self._body_label.setStyleSheet(prefs.scale_stylesheet(
+                "color: #888; font-size: 11px; font-family: monospace;"))
             self._end_pick_body()
 
     def _on_pick_edge_toggle(self, checked: bool):
@@ -666,8 +667,8 @@ class ExtrudePanel(QWidget):
         self._target_vertex  = None
         self._vertex_dist_mm = None
         self._vtx_label.setText("No vertex selected")
-        self._vtx_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._vtx_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         self._vtx_dist_label.setText("—")
         self._end_pick_vertex()
         self._emit_preview()
@@ -675,8 +676,8 @@ class ExtrudePanel(QWidget):
     def _reset_direction(self):
         self._direction = None
         self._dir_label.setText("Normal")
-        self._dir_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._dir_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         self._end_pick_edge()
         self._recompute_vertex_dist()
         self._emit_preview()

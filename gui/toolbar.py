@@ -5,6 +5,7 @@ Top toolbar with SVG-drawn operation buttons.
 """
 
 from __future__ import annotations
+from cad.prefs import prefs
 from PyQt6.QtWidgets import (QToolBar, QToolButton, QFrame, QWidget,
                               QMenu, QWidgetAction, QButtonGroup, QHBoxLayout,
                               QLabel)
@@ -51,10 +52,12 @@ QToolButton:disabled {
 # SVG helpers
 # ---------------------------------------------------------------------------
 
-def _svg_icon(svg: str) -> QIcon:
+def _svg_icon(svg: str, size: int | None = None) -> QIcon:
+    if size is None:
+        size = prefs.scaled_px(_ICON_SIZE)
     data = QByteArray(svg.encode())
     renderer = QSvgRenderer(data)
-    pixmap = QPixmap(_ICON_SIZE, _ICON_SIZE)
+    pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     renderer.render(painter)
@@ -174,15 +177,15 @@ _SVG_DRAFT = """
 # Fillet: a sharp corner becoming rounded
 _SVG_FILLET = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
-  <!-- sharp corner (grey, faint) -->
-  <polyline points="7,29 7,7 29,7" fill="none" stroke="#888" stroke-width="1"
+  <!-- sharp corner (faint) -->
+  <polyline points="7,29 7,7 29,7" fill="none" stroke="#ef9a9a" stroke-width="1"
             opacity="0.3" stroke-dasharray="2,2"/>
   <!-- rounded fillet result -->
-  <path d="M7,29 L7,16 Q7,7 16,7 L29,7" fill="none" stroke="#888" stroke-width="2"
-        stroke-linecap="round" stroke-linejoin="round" opacity="0.55"/>
+  <path d="M7,29 L7,16 Q7,7 16,7 L29,7" fill="none" stroke="#ef9a9a" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
   <!-- radius indicator arc -->
-  <path d="M7,16 Q7,7 16,7" fill="none" stroke="#aaa" stroke-width="1"
-        stroke-dasharray="2,2" opacity="0.5"/>
+  <path d="M7,16 Q7,7 16,7" fill="none" stroke="#ef9a9a" stroke-width="1"
+        stroke-dasharray="2,2" opacity="0.6"/>
 </svg>
 """
 
@@ -229,8 +232,9 @@ class OpsToolbar(QToolBar):
     def __init__(self, parent=None):
         super().__init__("Operations", parent)
         self.setMovable(False)
-        self.setIconSize(QSize(_ICON_SIZE, _ICON_SIZE))
-        self.setStyleSheet(_STYLE)
+        icon_size = prefs.scaled_px(_ICON_SIZE)
+        self.setIconSize(QSize(icon_size, icon_size))
+        self.setStyleSheet(prefs.scale_stylesheet(_STYLE))
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
 
         # --- sketch (wired) ---
@@ -546,8 +550,9 @@ class SketchToolbar(QToolBar):
     def __init__(self, parent=None):
         super().__init__("Sketch Tools", parent)
         self.setMovable(False)
-        self.setIconSize(QSize(_ICON_SIZE, _ICON_SIZE))
-        self.setStyleSheet(_SKETCH_TOOLBAR_STYLE)
+        icon_size = prefs.scaled_px(_ICON_SIZE)
+        self.setIconSize(QSize(icon_size, icon_size))
+        self.setStyleSheet(prefs.scale_stylesheet(_SKETCH_TOOLBAR_STYLE))
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         self._circle_mode = "center_radius"
         self._build_ui()

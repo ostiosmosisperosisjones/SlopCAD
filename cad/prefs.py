@@ -21,6 +21,7 @@ Keybind values are key strings like "L", "Ctrl+Z", "Return", "Escape".
 from __future__ import annotations
 import json
 import os
+import re
 from dataclasses import dataclass, field, asdict
 from typing import Tuple
 
@@ -42,6 +43,7 @@ KEYBIND_DEFAULTS: dict[str, str] = {
     "extrude":           "E",
     "thicken":           "T",
     "fillet":            "F",
+    "revolve":           "R",
     "undo":              "Ctrl+Z",
     "redo":              "Ctrl+Y",
     "projection_toggle": "",
@@ -75,7 +77,7 @@ KEYBIND_DEFAULTS: dict[str, str] = {
 
 # Actions that are only active in 3D mode (no sketch open)
 KEYBINDS_3D: frozenset[str] = frozenset({
-    "extrude", "thicken", "fillet", "undo", "redo", "projection_toggle",
+    "extrude", "thicken", "fillet", "revolve", "undo", "redo", "projection_toggle",
 })
 
 # Actions that are only active in sketch mode
@@ -92,7 +94,8 @@ KEYBINDS_SKETCH: frozenset[str] = frozenset({
 KEYBIND_LABELS: dict[str, tuple[str, str]] = {
     "extrude":                  ("3D Mode",    "Extrude selected face"),
     "thicken":                  ("3D Mode",    "Thicken active body"),
-    "fillet":                  ("3D Mode",    "Fillet selected edges"),
+    "fillet":                   ("3D Mode",    "Fillet selected edges"),
+    "revolve":                  ("3D Mode",    "Revolve a sketch or face"),
     "undo":                     ("3D Mode",    "Undo"),
     "redo":                     ("3D Mode",    "Redo"),
     "projection_toggle":        ("3D Mode",    "Toggle ortho/perspective"),
@@ -190,6 +193,12 @@ class Prefs:
     display_decimals: int = 3
 
     # ------------------------------------------------------------------
+    # UI scale offset  — integer steps added to every base font size
+    # 0 = default; positive = larger; negative = smaller
+    # ------------------------------------------------------------------
+    ui_scale_offset: int = 0
+
+    # ------------------------------------------------------------------
     # Keybindings  — action_name → key string
     # ------------------------------------------------------------------
     keybinds: dict = field(
@@ -202,6 +211,17 @@ class Prefs:
     def key(self, action: str) -> str:
         """Return the current key string for an action, falling back to default."""
         return self.keybinds.get(action, KEYBIND_DEFAULTS.get(action, ""))
+
+    def scaled_px(self, base: int) -> int:
+        return max(1, base + self.ui_scale_offset)
+
+    def scale_stylesheet(self, css: str) -> str:
+        """Rewrite all font-size: Npx values by applying ui_scale_offset."""
+        if self.ui_scale_offset == 0:
+            return css
+        def _sub(m):
+            return f"font-size: {self.scaled_px(int(m.group(1)))}px"
+        return re.sub(r'font-size:\s*(\d+)px', _sub, css)
 
     def matches(self, action: str, qt_key_event) -> bool:
         """

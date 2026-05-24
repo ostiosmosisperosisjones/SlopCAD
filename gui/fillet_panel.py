@@ -5,6 +5,7 @@ FilletPanel — small floating panel for the 2D sketch fillet tool.
 """
 
 from __future__ import annotations
+from cad.prefs import prefs
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
 from PyQt6.QtCore import pyqtSignal, Qt
 
@@ -38,8 +39,8 @@ class FilletPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("FilletPanel")
-        self.setStyleSheet(_STYLE)
-        self.setFixedWidth(220)
+        self.setStyleSheet(prefs.scale_stylesheet(_STYLE))
+        self.setMinimumWidth(prefs.scaled_px(220))
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._corner = None
         self._tool   = None
@@ -69,7 +70,7 @@ class FilletPanel(QWidget):
         root.addLayout(row)
 
         self._hint = QLabel("")
-        self._hint.setStyleSheet("color: #c05050; font-size: 10px;")
+        self._hint.setStyleSheet(prefs.scale_stylesheet("color: #c05050; font-size: 10px;"))
         self._hint.setWordWrap(True)
         root.addWidget(self._hint)
 

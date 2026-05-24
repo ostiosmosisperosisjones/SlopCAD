@@ -16,9 +16,55 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QFrame, QSizePolicy, QKeySequenceEdit,
     QTabWidget,
 )
-from PyQt6.QtGui import QColor, QKeySequence
+from PyQt6.QtGui import QColor, QKeySequence, QFont
+from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 from cad.prefs import prefs, KEYBIND_LABELS, KEYBIND_DEFAULTS
+
+
+def _apply_ui_scale(old_offset: int = 0):
+    """Update QApplication font and rescale all widget stylesheets."""
+    import re
+    app = QApplication.instance()
+    if app is None:
+        return
+
+    import cad.prefs as _prefs_mod
+    base_pt = getattr(_prefs_mod, '_BASE_FONT_PT', 9)
+    f = app.font()
+    f.setPointSize(max(1, base_pt + prefs.ui_scale_offset))
+    app.setFont(f)
+
+    new_offset = prefs.ui_scale_offset
+
+    def _rebase(css: str) -> str:
+        """Undo old offset, apply new offset to every font-size: Npx."""
+        def _sub(m):
+            current = int(m.group(1))
+            original = current - old_offset
+            return f"font-size: {max(1, original + new_offset)}px"
+        return re.sub(r'font-size:\s*(\d+)px', _sub, css)
+
+    all_widgets = list(app.allWidgets()) + list(app.topLevelWidgets())
+    seen = set()
+    for widget in all_widgets:
+        if id(widget) in seen:
+            continue
+        seen.add(id(widget))
+        ss = widget.styleSheet()
+        if ss and 'font-size' in ss:
+            widget.setStyleSheet(_rebase(ss))
+
+    # Menu bars cache their font — force re-inherit from the app font
+    from PyQt6.QtWidgets import QMenuBar, QMenu, QMainWindow
+    for widget in app.allWidgets():
+        if isinstance(widget, (QMenuBar, QMenu)):
+            widget.setFont(app.font())
+
+    # Rebuild toolbars so icon size updates immediately
+    for widget in app.topLevelWidgets():
+        if isinstance(widget, QMainWindow) and hasattr(widget, 'refresh_toolbars'):
+            widget.refresh_toolbars()
 
 
 class ClearableKeySequenceEdit(QKeySequenceEdit):
@@ -66,6 +112,7 @@ _LABELS = {
     'camera_mode':             ('Camera',    'Rotation mode'),
     'camera_invert_yaw':       ('Camera',    'Invert yaw'),
     'camera_invert_pitch':     ('Camera',    'Invert pitch'),
+    'ui_scale_offset':         ('UI',        'Font size offset (steps)'),
 }
 
 _STR_OPTIONS = {
@@ -92,9 +139,9 @@ def _swatch_style(color) -> str:
 
 def _section_header(layout, title: str):
     lbl = QLabel(title.upper())
-    lbl.setStyleSheet(
+    lbl.setStyleSheet(prefs.scale_stylesheet(
         "color: #555; font-size: 10px; font-weight: bold; "
-        "letter-spacing: 1px; padding-top: 12px; padding-bottom: 4px;")
+        "letter-spacing: 1px; padding-top: 12px; padding-bottom: 4px;"))
     layout.addWidget(lbl)
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
@@ -104,7 +151,7 @@ def _section_header(layout, title: str):
 
 def _row_label(text: str) -> QLabel:
     lbl = QLabel(text)
-    lbl.setStyleSheet("color: #ccc; font-size: 12px;")
+    lbl.setStyleSheet(prefs.scale_stylesheet("color: #ccc; font-size: 12px;"))
     lbl.setSizePolicy(QSizePolicy.Policy.Expanding,
                       QSizePolicy.Policy.Preferred)
     return lbl
@@ -185,8 +232,15 @@ class PrefsDialog(QDialog):
 
             elif isinstance(val, int):
                 sp = QSpinBox()
-                sp.setMinimum(0)
-                sp.setMaximum(6)
+                if key == 'ui_scale_offset':
+                    sp.setMinimum(-4)
+                    sp.setMaximum(8)
+                    sp.setPrefix("+" if val >= 0 else "")
+                    sp.valueChanged.connect(
+                        lambda v, s=sp: s.setPrefix("+" if v >= 0 else ""))
+                else:
+                    sp.setMinimum(0)
+                    sp.setMaximum(6)
                 sp.setValue(val)
                 sp.setFixedWidth(60)
                 sp.setProperty('pref_key', key)
@@ -354,6 +408,8 @@ class PrefsDialog(QDialog):
         PrefsDialog(self.parent()).exec()
 
     def _apply_and_accept(self):
+        old_scale = prefs.ui_scale_offset
+
         # Display prefs
         for key, widget in self._widgets.items():
             if isinstance(widget, QPushButton):
@@ -375,4 +431,11 @@ class PrefsDialog(QDialog):
             prefs.keybinds[action] = seq.toString() if not seq.isEmpty() else ""
 
         prefs.save()
+
+        if prefs.ui_scale_offset != old_scale:
+            _apply_ui_scale(old_offset=old_scale)
+            self.close()
+            PrefsDialog(self.parent()).exec()
+            return
+
         self.accept()

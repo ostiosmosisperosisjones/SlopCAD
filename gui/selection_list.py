@@ -25,6 +25,7 @@ Usage
 """
 
 from __future__ import annotations
+from cad.prefs import prefs
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
@@ -57,8 +58,8 @@ class SelectionList(QWidget):
         self._layout.setSpacing(2)
 
         self._empty_label = QLabel(empty_text)
-        self._empty_label.setStyleSheet(
-            "color: #555; font-size: 11px; font-family: monospace;")
+        self._empty_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #555; font-size: 11px; font-family: monospace;"))
         self._layout.addWidget(self._empty_label)
 
     # ------------------------------------------------------------------
@@ -148,8 +149,8 @@ class SelectionList(QWidget):
             row_layout.addWidget(lbl)
 
             rm = QPushButton("✕")
-            rm.setFixedWidth(22)
-            rm.setStyleSheet(_RM_STYLE)
+            rm.setFixedWidth(prefs.scaled_px(22))
+            rm.setStyleSheet(prefs.scale_stylesheet(_RM_STYLE))
             rm.clicked.connect(lambda _, idx=i: self.remove_at(idx))
             row_layout.addWidget(rm)
 

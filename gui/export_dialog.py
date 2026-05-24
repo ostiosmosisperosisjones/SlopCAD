@@ -5,6 +5,7 @@ Export dialog — format picker + save-as trigger.
 """
 
 from __future__ import annotations
+from cad.prefs import prefs
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QButtonGroup, QRadioButton, QFileDialog, QFrame
@@ -31,7 +32,7 @@ class ExportDialog(QDialog):
         self._result = (None, None)
         self.setWindowTitle("Export Body")
         self.setModal(True)
-        self.setFixedWidth(340)
+        self.setMinimumWidth(prefs.scaled_px(340))
         self._build()
 
     def _build(self):
@@ -40,7 +41,7 @@ class ExportDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
 
         title = QLabel(f"Export  <b>{self._body_name}</b>")
-        title.setStyleSheet("font-size: 13px; color: #d4d4d4;")
+        title.setStyleSheet(prefs.scale_stylesheet("font-size: 13px; color: #d4d4d4;"))
         root.addWidget(title)
 
         sep = QFrame()
@@ -49,7 +50,7 @@ class ExportDialog(QDialog):
         root.addWidget(sep)
 
         fmt_label = QLabel("Format")
-        fmt_label.setStyleSheet("color: #888; font-size: 11px;")
+        fmt_label.setStyleSheet(prefs.scale_stylesheet("color: #888; font-size: 11px;"))
         root.addWidget(fmt_label)
 
         self._btn_group = QButtonGroup(self)
@@ -59,9 +60,9 @@ class ExportDialog(QDialog):
             rb = QRadioButton(key)
             rb.setEnabled(enabled)
             rb.setToolTip(hint)
-            rb.setStyleSheet("color: #d4d4d4; font-size: 12px;")
+            rb.setStyleSheet(prefs.scale_stylesheet("color: #d4d4d4; font-size: 12px;"))
             if not enabled:
-                rb.setStyleSheet("color: #555; font-size: 12px;")
+                rb.setStyleSheet(prefs.scale_stylesheet("color: #555; font-size: 12px;"))
             self._btn_group.addButton(rb)
             self._radio[key] = rb
             root.addWidget(rb)

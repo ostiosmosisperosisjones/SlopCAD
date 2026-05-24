@@ -12,6 +12,7 @@ HistoryPanel — flat chronological operation list.
 """
 
 from __future__ import annotations
+from cad.prefs import prefs
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QSizePolicy, QDialog, QFormLayout,
@@ -76,7 +77,7 @@ class _EditDialog(QDialog):
     def __init__(self, entry: HistoryEntry, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Edit — {entry.label}")
-        self.setMinimumWidth(300)
+        self.setMinimumWidth(prefs.scaled_px(300))
         self.result_params = None
 
         schema = EDIT_SCHEMA.get(entry.operation, [])
@@ -114,7 +115,7 @@ class _EditDialog(QDialog):
             layout.addRow(label + "  (±):", spin)
 
         note = QLabel("Positive = add material   /   Negative = cut")
-        note.setStyleSheet("color: #555; font-size: 11px;")
+        note.setStyleSheet(prefs.scale_stylesheet("color: #555; font-size: 11px;"))
         layout.addRow(note)
 
         buttons = QDialogButtonBox(
@@ -189,9 +190,9 @@ class _EntryWidget(QFrame):
 
         if entry.operation != "import":
             body_lbl = QLabel(body_name)
-            body_lbl.setStyleSheet(
+            body_lbl.setStyleSheet(prefs.scale_stylesheet(
                 "color: #333; font-size: 10px; "
-                "border: none; background: transparent;")
+                "border: none; background: transparent;"))
             outer.addWidget(body_lbl)
 
         row = QHBoxLayout()
@@ -200,9 +201,9 @@ class _EntryWidget(QFrame):
 
         tag = QLabel(_op_icon(entry.operation))
         tag.setFixedWidth(16)
-        tag.setStyleSheet(
+        tag.setStyleSheet(prefs.scale_stylesheet(
             f"color: {border}; font-size: 11px; "
-            "border: none; background: transparent;")
+            "border: none; background: transparent;"))
         row.addWidget(tag)
 
         from cad.units import format_op_label
@@ -215,9 +216,9 @@ class _EntryWidget(QFrame):
         elif entry.error:
             lbl_text = "⚠ " + lbl_text
         lbl = QLabel(lbl_text)
-        lbl.setStyleSheet(
+        lbl.setStyleSheet(prefs.scale_stylesheet(
             f"color: {text_color}; font-size: 12px; "
-            "border: none; background: transparent;")
+            "border: none; background: transparent;"))
         lbl.setSizePolicy(QSizePolicy.Policy.Expanding,
                           QSizePolicy.Policy.Preferred)
         if entry.error and entry.error_msg:
@@ -226,9 +227,9 @@ class _EntryWidget(QFrame):
 
         if editable:
             hint = QLabel("✎")
-            hint.setStyleSheet(
+            hint.setStyleSheet(prefs.scale_stylesheet(
                 "color: #303030; font-size: 10px; "
-                "border: none; background: transparent;")
+                "border: none; background: transparent;"))
             hint.setToolTip("Double-click to edit")
             row.addWidget(hint)
 
@@ -239,7 +240,7 @@ class _EntryWidget(QFrame):
             eye_btn = QPushButton("◉" if is_visible else "○")
             eye_btn.setFixedWidth(18)
             eye_btn.setToolTip("Toggle sketch visibility")
-            eye_btn.setStyleSheet("""
+            eye_btn.setStyleSheet(prefs.scale_stylesheet("""
                 QPushButton {
                     color: #4a6e8a;
                     font-size: 11px;
@@ -248,7 +249,7 @@ class _EntryWidget(QFrame):
                     padding: 0;
                 }
                 QPushButton:hover { color: #7ab3d4; }
-            """)
+            """))
             eye_btn.clicked.connect(lambda _: self.sketch_vis_toggled.emit(self._index))
             row.addWidget(eye_btn)
 
@@ -407,15 +408,15 @@ class HistoryPanel(QWidget):
         root.setSpacing(0)
 
         header = QLabel("  History")
-        header.setFixedHeight(28)
-        header.setStyleSheet("""
+        header.setFixedHeight(prefs.scaled_px(28))
+        header.setStyleSheet(prefs.scale_stylesheet("""
             background: #161616;
             color: #555;
             font-size: 11px;
             font-weight: bold;
             letter-spacing: 1px;
             border-bottom: 1px solid #2a2a2a;
-        """)
+        """))
         root.addWidget(header)
 
         self._list = _HistoryList()

@@ -107,19 +107,26 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._drag_arrow_active      = False  # True while dragging any op arrow
         self._drag_arrow_axis_origin = None  # world point on drag axis
         self._drag_arrow_op          = None  # 'extrude' | 'thicken' | 'revolve' | 'fillet3d'
+        self._drag_arrow_grab_offset = 0.0   # s_at_click - panel_value; subtracted during drag
         self._revolve_preview_mesh   = None
         self._revolve_arrow_origin   = None
         self._revolve_arrow_dir      = None
         self._revolve_axis_point     = None  # stored for drag projection
         self._revolve_axis_dir       = None
 
-        self._thicken_panel         = None
-        self._thicken_body_id       = None
-        self._thicken_preview_mesh  = None
-        self._thicken_preview_dist  = 0.0
-        self._thicken_arrow_origin  = None
-        self._thicken_arrow_dir     = None
-        self._editing_thicken_idx   = None
+        self._thicken_panel               = None
+        self._thicken_body_id             = None
+        self._thicken_preview_mesh        = None
+        self._thicken_preview_dist        = 0.0
+        self._thicken_arrow_origin        = None
+        self._thicken_arrow_dir           = None
+        self._thicken_cage_wires          = None
+        self._thicken_cage_key            = None
+        self._thicken_last_preview_params = None
+        self._thicken_mesh_gen            = 0
+        self._thicken_mesh_inflight       = False
+        self._thicken_mesh_pending        = None
+        self._editing_thicken_idx         = None
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
@@ -131,6 +138,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         from PyQt6.QtCore import QEvent
         from PyQt6.QtWidgets import QLineEdit, QTextEdit
         if e.type() == QEvent.Type.KeyPress:
+            from PyQt6.QtWidgets import QApplication
+            if QApplication.activeModalWidget() is not None:
+                return False
             focused = self.__class__._focused_widget()
             # Don't intercept Tab while the line HUD is visible
             if (e.key() == Qt.Key.Key_Tab and
@@ -579,6 +589,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                                             + np.asarray(arrow_dir, dtype=float) * start_off)
         else:
             self._drag_arrow_axis_origin = np.asarray(arrow_origin, dtype=float)
+        s_click = self._closest_point_on_axis(ray_o, ray_d,
+                                              self._drag_arrow_axis_origin, arrow_dir)
+        current = (panel._spinbox.mm_value() or 0.0) if panel else 0.0
+        self._drag_arrow_grab_offset = (s_click - current) if s_click is not None else 0.0
         self._drag_arrow_active = True
         self._drag_arrow_op     = 'extrude'
         return True
@@ -602,8 +616,16 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         # axis_origin = face centroid (zero-thickness base)
         self._drag_arrow_axis_origin = (np.asarray(arrow_origin, dtype=float)
                                         - np.asarray(arrow_dir, dtype=float) * abs(dist))
+        s_click = self._closest_point_on_axis(ray_o, ray_d,
+                                              self._drag_arrow_axis_origin, arrow_dir)
+        panel = getattr(self, '_thicken_panel', None)
+        current = (panel._spinbox.mm_value() or 0.0) if panel else 0.0
+        self._drag_arrow_grab_offset = (s_click - current) if s_click is not None else 0.0
         self._drag_arrow_active = True
         self._drag_arrow_op     = 'thicken'
+        # Invalidate any inflight mesh compute so stale results don't land during drag.
+        self._thicken_mesh_gen = getattr(self, '_thicken_mesh_gen', 0) + 1
+        self._thicken_preview_mesh = None
         return True
 
     def _hit_revolve_arrow(self, mx: int, my: int) -> bool:
@@ -624,6 +646,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         import numpy as np
         # For revolve the drag is angular — store the arrow tip as drag origin.
         self._drag_arrow_axis_origin = np.asarray(arrow_origin, dtype=float)
+        self._drag_arrow_grab_offset = 0.0   # revolve uses incremental deltas, no offset needed
         self._drag_arrow_active      = True
         self._drag_arrow_op          = 'revolve'
         self._revolve_preview_mesh   = None  # drop mesh so cage shows during drag
@@ -642,8 +665,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         from viewer.drag_arrow import DragArrow
         panel  = getattr(self, '_fillet3d_panel', None)
         radius = (panel._spinbox.mm_value() or 1.0) if panel else 1.0
-        if DragArrow().hit_test(ray_o, ray_d, arrow_origin, arrow_dir,
-                                self._arrow_scale(radius)) is None:
+        scale  = self._arrow_scale(radius)
+        if DragArrow().hit_test(ray_o, ray_d, arrow_origin, arrow_dir, scale) is None:
             return False
         import numpy as np
         # Use the base (face centroid) as axis origin so _closest_point_on_axis
@@ -652,6 +675,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._drag_arrow_axis_origin = (np.asarray(base, dtype=float)
                                         if base is not None
                                         else np.asarray(arrow_origin, dtype=float))
+        s_click = self._closest_point_on_axis(ray_o, ray_d,
+                                              self._drag_arrow_axis_origin, arrow_dir)
+        current = radius  # already read above
+        self._drag_arrow_grab_offset = (s_click - current) if s_click is not None else 0.0
         self._drag_arrow_active = True
         self._drag_arrow_op     = 'fillet3d'
         return True
@@ -672,6 +699,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         if ray_o is None:
             return
 
+        grab_off = getattr(self, '_drag_arrow_grab_offset', 0.0)
+
         if op == 'extrude':
             arrow_dir = getattr(self, '_extrude_arrow_dir', None)
             if arrow_dir is None:
@@ -679,7 +708,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             s = self._closest_point_on_axis(ray_o, ray_d, axis_origin, arrow_dir)
             if s is None:
                 return
-            s = max(0.001, min(10000.0, s))
+            s = max(0.001, min(10000.0, s - grab_off))
             panel = getattr(self, '_extrude_panel', None)
             if panel is None:
                 return
@@ -693,7 +722,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             s = self._closest_point_on_axis(ray_o, ray_d, axis_origin, arrow_dir)
             if s is None:
                 return
-            s = max(0.001, min(10000.0, s))
+            s = max(0.001, min(10000.0, s - grab_off))
             panel = getattr(self, '_thicken_panel', None)
             if panel is None:
                 return
@@ -759,7 +788,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             s = self._closest_point_on_axis(ray_o, ray_d, axis_origin, arrow_dir)
             if s is None:
                 return
-            s = max(0.001, min(10000.0, s))
+            s = max(0.001, min(10000.0, s - grab_off))
             panel = getattr(self, '_fillet3d_panel', None)
             if panel is None:
                 return
@@ -786,11 +815,12 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
     def keyPressEvent(self, e):
         from cad.prefs import prefs
         from cad.sketch import SketchTool
+        from PyQt6.QtWidgets import QApplication
+
+        if QApplication.activeModalWidget() is not None:
+            return
 
         if e.key() == Qt.Key.Key_Escape:
-            from PyQt6.QtWidgets import QApplication
-            if QApplication.activeModalWidget() is not None:
-                super().keyPressEvent(e); return
             if self._sketch is not None:
                 if self._sketch.snap.declared_type is not None:
                     self._sketch.snap.consume_declared()
@@ -902,9 +932,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                           "select edges, vertices, or sketch lines first.")
                 return
             elif prefs.matches("sketch_commit", e):
-                from PyQt6.QtWidgets import QApplication
-                if QApplication.activeModalWidget() is None:
-                    self._complete_sketch()
+                self._complete_sketch()
                 return
             elif prefs.matches("sketch_projection_toggle", e):
                 self.toggle_projection(); return
@@ -936,6 +964,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             if getattr(self, '_thicken_panel', None) is not None:
                 self._close_thicken_panel()
                 return
+            if getattr(self, '_revolve_panel', None) is not None:
+                self._close_revolve_panel()
+                return
         if prefs.matches("undo", e):
             self._do_undo()
         elif prefs.matches("redo", e):
@@ -948,6 +979,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             self._try_thicken()
         elif prefs.matches("fillet", e):
             self._try_fillet()
+        elif prefs.matches("revolve", e):
+            self._try_revolve()
         else:
             super().keyPressEvent(e)
 
@@ -1441,7 +1474,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton and self._drag_arrow_active:
-            was_revolve = (self._drag_arrow_op == 'revolve')
+            was_revolve  = (self._drag_arrow_op == 'revolve')
+            was_thicken  = (self._drag_arrow_op == 'thicken')
             self._drag_arrow_active      = False
             self._drag_arrow_axis_origin = None
             if was_revolve:
@@ -1449,6 +1483,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 if params is not None:
                     self._revolve_preview_mesh = None  # drop stale mesh, show cage until new one lands
                     self._revolve_compute_mesh(*params)
+            elif was_thicken:
+                params = getattr(self, '_thicken_last_preview_params', None)
+                if params is not None:
+                    self._thicken_preview_mesh = None  # show cage until mesh lands
+                    self._thicken_compute_mesh(*params)
             return
         if e.button() == Qt.MouseButton.LeftButton and self._dragging_label is not None:
             mx, my = int(e.position().x()), int(e.position().y())

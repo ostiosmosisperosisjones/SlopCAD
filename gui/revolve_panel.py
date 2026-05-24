@@ -6,6 +6,7 @@ RevolvePanel — floating non-modal panel for the revolve operation.
 
 from __future__ import annotations
 import numpy as np
+from cad.prefs import prefs
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -110,8 +111,8 @@ class RevolvePanel(QWidget):
             Qt.WindowType.WindowStaysOnTopHint)
         self._viewport = parent
         self.setObjectName("RevolvePanel")
-        self.setStyleSheet(_PANEL_STYLE)
-        self.setFixedWidth(260)
+        self.setStyleSheet(prefs.scale_stylesheet(_PANEL_STYLE))
+        self.setMinimumWidth(prefs.scaled_px(260))
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         self._workspace      = workspace
@@ -199,8 +200,8 @@ class RevolvePanel(QWidget):
         root.addLayout(axis_header)
 
         self._axis_label = QLabel("No axis selected")
-        self._axis_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._axis_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         self._axis_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         axis_reset_row = QHBoxLayout()
@@ -210,11 +211,11 @@ class RevolvePanel(QWidget):
         self._flip_btn.setObjectName("pick_axis")
         self._flip_btn.setToolTip("Flip revolution direction")
         self._flip_btn.setCheckable(True)
-        self._flip_btn.setFixedWidth(28)
+        self._flip_btn.setFixedWidth(prefs.scaled_px(28))
         self._flip_btn.clicked.connect(self._on_flip)
         axis_reset_row.addWidget(self._flip_btn)
         reset_axis_btn = QPushButton("✕")
-        reset_axis_btn.setFixedWidth(24)
+        reset_axis_btn.setFixedWidth(prefs.scaled_px(24))
         reset_axis_btn.clicked.connect(self._reset_axis)
         axis_reset_row.addWidget(reset_axis_btn)
         root.addLayout(axis_reset_row)
@@ -259,8 +260,8 @@ class RevolvePanel(QWidget):
         self._pick_body_btn.clicked.connect(self._on_pick_body_toggle)
         merge_row.addWidget(self._pick_body_btn)
         self._body_label = QLabel("—")
-        self._body_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         merge_row.addWidget(self._body_label)
         revolve_op_layout.addLayout(merge_row)
         root.addWidget(self._revolve_op_widget)
@@ -276,8 +277,8 @@ class RevolvePanel(QWidget):
         self._pick_cut_body_btn.clicked.connect(self._on_pick_body_toggle)
         cut_op_layout.addWidget(self._pick_cut_body_btn)
         self._cut_body_label = QLabel("—")
-        self._cut_body_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._cut_body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         cut_op_layout.addWidget(self._cut_body_label)
         root.addWidget(self._cut_op_widget)
         self._cut_op_widget.hide()
@@ -331,8 +332,8 @@ class RevolvePanel(QWidget):
         self._axis_dir   = direction / np.linalg.norm(direction)
         x, y, z = self._axis_dir
         self._axis_label.setText(f"{x:+.2f}, {y:+.2f}, {z:+.2f}")
-        self._axis_label.setStyleSheet(
-            "color: #8dcc5a; font-size: 11px; font-family: monospace;")
+        self._axis_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #8dcc5a; font-size: 11px; font-family: monospace;"))
         self._end_pick_axis()
         self._emit_preview()
 
@@ -342,11 +343,11 @@ class RevolvePanel(QWidget):
         self._self_cut = False
         self._end_pick_body()
         self._body_label.setText(body_name)
-        self._body_label.setStyleSheet(
-            "color: #7ab3d4; font-size: 11px; font-family: monospace;")
+        self._body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #7ab3d4; font-size: 11px; font-family: monospace;"))
         self._cut_body_label.setText(body_name)
-        self._cut_body_label.setStyleSheet(
-            "color: #7ab3d4; font-size: 11px; font-family: monospace;")
+        self._cut_body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #7ab3d4; font-size: 11px; font-family: monospace;"))
 
     # ------------------------------------------------------------------
     # Internal
@@ -381,11 +382,11 @@ class RevolvePanel(QWidget):
         self._merge_body_id = None
         self._self_cut = True
         self._body_label.setText("—")
-        self._body_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         self._cut_body_label.setText("—")
-        self._cut_body_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._cut_body_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         self._emit_preview()
 
     def _on_op_changed(self, btn_id: int):
@@ -393,8 +394,8 @@ class RevolvePanel(QWidget):
         if btn_id == 0:
             self._merge_body_id = None
             self._body_label.setText("—")
-            self._body_label.setStyleSheet(
-                "color: #888; font-size: 11px; font-family: monospace;")
+            self._body_label.setStyleSheet(prefs.scale_stylesheet(
+                "color: #888; font-size: 11px; font-family: monospace;"))
             self._end_pick_body()
 
     def _on_pick_axis_toggle(self, checked: bool):
@@ -455,8 +456,8 @@ class RevolvePanel(QWidget):
         self._axis_point = None
         self._axis_dir   = None
         self._axis_label.setText("No axis selected")
-        self._axis_label.setStyleSheet(
-            "color: #888; font-size: 11px; font-family: monospace;")
+        self._axis_label.setStyleSheet(prefs.scale_stylesheet(
+            "color: #888; font-size: 11px; font-family: monospace;"))
         self._end_pick_axis()
         self._emit_preview()
 

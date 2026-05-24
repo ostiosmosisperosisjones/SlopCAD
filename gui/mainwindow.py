@@ -16,6 +16,7 @@ from viewer.mesh import Mesh
 from cad.importer import load_step
 from cad.history import History
 from cad.workspace import Workspace
+from cad.prefs import prefs
 from gui.sidebar import Sidebar
 
 
@@ -68,6 +69,19 @@ class MainWindow(QMainWindow):
 
         # Keep a ref for backwards compat
         self._toolbar = self._ops_toolbar
+
+    def refresh_toolbars(self):
+        """Rebuild both toolbars so icon size and styles pick up the new scale."""
+        sketch_visible = self._sketch_toolbar.isVisible()
+        enabled = self._ops_toolbar._btn_extrude.isEnabled()
+        self.removeToolBar(self._ops_toolbar)
+        self.removeToolBar(self._sketch_toolbar)
+        self._ops_toolbar.deleteLater()
+        self._sketch_toolbar.deleteLater()
+        self._build_toolbar()
+        self._ops_toolbar.set_enabled(enabled)
+        self._sketch_toolbar.setVisible(sketch_visible)
+        self._ops_toolbar.setVisible(not sketch_visible)
 
     def _toolbar_sketch(self):
         if not self._viewport:
@@ -145,31 +159,21 @@ class MainWindow(QMainWindow):
     def _toolbar_thicken(self):
         if not self._viewport:
             return
-        if self._viewport.selection.face_count == 0:
-            self.statusBar().showMessage("Select a face first.", 3000)
-            return
         self._viewport._try_thicken()
 
     def _toolbar_fillet(self):
         if not self._viewport:
-            return
-        if self._viewport.selection.face_count == 0:
-            self.statusBar().showMessage("Select a face first.", 3000)
             return
         self._viewport._try_fillet()
 
     def _toolbar_revolve(self):
         if not self._viewport:
             return
-        vp = self._viewport
-        if vp.selection.face_count == 0 and vp._selected_sketch_entry is None:
-            self.statusBar().showMessage("Select a sketch first.", 3000)
-            return
-        vp._try_revolve()
+        self._viewport._try_revolve()
 
     def _build_statusbar(self):
         sb = self.statusBar()
-        sb.setStyleSheet("""
+        sb.setStyleSheet(prefs.scale_stylesheet("""
             QStatusBar {
                 background: #161616;
                 color: #555;
@@ -177,7 +181,7 @@ class MainWindow(QMainWindow):
                 border-top: 1px solid #2a2a2a;
             }
             QStatusBar::item { border: none; }
-        """)
+        """))
         from PyQt6.QtWidgets import QLabel
         self._sketch_label = QLabel("")
         self._sketch_label.setStyleSheet(

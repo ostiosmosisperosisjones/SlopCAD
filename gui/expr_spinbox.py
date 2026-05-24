@@ -18,6 +18,7 @@ Invalid:  red border, tooltip shows the error, value unchanged
 """
 
 from __future__ import annotations
+from cad.prefs import prefs
 from PyQt6.QtWidgets import QLineEdit
 from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui import QPalette
@@ -64,8 +65,8 @@ class ExprSpinBox(QLineEdit):
         self._mm_value: float = 0.0
         self._valid    = True
 
-        self.setStyleSheet(self._STYLE_NORMAL)
-        self.setMinimumWidth(60)
+        self.setStyleSheet(prefs.scale_stylesheet(self._STYLE_NORMAL))
+        self.setMinimumWidth(prefs.scaled_px(60))
         self.setAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.editingFinished.connect(self._on_commit)
@@ -101,7 +102,7 @@ class ExprSpinBox(QLineEdit):
     def _show_formatted(self):
         from cad.units import format_value
         self.setText(format_value(self._mm_value, self._unit, self._decimals))
-        self.setStyleSheet(self._STYLE_NORMAL)
+        self.setStyleSheet(prefs.scale_stylesheet(self._STYLE_NORMAL))
         self.setToolTip("")
 
     def _on_commit(self):
@@ -118,7 +119,7 @@ class ExprSpinBox(QLineEdit):
             self.value_changed.emit(self._mm_value)
         except ValueError as ex:
             self._valid = False
-            self.setStyleSheet(self._STYLE_ERROR)
+            self.setStyleSheet(prefs.scale_stylesheet(self._STYLE_ERROR))
             self.setToolTip(str(ex))
 
     def focusInEvent(self, e):
