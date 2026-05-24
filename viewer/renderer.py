@@ -34,10 +34,13 @@ def draw_opaque(meshes, workspace, selection):
 
     glDisable(GL_LIGHTING)
 
-    # Selected face highlights
+    # Selected face highlights — depth-tested so they don't bleed through
+    # occluding geometry. Polygon offset pulls the highlight slightly toward
+    # the camera to avoid z-fighting with the underlying face.
     if selection.face_count > 0:
         glColor3f(*prefs.face_selected_color)
-        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_POLYGON_OFFSET_FILL)
+        glPolygonOffset(-1.0, -1.0)
         glEnableClientState(GL_VERTEX_ARRAY)
         for face_sel in selection.faces:
             mesh = meshes.get(face_sel.body_id)
@@ -52,7 +55,7 @@ def draw_opaque(meshes, workspace, selection):
         glDisableClientState(GL_VERTEX_ARRAY)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)
-        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_POLYGON_OFFSET_FILL)
 
     # Wireframe edges — optional, respects prefs
     if prefs.show_edges:

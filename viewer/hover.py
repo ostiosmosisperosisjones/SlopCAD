@@ -284,10 +284,10 @@ class HoverState:
 
     def _edge_visible(self, body_id: str, ei: int, world_pt: np.ndarray) -> bool:
         """
-        Visibility check for edges. Uses adjacent face normals (viewcube approach):
-        an edge is visible if at least one adjacent face is front-facing toward the
-        camera. Falls back to ray-cast occlusion only for silhouette edges where all
-        adjacent faces are near-perpendicular to the view direction.
+        Visibility check for edges. Uses adjacent face normals as a fast reject:
+        if every adjacent face points away from the camera, the edge is on the
+        back of its own body and cannot be visible. Otherwise we still ray-cast,
+        because a front-facing edge on this body can be occluded by other bodies.
         """
         if self._eye is None:
             return True
@@ -301,10 +301,7 @@ class HoverState:
                 if dist > 1e-9:
                     to_eye_n = to_eye / dist
                     dots = face_normals.astype(np.float64) @ to_eye_n
-                    max_dot = float(dots.max())
-                    if max_dot > 0.01:
-                        return True
-                    if max_dot < -0.01:
+                    if float(dots.max()) < -0.01:
                         return False
 
         return self._visible(world_pt)
