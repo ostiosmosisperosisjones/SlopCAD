@@ -1302,11 +1302,14 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         print(f"Picked sketch vertex {hov_idx} | "
                               f"pos=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})")
                 else:
+                    body = self.workspace.bodies.get(hov_body)
+                    mesh = self._meshes.get(hov_body)
+                    if body is None or mesh is None or hov_idx >= len(mesh.topo_verts):
+                        return
                     self.workspace.set_active_body(hov_body)
                     self.body_selected.emit(hov_body)
-                    p = self._meshes[hov_body].topo_verts[hov_idx]
-                    print(f"Picked vertex {hov_idx} | "
-                          f"{self.workspace.bodies[hov_body].name} | "
+                    p = mesh.topo_verts[hov_idx]
+                    print(f"Picked vertex {hov_idx} | {body.name} | "
                           f"pos=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})")
 
             elif hov_ebody is not None:
@@ -1335,12 +1338,16 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     # Route to 3D fillet edge-pick if active
                     if self.route_edge_pick_for_fillet3d(hov_eidx, hov_ebody):
                         return
+                    body = self.workspace.bodies.get(hov_ebody)
+                    if body is None:
+                        # Hover cache pointed at a body that has since been
+                        # removed (e.g. by a split/replace from a downstream op).
+                        return
                     self.selection.select_edge(hov_ebody, hov_eidx,
                                                additive=additive)
                     self.workspace.set_active_body(hov_ebody)
                     self.body_selected.emit(hov_ebody)
-                    print(f"Picked edge {hov_eidx} | "
-                          f"{self.workspace.bodies[hov_ebody].name}")
+                    print(f"Picked edge {hov_eidx} | {body.name}")
 
             else:
                 origin, direction = self.get_ray(e.position().x(),

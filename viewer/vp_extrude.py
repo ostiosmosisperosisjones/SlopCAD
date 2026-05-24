@@ -201,6 +201,7 @@ class ExtrudeMixin:
         panel        = getattr(self, '_extrude_panel', None)
         start_offset = (panel._start_offset.mm_value() or 0.0) if panel else 0.0
         end_offset   = (panel._end_offset.mm_value()   or 0.0) if panel else 0.0
+        draft_angle  = panel.draft_angle_deg() if panel else 0.0
         try:
             if sketch_idx is not None:
                 all_sketch = self._sketch_faces.get(sketch_idx, [])
@@ -231,7 +232,8 @@ class ExtrudeMixin:
 
             self._extrude_preview_mesh = [
                 _do_extrude_solid(f, dist, direction,
-                                  start_offset=start_offset, end_offset=end_offset)
+                                  start_offset=start_offset, end_offset=end_offset,
+                                  draft_angle=draft_angle)
                 for f in preview_faces
             ]
             self._extrude_preview_dist = dist
@@ -668,6 +670,7 @@ class ExtrudeMixin:
                 target_vertex    = (extra or {}).get('target_vertex'),
                 start_offset     = float((extra or {}).get('start_offset', 0.0)),
                 end_offset       = float((extra or {}).get('end_offset', 0.0)),
+                draft_angle      = float((extra or {}).get('draft_angle', 0.0)),
             )
         elif sketch_idx is not None:
             live_faces = self._selected_sketch_face
@@ -681,6 +684,7 @@ class ExtrudeMixin:
                 target_vertex  = (extra or {}).get('target_vertex'),
                 start_offset   = float((extra or {}).get('start_offset', 0.0)),
                 end_offset     = float((extra or {}).get('end_offset', 0.0)),
+                draft_angle    = float((extra or {}).get('draft_angle', 0.0)),
                 force_new_body = (merge_body_id == "__new_body__"),
             )
         else:
@@ -694,6 +698,7 @@ class ExtrudeMixin:
                 target_vertex  = (extra or {}).get('target_vertex'),
                 start_offset   = float((extra or {}).get('start_offset', 0.0)),
                 end_offset     = float((extra or {}).get('end_offset', 0.0)),
+                draft_angle    = float((extra or {}).get('draft_angle', 0.0)),
                 force_new_body = (merge_body_id == "__new_body__"),
             )
 
@@ -726,6 +731,7 @@ class ExtrudeMixin:
         target_vertex = getattr(panel, '_target_vertex', None)
         start_off     = (panel._start_offset.mm_value() or 0.0) if panel else 0.0
         end_off       = (panel._end_offset.mm_value()   or 0.0) if panel else 0.0
+        draft_angle   = panel.draft_angle_deg() if panel else 0.0
 
         editing_idx = getattr(self, '_editing_history_idx', None)
         if editing_idx is not None:
@@ -744,6 +750,8 @@ class ExtrudeMixin:
             extra['start_offset'] = start_off
         if end_off != 0.0:
             extra['end_offset'] = end_off
+        if draft_angle != 0.0:
+            extra['draft_angle'] = draft_angle
 
         if editing_idx is not None:
             self._editing_history_idx = editing_idx  # restore for _commit
@@ -816,6 +824,7 @@ class ExtrudeMixin:
             target_vertex    = (extra or {}).get('target_vertex'),
             start_offset     = float((extra or {}).get('start_offset', 0.0)),
             end_offset       = float((extra or {}).get('end_offset', 0.0)),
+            draft_angle      = float((extra or {}).get('draft_angle', 0.0)),
         )
         op.commit_async(self, extra)
 
@@ -868,14 +877,16 @@ class ExtrudeMixin:
             tool_dir = -np.array([z.X, z.Y, z.Z], dtype=float)
         else:
             tool_dir = np.asarray(direction, dtype=float)
-        start_off = float((extra or {}).get('start_offset', 0.0))
-        end_off   = float((extra or {}).get('end_offset',   0.0))
+        start_off    = float((extra or {}).get('start_offset', 0.0))
+        end_off      = float((extra or {}).get('end_offset',   0.0))
+        draft_angle  = float((extra or {}).get('draft_angle',  0.0))
 
         try:
             tool_solid = None
             for face in tool_faces:
                 s = _do_extrude_solid(face, tool_dist, tool_dir,
-                                      start_offset=start_off, end_offset=end_off)
+                                      start_offset=start_off, end_offset=end_off,
+                                      draft_angle=draft_angle)
                 if tool_solid is None:
                     tool_solid = s
                 else:
@@ -904,6 +915,7 @@ class ExtrudeMixin:
                 target_vertex    = (extra or {}).get('target_vertex'),
                 start_offset     = start_off,
                 end_offset       = end_off,
+                draft_angle      = draft_angle,
             )
 
         fan_out_cut(self, tool_solid, build_op, extra, op_label="Cut")
@@ -957,6 +969,7 @@ class ExtrudeMixin:
             if extra_params:
                 op_params.update(extra_params)
             _merge_body_id = merge_body_id
+            _draft_angle   = float((extra_params or {}).get('draft_angle', 0.0))
 
             def _compute():
                 from build123d import Compound as _C
@@ -964,7 +977,8 @@ class ExtrudeMixin:
                 from OCP.TopTools import TopTools_ListOfShape as _L
                 result = target_occ
                 for fo in face_objs:
-                    tool = _do_extrude_solid(fo, distance, direction)
+                    tool = _do_extrude_solid(fo, distance, direction,
+                                             draft_angle=_draft_angle)
                     lst_a = _L(); lst_a.Append(result)
                     lst_b = _L(); lst_b.Append(tool.wrapped)
                     fuse = _F()
@@ -993,6 +1007,7 @@ class ExtrudeMixin:
             target_vertex  = (extra_params or {}).get('target_vertex'),
             start_offset   = float((extra_params or {}).get('start_offset', 0.0)),
             end_offset     = float((extra_params or {}).get('end_offset', 0.0)),
+            draft_angle    = float((extra_params or {}).get('draft_angle', 0.0)),
             force_new_body = force_new_body,
         )
         op.commit_async(self, extra_params)
@@ -1018,6 +1033,7 @@ class ExtrudeMixin:
             target_vertex  = (extra_params or {}).get('target_vertex'),
             start_offset   = float((extra_params or {}).get('start_offset', 0.0)),
             end_offset     = float((extra_params or {}).get('end_offset', 0.0)),
+            draft_angle    = float((extra_params or {}).get('draft_angle', 0.0)),
             force_new_body = force_new_body,
         )
         op.commit_async(self, extra_params)

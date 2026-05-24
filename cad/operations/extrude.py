@@ -11,7 +11,8 @@ from OCP.BOPAlgo import BOPAlgo_GlueEnum
 def extrude_face(shape, face_idx: int, distance: float,
                  direction: np.ndarray | None = None,
                  start_offset: float = 0.0,
-                 end_offset: float = 0.0):
+                 end_offset: float = 0.0,
+                 draft_angle: float = 0.0):
     """
     Extrude a planar face of *shape* by *distance* along its normal
     (or along *direction* if given).
@@ -34,13 +35,15 @@ def extrude_face(shape, face_idx: int, distance: float,
         return shape
 
     return _do_extrude_boolean(shape, face, distance, direction=direction,
-                               start_offset=start_offset, end_offset=end_offset)
+                               start_offset=start_offset, end_offset=end_offset,
+                               draft_angle=draft_angle)
 
 
 def extrude_face_direct(body_shape, face: Face, distance: float,
                         direction: np.ndarray | None = None,
                         start_offset: float = 0.0,
-                        end_offset: float = 0.0):
+                        end_offset: float = 0.0,
+                        draft_angle: float = 0.0):
     """
     Extrude a face object directly (not looked up by index).
 
@@ -62,23 +65,27 @@ def extrude_face_direct(body_shape, face: Face, distance: float,
 
     if body_shape is None:
         extruded = _do_extrude_solid(face, distance, direction,
-                                     start_offset=start_offset, end_offset=end_offset)
+                                     start_offset=start_offset, end_offset=end_offset,
+                                     draft_angle=draft_angle)
         return Compound(extruded.wrapped)
 
     return _do_extrude_boolean(body_shape, face, distance, glue=False,
                                direction=direction,
-                               start_offset=start_offset, end_offset=end_offset)
+                               start_offset=start_offset, end_offset=end_offset,
+                               draft_angle=draft_angle)
 
 
 def _do_extrude_solid(face: Face, distance: float,
                       direction: np.ndarray | None = None,
                       start_offset: float = 0.0,
-                      end_offset: float = 0.0):
+                      end_offset: float = 0.0,
+                      draft_angle: float = 0.0):
     """Produce the raw extruded solid (no boolean).
 
     start_offset: translate the face along the extrude direction by this amount
                   before extruding, so the solid starts offset from the face.
     end_offset:   shorten the extrude distance by this amount.
+    draft_angle:  taper angle in degrees (positive = walls flare outward).
     """
     from build123d import extrude as b3d_extrude, Vector
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
@@ -114,14 +121,15 @@ def _do_extrude_solid(face: Face, distance: float,
     vec = Vector(float(d[0] * effective_dist),
                  float(d[1] * effective_dist),
                  float(d[2] * effective_dist))
-    return b3d_extrude(face, amount=effective_dist, dir=vec)
+    return b3d_extrude(face, amount=effective_dist, dir=vec, taper=float(draft_angle))
 
 
 def _do_extrude_boolean(shape, face: Face, distance: float,
                         glue: bool = True,
                         direction: np.ndarray | None = None,
                         start_offset: float = 0.0,
-                        end_offset: float = 0.0):
+                        end_offset: float = 0.0,
+                        draft_angle: float = 0.0):
     """
     Shared boolean logic for both extrude entry points.
 
@@ -133,11 +141,12 @@ def _do_extrude_boolean(shape, face: Face, distance: float,
     """
     if distance > 0:
         extruded = _do_extrude_solid(face, distance, direction,
-                                     start_offset=start_offset, end_offset=end_offset)
+                                     start_offset=start_offset, end_offset=end_offset,
+                                     draft_angle=draft_angle)
         op = BRepAlgoAPI_Fuse()
         op.SetArguments(_to_list(shape.wrapped))
         op.SetTools(_to_list(extruded.wrapped))
-        if glue and start_offset == 0.0:
+        if glue and start_offset == 0.0 and draft_angle == 0.0:
             # Glue is only valid when the tool base face coincides with a shape face.
             # With a start_offset the tool is translated away, so glue must be off.
             op.SetGlue(BOPAlgo_GlueEnum.BOPAlgo_GlueShift)
@@ -151,7 +160,8 @@ def _do_extrude_boolean(shape, face: Face, distance: float,
     # coincident with an existing face (OCCT drops geometry when that happens).
     cut_dist = distance - 0.01  # more negative = 0.01mm deeper
     extruded = _do_extrude_solid(face, cut_dist, direction,
-                                 start_offset=start_offset, end_offset=end_offset)
+                                 start_offset=start_offset, end_offset=end_offset,
+                                 draft_angle=draft_angle)
     op = BRepAlgoAPI_Cut()
     op.SetArguments(_to_list(shape.wrapped))
     op.SetTools(_to_list(extruded.wrapped))
@@ -169,7 +179,8 @@ def _do_extrude_boolean(shape, face: Face, distance: float,
             _n  = np.array([_pl.z_dir.X, _pl.z_dir.Y, _pl.z_dir.Z])
             flip_dir = _n
         extruded_flip = _do_extrude_solid(face, abs(cut_dist), flip_dir,
-                                          start_offset=start_offset, end_offset=end_offset)
+                                          start_offset=start_offset, end_offset=end_offset,
+                                          draft_angle=draft_angle)
         op2 = BRepAlgoAPI_Cut()
         op2.SetArguments(_to_list(shape.wrapped))
         op2.SetTools(_to_list(extruded_flip.wrapped))

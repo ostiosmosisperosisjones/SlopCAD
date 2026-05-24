@@ -161,19 +161,6 @@ _SVG_LOFT = """
 </svg>
 """
 
-# Draft: a box face with an angled taper arrow
-_SVG_DRAFT = """
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
-  <polygon points="7,28 29,28 24,10 12,10" fill="#888" fill-opacity="0.08"
-           stroke="#888" stroke-width="1.3" stroke-dasharray="3,2" opacity="0.55"/>
-  <line x1="18" y1="28" x2="18" y2="10" stroke="#888" stroke-width="1"
-        stroke-dasharray="2,2" opacity="0.4"/>
-  <line x1="18" y1="10" x2="24" y2="28" stroke="#888" stroke-width="1" opacity="0.3"/>
-  <text x="18" y="34" text-anchor="middle" font-family="monospace"
-        font-size="7" fill="#888" opacity="0.5">α</text>
-</svg>
-"""
-
 # Fillet: a sharp corner becoming rounded
 _SVG_FILLET = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
@@ -259,7 +246,6 @@ class OpsToolbar(QToolBar):
             "Revolve", _SVG_REVOLVE, self.revolve_requested,
             "Revolve a sketch profile around an axis")
         self._btn_loft     = self._add_stub("Loft",     _SVG_LOFT,     "Loft between two or more profiles  [not yet implemented]")
-        self._btn_draft    = self._add_stub("Draft",    _SVG_DRAFT,    "Apply a draft angle to faces  [not yet implemented]")
 
         self._btn_fillet   = self._add_op_button(
             "Fillet", _SVG_FILLET, self.fillet_requested,

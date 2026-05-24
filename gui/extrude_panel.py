@@ -10,7 +10,8 @@ from cad.prefs import prefs
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QButtonGroup, QRadioButton, QFrame, QSizePolicy,
+    QButtonGroup, QRadioButton, QFrame, QSizePolicy, QCheckBox,
+    QDoubleSpinBox,
 )
 from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui import QKeyEvent
@@ -77,6 +78,37 @@ QPushButton#pick_face[active=true] {
     border-color: #d96a4a;
     color: #ff9977;
 }
+QPushButton#flip_draft[active=true] {
+    background: #2a2a1e;
+    border-color: #d9c44a;
+    color: #e8d878;
+}
+QCheckBox {
+    color: #d4d4d4;
+    font-size: 12px;
+    spacing: 6px;
+}
+QCheckBox::indicator {
+    width: 13px; height: 13px;
+    border-radius: 3px;
+    border: 1px solid #555;
+    background: #2a2a2a;
+}
+QCheckBox::indicator:checked {
+    background: #4a90d9;
+    border-color: #4a90d9;
+}
+QDoubleSpinBox {
+    background: #2a2a2a;
+    color: #d4d4d4;
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 2px 6px;
+    font-size: 12px;
+    font-family: monospace;
+}
+QDoubleSpinBox:focus { border-color: #4a90d9; }
+QDoubleSpinBox:disabled { color: #666; background: #222; }
 QRadioButton {
     color: #d4d4d4;
     font-size: 12px;
@@ -133,6 +165,8 @@ class ExtrudePanel(QWidget):
         self._vertex_dist_mm : float | None = None
         self._merge_body_id  : str | None = None   # picked target body for merge/cut
         self._self_cut       : bool = True          # False only when user explicitly picks a cross-body cut target
+
+        self._draft_flip     : bool = False         # invert draft angle sign
 
         self._build_ui()
 
@@ -267,6 +301,38 @@ class ExtrudePanel(QWidget):
         end_col.addWidget(self._end_offset)
         offset_grid.addLayout(end_col)
         root.addLayout(offset_grid)
+
+        # ── Draft ─────────────────────────────────────────────────────
+        root.addWidget(self._separator())
+        draft_header = QHBoxLayout()
+        draft_header.setSpacing(6)
+        draft_header.addWidget(self._section_label("Draft"))
+        draft_header.addStretch()
+        self._draft_toggle = QCheckBox("Enable")
+        self._draft_toggle.toggled.connect(self._on_draft_toggle)
+        draft_header.addWidget(self._draft_toggle)
+        root.addLayout(draft_header)
+
+        self._draft_row = QWidget()
+        draft_row = QHBoxLayout(self._draft_row)
+        draft_row.setContentsMargins(0, 0, 0, 0)
+        draft_row.setSpacing(6)
+        self._draft_angle = QDoubleSpinBox()
+        self._draft_angle.setRange(-89.0, 89.0)
+        self._draft_angle.setDecimals(2)
+        self._draft_angle.setSingleStep(0.5)
+        self._draft_angle.setSuffix(" °")
+        self._draft_angle.setValue(5.0)
+        self._draft_angle.valueChanged.connect(self._emit_preview)
+        draft_row.addWidget(self._draft_angle, 1)
+        self._draft_flip_btn = QPushButton("⇌")
+        self._draft_flip_btn.setObjectName("flip_draft")
+        self._draft_flip_btn.setToolTip("Flip draft direction (inward / outward)")
+        self._draft_flip_btn.setCheckable(True)
+        self._draft_flip_btn.clicked.connect(self._on_draft_flip)
+        draft_row.addWidget(self._draft_flip_btn)
+        root.addWidget(self._draft_row)
+        self._draft_row.setEnabled(False)
 
         # ── Direction ─────────────────────────────────────────────────
         root.addWidget(self._separator())
@@ -576,6 +642,43 @@ class ExtrudePanel(QWidget):
         self._flip_btn.setText("⇅" if not checked else "⇵")
         self._recompute_vertex_dist()
         self._emit_preview()
+
+    def _on_draft_toggle(self, checked: bool):
+        self._draft_row.setEnabled(checked)
+        self._emit_preview()
+
+    def _on_draft_flip(self, checked: bool):
+        self._draft_flip = checked
+        self._draft_flip_btn.setProperty("active", checked)
+        self._draft_flip_btn.style().unpolish(self._draft_flip_btn)
+        self._draft_flip_btn.style().polish(self._draft_flip_btn)
+        self._emit_preview()
+
+    def draft_angle_deg(self) -> float:
+        """Signed draft angle in degrees; 0.0 when the draft toggle is off."""
+        if not self._draft_toggle.isChecked():
+            return 0.0
+        ang = float(self._draft_angle.value())
+        return -ang if self._draft_flip else ang
+
+    def set_draft(self, angle_deg: float):
+        """Restore draft state from a stored value (used by reopen)."""
+        if angle_deg == 0.0:
+            self._draft_toggle.setChecked(False)
+            self._draft_flip = False
+            self._draft_flip_btn.setChecked(False)
+            self._draft_flip_btn.setProperty("active", False)
+            self._draft_flip_btn.style().unpolish(self._draft_flip_btn)
+            self._draft_flip_btn.style().polish(self._draft_flip_btn)
+            return
+        self._draft_toggle.setChecked(True)
+        flip = angle_deg < 0
+        self._draft_flip = flip
+        self._draft_flip_btn.setChecked(flip)
+        self._draft_flip_btn.setProperty("active", flip)
+        self._draft_flip_btn.style().unpolish(self._draft_flip_btn)
+        self._draft_flip_btn.style().polish(self._draft_flip_btn)
+        self._draft_angle.setValue(abs(angle_deg))
 
     def _on_op_changed(self, btn_id: int):
         # Enable pick body only when "Merge with" is selected

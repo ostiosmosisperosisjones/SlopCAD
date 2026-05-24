@@ -42,6 +42,7 @@ class FaceExtrudeOp(Op):
     target_vertex:  list[float] | None = None
     start_offset:   float = 0.0
     end_offset:     float = 0.0
+    draft_angle:    float = 0.0     # taper angle in degrees (signed)
     force_new_body: bool  = False
     face_indices:   list  = None   # face indices (single body, compat)
     face_refs:      list  = None   # FaceRef per face, built at commit
@@ -109,7 +110,8 @@ class FaceExtrudeOp(Op):
                     face_obj = all_f[fi]
                 extruded = _do_extrude_solid(face_obj, self.distance, direction,
                                              start_offset=self.start_offset,
-                                             end_offset=self.end_offset)
+                                             end_offset=self.end_offset,
+                                             draft_angle=self.draft_angle)
                 if result_solid is None:
                     result_solid = extruded.wrapped
                 else:
@@ -153,7 +155,8 @@ class FaceExtrudeOp(Op):
             current = extrude_face(current, fi, self.distance,
                                    direction=direction,
                                    start_offset=self.start_offset,
-                                   end_offset=self.end_offset)
+                                   end_offset=self.end_offset,
+                                   draft_angle=self.draft_angle)
         return current
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
@@ -220,6 +223,7 @@ class FaceExtrudeOp(Op):
             body_id      = self.source_body_id
             start_offset = self.start_offset
             end_offset   = self.end_offset
+            draft_angle  = self.draft_angle
 
             def compute():
                 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
@@ -228,7 +232,8 @@ class FaceExtrudeOp(Op):
                 for fo in face_objs:
                     extruded = _do_extrude_solid(fo, distance, direction,
                                                  start_offset=start_offset,
-                                                 end_offset=end_offset)
+                                                 end_offset=end_offset,
+                                                 draft_angle=draft_angle)
                     if result_occ is None:
                         result_occ = extruded.wrapped
                     else:
@@ -271,6 +276,7 @@ class FaceExtrudeOp(Op):
         distance     = self.distance
         start_offset = self.start_offset
         end_offset   = self.end_offset
+        draft_angle  = self.draft_angle
         face_refs_snap = list(self.face_refs)
 
         def compute():
@@ -282,7 +288,8 @@ class FaceExtrudeOp(Op):
                         f"FaceExtrudeOp compute: could not locate face "
                         f"(normal={ref.normal}, area={ref.area:.3f})")
                 current = extrude_face(current, fi, distance, direction=direction,
-                                       start_offset=start_offset, end_offset=end_offset)
+                                       start_offset=start_offset, end_offset=end_offset,
+                                       draft_angle=draft_angle)
             if not list(current.solids()):
                 raise RuntimeError("Boolean result has no solids.")
             return current
@@ -335,6 +342,9 @@ class FaceExtrudeOp(Op):
         if self.end_offset:
             panel._end_offset.set_mm(self.end_offset)
 
+        if self.draft_angle:
+            panel.set_draft(self.draft_angle)
+
         if self.target_vertex is not None:
             panel._radio_vertex.setChecked(True)
             panel._on_target_mode_changed(1)
@@ -367,6 +377,8 @@ class FaceExtrudeOp(Op):
             p["start_offset"] = self.start_offset
         if self.end_offset:
             p["end_offset"] = self.end_offset
+        if self.draft_angle:
+            p["draft_angle"] = self.draft_angle
         if self.force_new_body:
             p["force_new_body"] = True
         return p
@@ -404,6 +416,7 @@ class FaceExtrudeOp(Op):
             target_vertex  = params.get("target_vertex"),
             start_offset   = float(params.get("start_offset", 0.0)),
             end_offset     = float(params.get("end_offset", 0.0)),
+            draft_angle    = float(params.get("draft_angle", 0.0)),
             force_new_body = bool(params.get("force_new_body", False)),
         )
 
@@ -439,6 +452,7 @@ class CrossBodyCutOp(Op):
     target_vertex:     list[float] | None = None
     start_offset:      float = 0.0
     end_offset:        float = 0.0
+    draft_angle:       float = 0.0   # taper angle in degrees (signed)
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         import numpy as np
@@ -514,7 +528,8 @@ class CrossBodyCutOp(Op):
             else:
                 fd = tool_dir
             s = _do_extrude_solid(face, tool_dist, fd,
-                                  start_offset=self.start_offset, end_offset=self.end_offset)
+                                  start_offset=self.start_offset, end_offset=self.end_offset,
+                                  draft_angle=self.draft_angle)
             if tool_solid is None:
                 tool_solid = s
             else:
@@ -608,6 +623,7 @@ class CrossBodyCutOp(Op):
         tool_dist    = self.distance + 0.01
         start_offset = self.start_offset
         end_offset   = self.end_offset
+        draft_angle  = self.draft_angle
 
         op_params = self.to_params()
         if extra_params:
@@ -622,7 +638,8 @@ class CrossBodyCutOp(Op):
                     z  = Plane(face).z_dir
                     fd = -np.array([z.X, z.Y, z.Z], dtype=float)
                 s = _do_extrude_solid(face, tool_dist, fd,
-                                      start_offset=start_offset, end_offset=end_offset)
+                                      start_offset=start_offset, end_offset=end_offset,
+                                      draft_angle=draft_angle)
                 if tool_solid is None:
                     tool_solid = s
                 else:
@@ -695,6 +712,9 @@ class CrossBodyCutOp(Op):
         if self.end_offset:
             panel._end_offset.set_mm(self.end_offset)
 
+        if self.draft_angle:
+            panel.set_draft(self.draft_angle)
+
         if self.target_vertex is not None:
             panel._radio_vertex.setChecked(True)
             panel._on_target_mode_changed(1)
@@ -722,6 +742,8 @@ class CrossBodyCutOp(Op):
             p["start_offset"] = self.start_offset
         if self.end_offset:
             p["end_offset"] = self.end_offset
+        if self.draft_angle:
+            p["draft_angle"] = self.draft_angle
         return p
 
     @classmethod
@@ -736,6 +758,7 @@ class CrossBodyCutOp(Op):
             target_vertex    = params.get("target_vertex"),
             start_offset     = float(params.get("start_offset", 0.0)),
             end_offset       = float(params.get("end_offset", 0.0)),
+            draft_angle      = float(params.get("draft_angle", 0.0)),
         )
 
 
@@ -768,6 +791,7 @@ class SketchExtrudeOp(Op):
     target_vertex:   list[float] | None = None
     start_offset:    float = 0.0
     end_offset:      float = 0.0
+    draft_angle:     float = 0.0       # taper angle in degrees (signed)
     force_new_body:  bool  = False
     merged_from:     str   | None = None
 
@@ -847,7 +871,8 @@ class SketchExtrudeOp(Op):
         for face in faces:
             result = extrude_face_direct(result, face, signed_dist,
                                          start_offset=self.start_offset,
-                                         end_offset=self.end_offset)
+                                         end_offset=self.end_offset,
+                                         draft_angle=self.draft_angle)
 
         solids = list(result.solids())
         solids.sort(key=lambda s: s.volume, reverse=True)
@@ -936,6 +961,7 @@ class SketchExtrudeOp(Op):
         distance     = self.distance
         start_offset = self.start_offset
         end_offset   = self.end_offset
+        draft_angle  = self.draft_angle
 
         if self.merge_body_id is not None and not self.force_new_body:
             target_shape = viewport.workspace.current_shape(self.merge_body_id)
@@ -956,7 +982,8 @@ class SketchExtrudeOp(Op):
                 tool_solid = None
                 for face in faces:
                     s = _do_extrude_solid(face, distance, direction,
-                                          start_offset=start_offset, end_offset=end_offset)
+                                          start_offset=start_offset, end_offset=end_offset,
+                                          draft_angle=draft_angle)
                     if tool_solid is None:
                         tool_solid = s
                     else:
@@ -991,7 +1018,8 @@ class SketchExtrudeOp(Op):
             result = None if force_new else shape_before
             for face in faces:
                 result = extrude_face_direct(result, face, distance, direction=direction,
-                                             start_offset=start_offset, end_offset=end_offset)
+                                             start_offset=start_offset, end_offset=end_offset,
+                                             draft_angle=draft_angle)
             if not force_new and not list(result.solids()):
                 raise RuntimeError("Sketch extrude produced no solids.")
             return result
@@ -1078,6 +1106,9 @@ class SketchExtrudeOp(Op):
         if self.end_offset:
             panel._end_offset.set_mm(self.end_offset)
 
+        if self.draft_angle:
+            panel.set_draft(self.draft_angle)
+
         if self.target_vertex is not None:
             panel._radio_vertex.setChecked(True)
             panel._on_target_mode_changed(1)
@@ -1108,6 +1139,8 @@ class SketchExtrudeOp(Op):
             p["start_offset"] = self.start_offset
         if self.end_offset:
             p["end_offset"] = self.end_offset
+        if self.draft_angle:
+            p["draft_angle"] = self.draft_angle
         if self.force_new_body:
             p["force_new_body"] = True
         return p
@@ -1125,6 +1158,7 @@ class SketchExtrudeOp(Op):
             target_vertex  = params.get("target_vertex"),
             start_offset   = float(params.get("start_offset", 0.0)),
             end_offset     = float(params.get("end_offset", 0.0)),
+            draft_angle    = float(params.get("draft_angle", 0.0)),
             force_new_body = bool(params.get("force_new_body", False)),
             merged_from    = params.get("merged_from"),
         )
