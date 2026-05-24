@@ -4,10 +4,10 @@ gui/mainwindow.py
 
 import os
 from PyQt6.QtWidgets import (
-    QMainWindow, QFileDialog, QSplitter
+    QMainWindow, QFileDialog, QSplitter, QWidget
 )
 from PyQt6.QtGui import QAction, QKeySequence
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QEvent
 
 from gui.toolbar import OpsToolbar, SketchToolbar
 
@@ -31,6 +31,16 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_statusbar()
         self.new_workspace()
+
+    def changeEvent(self, event):
+        # When the main window is activated, raise all child Qt.Tool panels
+        # so they don't get stuck behind it on WMs that don't propagate
+        # owner-window z-order automatically.
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            for child in self.findChildren(QWidget):
+                if child.isWindow() and child.isVisible():
+                    child.raise_()
+        super().changeEvent(event)
 
     def _build_toolbar(self):
         self._ops_toolbar = OpsToolbar(self)

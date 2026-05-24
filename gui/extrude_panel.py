@@ -108,11 +108,11 @@ class ExtrudePanel(QWidget):
     face_entry_removed     = pyqtSignal(int)   # index of removed entry (forwarded from SelectionList)
 
     def __init__(self, workspace, parent=None):
-        super().__init__(None)   # top-level so it's never clipped by the viewport
-        self.setWindowFlags(
-            Qt.WindowType.Tool |
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint)
+        # Parent to the top-level main window so this Tool window rides its
+        # z-order (raises when the main window is activated).
+        super().__init__(parent.window() if parent is not None else None)
+        self.setWindowFlags(Qt.WindowType.Tool)
+        self.setWindowTitle("Extrude / Cut")
         self._viewport = parent  # keep reference for positioning
         self.setObjectName("ExtrudePanel")
         self.setStyleSheet(prefs.scale_stylesheet(_PANEL_STYLE))
