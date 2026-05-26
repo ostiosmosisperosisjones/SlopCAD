@@ -257,6 +257,16 @@ class BooleanPanel(QWidget):
     def remove_tool_entry(self, index: int):
         self._tool_list.remove_at(index)
 
+    def set_body_entry_error(self, index: int, message: str):
+        self._target_list.set_error(index, message)
+
+    def set_tool_entry_error(self, index: int, message: str):
+        self._tool_list.set_error(index, message)
+
+    def clear_entry_errors(self):
+        self._target_list.clear_errors()
+        self._tool_list.clear_errors()
+
     def _has_selection(self) -> bool:
         op = self._get_operation()
         if op == "subtract":
@@ -314,6 +324,11 @@ class BooleanPanel(QWidget):
 
     def _on_ok(self):
         if not self._has_selection():
+            return
+        # Block OK when any entry is flagged (e.g. disjoint inputs).
+        if not self._target_list.has_valid_entries:
+            return
+        if self._get_operation() == "subtract" and not self._tool_list.has_valid_entries:
             return
         op = self._get_operation()
         keep = self._keep_chk.isChecked()

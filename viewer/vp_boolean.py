@@ -13,6 +13,30 @@ Preview computes the boolean live and swaps the result in for the first body.
 from __future__ import annotations
 
 
+_TOUCH_TOL = 1e-6  # mm — shapes within this distance are considered touching
+
+
+def _shapes_share_geometry(a, b) -> bool:
+    """True if shapes a and b overlap OR touch (within _TOUCH_TOL mm).
+
+    Uses BRepExtrema_DistShapeShape — returns the minimum distance between
+    any two points on the shapes. Zero means they overlap or abut (including
+    face-to-face contact and edge-to-face contact). This handles the
+    "butt-to-butt on the same plane" case that BRepAlgoAPI_Common can't —
+    coplanar abutting parts have zero common volume but zero distance.
+    """
+    try:
+        from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+
+        ext = BRepExtrema_DistShapeShape(a.wrapped, b.wrapped)
+        ext.Perform()
+        if not ext.IsDone():
+            return True   # OCC couldn't decide — don't flag the user
+        return ext.Value() <= _TOUCH_TOL
+    except Exception:
+        return True
+
+
 class BooleanMixin:
 
     # ------------------------------------------------------------------
@@ -173,6 +197,8 @@ class BooleanMixin:
             else:
                 self._boolean_body_ids.append(body_id)
                 panel.add_body_entry(body_id, body.name)
+        # Trigger preview recompute (which also re-runs the disjoint check).
+        panel.preview_changed.emit()
         return True
 
     # ------------------------------------------------------------------
@@ -195,6 +221,9 @@ class BooleanMixin:
         else:
             all_ids = body_ids
 
+        # Clear any prior intersection errors before recomputing.
+        panel.clear_entry_errors()
+
         if len(all_ids) < 2:
             self._boolean_preview_mesh = None
             self.update()
@@ -208,6 +237,10 @@ class BooleanMixin:
                 self.update()
                 return
             shapes.append(s)
+
+        # Intersection check — mark disjoint inputs red.
+        self._mark_disjoint_inputs(panel, op, body_ids, tool_ids if op == "subtract" else [],
+                                   shapes)
 
         try:
             from OCP.BRepAlgoAPI import (
@@ -256,6 +289,65 @@ class BooleanMixin:
             self._boolean_preview_mesh = None
 
         self.update()
+
+    def _mark_disjoint_inputs(self, panel, op, body_ids, tool_ids, shapes):
+        """Mark inputs that don't actually intersect another participant.
+
+        Two-tier check per pair:
+          1. Bbox-overlap (cheap, definitive when boxes are disjoint).
+          2. BRepAlgoAPI_Common (exact, only run when bboxes overlap).
+
+        A pair is "touching" when the common volume has at least one solid
+        OR at least one face/edge in shared boundary (so coplanar abutting
+        parts also count). Inputs with no touching neighbor get flagged.
+        """
+        from cad.cut_all import bboxes_overlap
+
+        bboxes = []
+        for s in shapes:
+            try:
+                bboxes.append(s.bounding_box())
+            except Exception:
+                bboxes.append(None)
+
+        n = len(shapes)
+        # Memoize pair results so each common-volume check runs at most once.
+        cache: dict[tuple[int, int], bool] = {}
+
+        def intersects(i: int, j: int) -> bool:
+            key = (i, j) if i < j else (j, i)
+            if key in cache:
+                return cache[key]
+            if bboxes[i] is None or bboxes[j] is None:
+                cache[key] = True   # can't tell — give the benefit of the doubt
+                return True
+            if not bboxes_overlap(bboxes[i], bboxes[j]):
+                cache[key] = False
+                return False
+            # Bboxes overlap; confirm with exact common.
+            result = _shapes_share_geometry(shapes[i], shapes[j])
+            cache[key] = result
+            return result
+
+        if op == "subtract":
+            # body_ids = [target]; tool_ids in shapes[1:]. Each tool must touch target.
+            if n < 2:
+                return
+            for k, _tid in enumerate(tool_ids):
+                tool_idx = 1 + k
+                if tool_idx >= n:
+                    break
+                if not intersects(0, tool_idx):
+                    panel.set_tool_entry_error(
+                        k, "Tool does not intersect the target — subtract will be a no-op.")
+        else:
+            # union / intersect: each body must touch at least one other.
+            for i in range(n):
+                touched = any(intersects(i, j) for j in range(n) if j != i)
+                if not touched:
+                    msg = ("Body does not intersect any other selected body — "
+                           f"{op} will produce a disjoint result.")
+                    panel.set_body_entry_error(i, msg)
 
     def _draw_boolean_preview(self):
         """No-op — the preview solid is drawn via _visible_meshes swap
