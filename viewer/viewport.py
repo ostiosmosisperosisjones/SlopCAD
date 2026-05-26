@@ -34,12 +34,16 @@ from viewer.vp_async import AsyncOpMixin
 from viewer.vp_offset import VpOffsetMixin
 from viewer.vp_fillet import VpFilletMixin
 from viewer.vp_fillet3d import Fillet3DMixin
+from viewer.vp_offset_plane import OffsetPlaneMixin
+from viewer.vp_loft import LoftMixin
+from viewer.vp_chamfer import ChamferMixin
+from viewer.vp_boolean import BooleanMixin
 from cad.workspace import Workspace
 from cad.history import History
 from cad.selection import SelectionSet
 
 
-class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, ExtrudeMixin, ThickenMixin, RevolveMixin, VpOffsetMixin, VpFilletMixin, Fillet3DMixin, QOpenGLWidget):
+class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, ExtrudeMixin, ThickenMixin, RevolveMixin, VpOffsetMixin, VpFilletMixin, Fillet3DMixin, OffsetPlaneMixin, LoftMixin, ChamferMixin, BooleanMixin, QOpenGLWidget):
     history_changed     = pyqtSignal()
     selection_changed   = pyqtSignal()
     sketch_mode_changed = pyqtSignal(bool)
@@ -94,6 +98,39 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.request_extrude_distance  = None
         self._offset_panel         = None
         self._fillet_panel         = None
+        self._offset_plane_panel        = None
+        self._offset_plane_face_active  = False
+        self._offset_plane_preview      = None
+        self._editing_offset_plane_idx  = None
+        self._hovered_plane_idx         = None
+        self._selected_plane_idx        = None
+        self._loft_panel               = None
+        self._loft_profile_pick_active = False
+        self._loft_body_pick_active    = False
+        self._loft_preview_mesh        = None
+        self._loft_preview_is_cut      = False
+        self._editing_loft_idx         = None
+        self._chamfer_panel            = None
+        self._chamfer_body_id          = None
+        self._chamfer_face_indices     = []
+        self._chamfer_edge_indices     = []
+        self._chamfer_preview_mesh     = None
+        self._chamfer_preview_token    = None
+        self._chamfer_computing        = False
+        self._chamfer_pending          = None
+        self._chamfer_pick_face        = False
+        self._chamfer_pick_edge        = False
+        self._editing_chamfer_idx      = None
+        self._boolean_panel            = None
+        self._boolean_body_ids             = []
+        self._boolean_tool_ids             = []
+        self._boolean_operation            = None
+        self._boolean_keep_inputs          = False
+        self._boolean_preview_mesh         = None
+        self._boolean_pick_active          = False
+        self._boolean_pick_target          = False
+        self._boolean_pick_tool            = False
+        self._editing_boolean_idx          = None
         self._extrude_panel        = None
         self._extrude_pick_active  = False
         self._extrude_vtx_active   = False
@@ -106,7 +143,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._extrude_arrow_dir    = None
         self._drag_arrow_active      = False  # True while dragging any op arrow
         self._drag_arrow_axis_origin = None  # world point on drag axis
-        self._drag_arrow_op          = None  # 'extrude' | 'thicken' | 'revolve' | 'fillet3d'
+        self._drag_arrow_op          = None  # 'extrude' | 'thicken' | 'revolve' | 'fillet3d' | 'chamfer'
         self._drag_arrow_grab_offset = 0.0   # s_at_click - panel_value; subtracted during drag
         self._revolve_preview_mesh   = None
         self._revolve_arrow_origin   = None
@@ -232,6 +269,30 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         if preview is not None and body_id is not None and body_id in meshes:
             meshes = dict(meshes)
             meshes[body_id] = preview
+        # Chamfer preview: same pattern
+        ch_preview = getattr(self, '_chamfer_preview_mesh', None)
+        ch_body    = getattr(self, '_chamfer_body_id', None)
+        if ch_preview is not None and ch_body is not None and ch_body in meshes:
+            meshes = dict(meshes)
+            meshes[ch_body] = ch_preview
+        # Boolean preview: swap first body mesh with preview mesh
+        bool_preview = getattr(self, '_boolean_preview_mesh', None)
+        bool_body_ids = getattr(self, '_boolean_body_ids', [])
+        bool_tool_ids = getattr(self, '_boolean_tool_ids', [])
+        bool_op = getattr(self, '_boolean_operation', None)
+        if bool_preview is not None:
+            if bool_op == "subtract" and bool_body_ids:
+                # Subtract: preview replaces target body
+                target = bool_body_ids[0]
+                if target in meshes:
+                    meshes = dict(meshes)
+                    meshes[target] = bool_preview
+            elif bool_body_ids:
+                # Union/intersect: preview replaces the first body
+                first = bool_body_ids[0]
+                if first in meshes:
+                    meshes = dict(meshes)
+                    meshes[first] = bool_preview
         return meshes
 
     def fit_camera_to_scene(self):
@@ -372,6 +433,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             draw_world_planes(self.workspace.world_plane_visible,
                               scene_radius=max(20.0, scene_r))
 
+        # Offset plane datums + in-progress panel preview
+        from viewer.plane_overlay import draw_offset_planes
+        draw_offset_planes(self)
+
         self._modelview  = glGetDoublev(GL_MODELVIEW_MATRIX)
         self._projection = glGetDoublev(GL_PROJECTION_MATRIX)
         self._viewport   = glGetIntegerv(GL_VIEWPORT)
@@ -387,6 +452,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._draw_thicken_preview()
         self._draw_revolve_preview()
         self._draw_fillet3d_preview()
+        self._draw_chamfer_preview()
+        self._draw_boolean_preview()
+        self._draw_loft_preview()
 
         self._dim_labels = draw_overlays(visible, self.selection,
                       self._hovered_vertex, self._hovered_edge,
@@ -683,11 +751,41 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._drag_arrow_op     = 'fillet3d'
         return True
 
+    def _hit_chamfer_arrow(self, mx: int, my: int) -> bool:
+        if getattr(self, '_chamfer_panel', None) is None:
+            return False
+        arrow_origin = getattr(self, '_chamfer_arrow_origin', None)
+        arrow_dir    = getattr(self, '_chamfer_arrow_dir',    None)
+        if arrow_origin is None or arrow_dir is None:
+            return False
+        ray_o, ray_d = self.get_ray(mx, my)
+        if ray_o is None:
+            return False
+        from viewer.drag_arrow import DragArrow
+        panel = getattr(self, '_chamfer_panel', None)
+        dist  = (panel._distance_spin.mm_value() or 1.0) if panel else 1.0
+        scale = self._arrow_scale(dist)
+        if DragArrow().hit_test(ray_o, ray_d, arrow_origin, arrow_dir, scale) is None:
+            return False
+        import numpy as np
+        base = getattr(self, '_chamfer_arrow_base', None)
+        self._drag_arrow_axis_origin = (np.asarray(base, dtype=float)
+                                        if base is not None
+                                        else np.asarray(arrow_origin, dtype=float))
+        s_click = self._closest_point_on_axis(ray_o, ray_d,
+                                              self._drag_arrow_axis_origin, arrow_dir)
+        current = dist
+        self._drag_arrow_grab_offset = (s_click - current) if s_click is not None else 0.0
+        self._drag_arrow_active = True
+        self._drag_arrow_op     = 'chamfer'
+        return True
+
     def _hit_any_arrow(self, mx: int, my: int) -> bool:
         return (self._hit_extrude_arrow(mx, my) or
                 self._hit_thicken_arrow(mx, my) or
                 self._hit_revolve_arrow(mx, my) or
-                self._hit_fillet3d_arrow(mx, my))
+                self._hit_fillet3d_arrow(mx, my) or
+                self._hit_chamfer_arrow(mx, my))
 
     def _update_arrow_drag(self, mx: int, my: int):
         import numpy as np
@@ -794,6 +892,22 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 return
             panel._spinbox.set_mm(s)
             self._reposition_fillet3d_arrow()
+            self.update()
+            panel._emit_preview()
+
+        elif op == 'chamfer':
+            arrow_dir = getattr(self, '_chamfer_arrow_dir', None)
+            if arrow_dir is None:
+                return
+            s = self._closest_point_on_axis(ray_o, ray_d, axis_origin, arrow_dir)
+            if s is None:
+                return
+            s = max(0.001, min(10000.0, s - grab_off))
+            panel = getattr(self, '_chamfer_panel', None)
+            if panel is None:
+                return
+            panel._distance_spin.set_mm(s)
+            self._reposition_chamfer_arrow()
             self.update()
             panel._emit_preview()
 
@@ -1029,6 +1143,12 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             if hidx is not None:
                 self._reenter_sketch(hidx)
                 return
+        # Try offset planes
+        from viewer.plane_overlay import pick_offset_plane
+        plane_idx = pick_offset_plane(self, origin, direction)
+        if plane_idx is not None:
+            self._enter_sketch_on_offset_plane(plane_idx)
+            return
         # Try visible world planes
         axis = self._pick_world_plane(origin, direction)
         if axis is not None:
@@ -1338,6 +1458,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     # Route to 3D fillet edge-pick if active
                     if self.route_edge_pick_for_fillet3d(hov_eidx, hov_ebody):
                         return
+                    # Route to chamfer edge-pick if active
+                    if self.route_edge_pick_for_chamfer(hov_eidx, hov_ebody):
+                        return
                     body = self.workspace.bodies.get(hov_ebody)
                     if body is None:
                         # Hover cache pointed at a body that has since been
@@ -1358,6 +1481,12 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         if self.route_sketch_face_pick_for_extrude(hidx, fidx):
                             self.update()
                             return
+                        if self.route_sketch_face_pick_for_offset_plane(hidx):
+                            self.update()
+                            return
+                        if self.route_sketch_face_pick_for_loft(hidx, fidx):
+                            self.update()
+                            return
                         self._selected_sketch_entry = hidx
                         self._selected_sketch_face  = [fidx]
                         self.selection.clear()
@@ -1372,6 +1501,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 body_id, idx = self._pick_at(e.position())
                 if idx is not None and self.route_face_pick_for_fillet3d(body_id, idx):
                     return
+                if idx is not None and self.route_face_pick_for_chamfer(body_id, idx):
+                    return
                 if idx is not None and self.route_face_pick_for_thicken(body_id, idx):
                     return
                 if idx is not None and self.route_face_pick_for_extrude(body_id, idx):
@@ -1382,9 +1513,16 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     return
                 if idx is not None and self.route_body_pick_for_revolve(body_id):
                     return
+                if idx is not None and self.route_face_pick_for_offset_plane(body_id, idx):
+                    return
+                if idx is not None and self.route_body_pick_for_loft(body_id):
+                    return
+                if idx is not None and self.route_body_pick_for_boolean(body_id):
+                    return
                 if idx is not None and body_id in self.workspace.bodies:
                     self._selected_sketch_entry = None
                     self._selected_sketch_face  = None
+                    self._selected_plane_idx    = None
                     self.selection.select_face(body_id, idx, additive=additive)
                     self.workspace.set_active_body(body_id)
                     self.body_selected.emit(body_id)
@@ -1399,11 +1537,26 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         print(f"Picked face {idx} | "
                               f"{self.workspace.bodies[body_id].name} | "
                               f"non-planar")
-                elif not additive:
-                    self._selected_sketch_entry = None
-                    self._selected_sketch_face  = None
-                    self.selection.clear()
-                    self.body_selected.emit(None)
+                else:
+                    # Try offset-plane pick before clearing selection
+                    from viewer.plane_overlay import pick_offset_plane
+                    ro, rd = self.get_ray(e.position().x(), e.position().y())
+                    plane_idx = (pick_offset_plane(self, ro, rd)
+                                 if ro is not None else None)
+                    if plane_idx is not None:
+                        self._selected_plane_idx    = plane_idx
+                        self._selected_sketch_entry = None
+                        self._selected_sketch_face  = None
+                        self.selection.clear()
+                        self.body_selected.emit(None)
+                        entry = self.history.entries[plane_idx]
+                        print(f"[OffsetPlane] Selected {entry.label}")
+                    elif not additive:
+                        self._selected_plane_idx    = None
+                        self._selected_sketch_entry = None
+                        self._selected_sketch_face  = None
+                        self.selection.clear()
+                        self.body_selected.emit(None)
 
             self.selection_changed.emit()
             self.update()
@@ -1456,10 +1609,35 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         new_v = self.hover.vertex_at(x, y)
         new_e = (None, None) if new_v[0] is not None \
                 else self.hover.edge_at(x, y)
+        # While picking edges for fillet/chamfer, sketch edges are not valid
+        # targets — drop them from hover so they don't highlight or click.
+        if new_e[0] is not None and (
+                getattr(self, '_fillet3d_pick_edge', False) or
+                getattr(self, '_chamfer_pick_edge', False)):
+            from viewer.hover import parse_sketch_key
+            if parse_sketch_key(new_e[0]) is not None:
+                new_e = (None, None)
         hover_changed = (new_v != self._hovered_vertex or
                          new_e != self._hovered_edge)
         self._hovered_vertex = new_v
         self._hovered_edge   = new_e
+
+        # Plane hover — only when no body-surface element is under the cursor,
+        # and we're not in active sketch mode.
+        new_plane_idx = None
+        if (new_v[0] is None and new_e[0] is None and
+                self._sketch is None):
+            from viewer.plane_overlay import pick_offset_plane
+            ro, rd = self.get_ray(x, y)
+            if ro is not None:
+                # Also need to lose to a face hit so picking-a-face-behind-a-plane
+                # still works in pick modes.  Cheap check: ask the GPU pick.
+                face_body, face_idx = self._pick_at(e.position())
+                if face_idx is None:
+                    new_plane_idx = pick_offset_plane(self, ro, rd)
+        if new_plane_idx != self._hovered_plane_idx:
+            self._hovered_plane_idx = new_plane_idx
+            hover_changed = True
 
         sketch_changed = False
         if self._sketch is not None:

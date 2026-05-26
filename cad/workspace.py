@@ -33,7 +33,9 @@ class Body:
     name:            str
     visible:         bool = True
     source_shape:    Any  = None   # original solid, set on import
-    created_at_entry_id: str | None = None  # entry_id of the op that created this body; None = always visible
+    created_at_entry_id:  str | None = None  # entry_id of the op that created this body; None = always existed
+    consumed_at_entry_id: str | None = None  # entry_id of the op that consumed this body (e.g. boolean union);
+                                              # body is invisible when cursor >= this entry's index
 
 
 class Workspace:
@@ -53,9 +55,14 @@ class Workspace:
     # Body management
     # ------------------------------------------------------------------
 
-    def add_body(self, name: str, source_shape) -> Body:
+    def add_body(self, name: str, source_shape, body_id: str | None = None) -> Body:
+        """
+        Create a Body and register it in the workspace. If body_id is given,
+        the body adopts that exact uuid — used by the edit path to preserve
+        identity across re-commits so downstream ops keep their source refs.
+        """
         body = Body(
-            id           = uuid.uuid4().hex,
+            id           = body_id if body_id else uuid.uuid4().hex,
             name         = name,
             source_shape = source_shape,
         )
@@ -122,6 +129,15 @@ class Workspace:
                 return None
             if entries[created_idx].error:
                 return None
+
+        # If consumed by a later op (e.g. boolean union), body becomes invisible
+        # once cursor reaches the consuming op. Stepping back makes it reappear.
+        if body.consumed_at_entry_id is not None:
+            consumed_idx = self.history.id_to_index(body.consumed_at_entry_id)
+            if consumed_idx is not None and cursor >= consumed_idx:
+                # Consumption only takes effect if the consuming op itself succeeded
+                if not entries[consumed_idx].error:
+                    return None
 
         # Find the last entry for this body at-or-before the cursor.
         last_entry = None

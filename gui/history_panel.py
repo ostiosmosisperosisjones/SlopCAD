@@ -51,21 +51,29 @@ _BORDER_DIVERGED = "#6e5a20"
 _BORDER_ERROR  = "#8a2020"
 
 _OP_ACCENT = {
-    "import":      "#505050",
-    "extrude":     "#3a6e44",
-    "cut":         "#6e3a3a",
-    "sketch":      "#4a6e8a",
-    "revolve_cut": "#6e3a3a",
+    "import":       "#505050",
+    "extrude":      "#3a6e44",
+    "cut":          "#6e3a3a",
+    "sketch":       "#4a6e8a",
+    "revolve_cut":  "#6e3a3a",
+    "offset_plane": "#6acce0",
+    "loft":         "#7a9e44",
+    "loft_cut":     "#9e7a44",
+    "chamfer":      "#4a8a82",
 }
 
 
 def _op_icon(op: str) -> str:
     return {
-        "import":      "⬡",
-        "extrude":     "▲",
-        "cut":         "▼",
-        "sketch":      "⬜",
-        "revolve_cut": "▼",
+        "import":       "⬡",
+        "extrude":      "▲",
+        "cut":          "▼",
+        "sketch":       "⬜",
+        "revolve_cut":  "▼",
+        "offset_plane": "▱",
+        "loft":         "⌬",
+        "loft_cut":     "⌬",
+        "chamfer":      "◢",
     }.get(op, "•")
 
 
@@ -182,13 +190,20 @@ class _EntryWidget(QFrame):
             }}
         """)
 
-        editable = entry.operation in EDIT_SCHEMA and not is_future
+        # Show ✎ for any op the panel can reopen — EDIT_SCHEMA covers the
+        # generic-dialog path; the hard-coded reopen branches below cover
+        # the rest (thicken, revolve, loft, …).
+        _REOPENABLE = {"extrude", "cut", "thicken", "revolve", "revolve_cut",
+                       "fillet", "chamfer", "loft", "loft_cut", "offset_plane"}
+        editable = ((entry.operation in EDIT_SCHEMA
+                     or entry.operation in _REOPENABLE)
+                    and not is_future)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 4, 10, 4)
         outer.setSpacing(1)
 
-        if entry.operation != "import":
+        if entry.operation not in ("import", "offset_plane"):
             body_lbl = QLabel(body_name)
             body_lbl.setStyleSheet(prefs.scale_stylesheet(
                 "color: #333; font-size: 10px; "
@@ -209,7 +224,9 @@ class _EntryWidget(QFrame):
         from cad.units import format_op_label
         lbl_text = (format_op_label(entry.operation, entry.params)
                     if entry.operation in ("extrude", "cut",
-                                            "revolve", "revolve_cut")
+                                            "revolve", "revolve_cut",
+                                            "loft", "loft_cut",
+                                            "chamfer")
                     else entry.label)
         if entry.editing:
             lbl_text = "✎ " + lbl_text
@@ -373,10 +390,14 @@ class HistoryPanel(QWidget):
     replay_requested         = pyqtSignal(int)
     sketch_vis_changed       = pyqtSignal()
     reenter_sketch_requested = pyqtSignal(int)
-    reopen_extrude_requested  = pyqtSignal(int)
-    reopen_thicken_requested  = pyqtSignal(int)
-    reopen_revolve_requested  = pyqtSignal(int)
-    reopen_fillet_requested   = pyqtSignal(int)
+    reopen_extrude_requested      = pyqtSignal(int)
+    reopen_thicken_requested      = pyqtSignal(int)
+    reopen_revolve_requested      = pyqtSignal(int)
+    reopen_fillet_requested       = pyqtSignal(int)
+    reopen_loft_requested         = pyqtSignal(int)
+    reopen_offset_plane_requested = pyqtSignal(int)
+    reopen_chamfer_requested      = pyqtSignal(int)
+    reopen_boolean_requested      = pyqtSignal(int)
     delete_requested         = pyqtSignal(int)
     reorder_requested        = pyqtSignal(int, int)
 
@@ -568,6 +589,46 @@ class HistoryPanel(QWidget):
                     "Single-click to seek here first, then double-click to edit.")
                 return
             self.reopen_fillet_requested.emit(index)
+            return
+
+        # Loft / loft-cut: reopen LoftPanel
+        if entry.operation in ("loft", "loft_cut"):
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_loft_requested.emit(index)
+            return
+
+        # Offset plane: reopen OffsetPlanePanel
+        if entry.operation == "offset_plane":
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_offset_plane_requested.emit(index)
+            return
+
+        # Chamfer: reopen ChamferPanel
+        if entry.operation == "chamfer":
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_chamfer_requested.emit(index)
+            return
+
+        # Boolean: reopen BooleanPanel
+        if entry.operation in ("union", "subtract", "intersect"):
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_boolean_requested.emit(index)
             return
 
         if entry.operation not in EDIT_SCHEMA:

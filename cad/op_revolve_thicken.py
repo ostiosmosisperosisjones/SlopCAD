@@ -152,7 +152,9 @@ class ThickenOp(Op):
         }
         if self.face_refs:
             p["face_refs"] = [
-                {"centroid": list(r.centroid), "area": r.area}
+                {"centroid": list(r.centroid),
+                 "area":     r.area,
+                 "category": r.category}
                 for r in self.face_refs
             ]
         return p
@@ -166,7 +168,9 @@ class ThickenOp(Op):
             indices = [int(params.get("face_idx", 0))]
         raw_refs = params.get("face_refs", [])
         face_refs = [
-            AnyFaceRef(centroid=tuple(r["centroid"]), area=r["area"])
+            AnyFaceRef(centroid=tuple(r["centroid"]),
+                       area=r["area"],
+                       category=r.get("category", ""))
             for r in raw_refs
         ]
         return cls(

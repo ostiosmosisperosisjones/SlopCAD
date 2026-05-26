@@ -35,6 +35,9 @@ class HistoryMixin:
             ok, err, mutated = self.history.replay_from(cursor)
             if not ok:
                 print(f"[Cascade] Replay after insert: {err}")
+            # Advance cursor to tip so current_shape() sees bodies created after
+            # the edit point (e.g. the result body of a boolean op).
+            self.history.seek(len(self.history.entries) - 1)
             self._rebuild_bodies(mutated or ({primary_body_id} if primary_body_id else set()))
         else:
             if primary_body_id is not None:

@@ -214,8 +214,11 @@ class FaceExtrudeOp(Op):
                         if self.direction is not None else None)
         op_str       = "cut" if self.distance < 0 else "extrude"
         op_params    = self.to_params()
+        # Transient hint from the edit path; consumed below, never stored.
+        preserved_body_ids = list((extra_params or {}).get("_preserved_body_ids", []))
         if extra_params:
             op_params.update(extra_params)
+        op_params.pop("_preserved_body_ids", None)
         original_solid_count = len(list(shape_before.solids()))
 
         if self.force_new_body:
@@ -254,9 +257,12 @@ class FaceExtrudeOp(Op):
                 solids    = list(shape_after.solids())
                 op_params["child_body_ids"] = []
                 new_bodies = []
-                for solid in solids:
+                for i, solid in enumerate(solids):
                     new_name = _next_split_name(root_name, viewport.workspace)
-                    new_body = viewport.workspace.add_body(new_name, Compound(solid.wrapped))
+                    preserved = (preserved_body_ids[i]
+                                 if i < len(preserved_body_ids) else None)
+                    new_body = viewport.workspace.add_body(
+                        new_name, Compound(solid.wrapped), body_id=preserved)
                     new_bodies.append(new_body)
                     op_params["child_body_ids"].append(new_body.id)
                     print(f"[Extrude] New body '{new_name}' ({len(list(solid.faces()))} faces)")
@@ -954,8 +960,11 @@ class SketchExtrudeOp(Op):
             op_params["force_new_body"] = True
         if direction is not None:
             op_params["direction"] = direction.tolist()
+        # Transient hint from the edit path; consumed below, never stored.
+        preserved_body_ids = list((extra_params or {}).get("_preserved_body_ids", []))
         if extra_params:
             op_params.update(extra_params)
+        op_params.pop("_preserved_body_ids", None)
         mesh     = viewport._meshes.get(body_id)
         face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[se.face_idx]) if mesh else None)
         distance     = self.distance
@@ -1034,7 +1043,13 @@ class SketchExtrudeOp(Op):
                 new_bodies = []
                 for i, solid in enumerate(solids):
                     new_name = _next_split_name(root_name, viewport.workspace)
-                    new_body = viewport.workspace.add_body(new_name, Compound(solid.wrapped))
+                    # Reuse the original body_id if the edit path supplied one
+                    # for this solid index — keeps downstream ops pointing at
+                    # the same body across parametric edits.
+                    preserved = (preserved_body_ids[i]
+                                 if i < len(preserved_body_ids) else None)
+                    new_body = viewport.workspace.add_body(
+                        new_name, Compound(solid.wrapped), body_id=preserved)
                     new_bodies.append(new_body)
                     op_params["child_body_ids"].append(new_body.id)
                     print(f"[Extrude] New body '{new_name}' ({len(list(solid.faces()))} faces)")

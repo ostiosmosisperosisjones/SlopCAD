@@ -630,6 +630,24 @@ class ExtrudeMixin:
             body = self.workspace.bodies.get(bid)
             if body is not None and body.created_at_entry_id in group_entry_ids:
                 removable_bodies.add(bid)
+
+        # Preserve the body uuid(s) so the new op re-creates bodies under the
+        # same ids. Without this, downstream ops (fillet/chamfer/thicken/boolean)
+        # lose their source_body_id reference on every parametric edit.
+        # Also preserve ids for bodies that were consumed by a later op (e.g.
+        # boolean union) and are no longer in workspace — they still need the
+        # same id so downstream entries in history can find them during replay.
+        # Order: main entry's body first, then any split children in entry order.
+        preserved_body_ids: list[str] = []
+        all_produced = ([entry.body_id] + list(child_body_ids))
+        for bid in all_produced:
+            if bid and bid not in preserved_body_ids:
+                body = self.workspace.bodies.get(bid)
+                # Include if: in workspace and created by this op, OR absent
+                # from workspace (consumed downstream — still need same id).
+                if body is None or body.created_at_entry_id in group_entry_ids:
+                    preserved_body_ids.append(bid)
+
         for j in reversed(group_indices):
             self.history.delete(j)
         for bid in removable_bodies:
@@ -653,6 +671,8 @@ class ExtrudeMixin:
             ok, err, _ = self.history.replay_all_from(new_idx + 1)
             if not ok:
                 print(f"[Edit] Downstream replay failed: {err}")
+            # Advance cursor to tip so bodies created downstream are visible.
+            self.history.seek(len(self.history.entries) - 1)
             self._rebuild_all_meshes()
             self.history_changed.emit()
             return
@@ -702,7 +722,10 @@ class ExtrudeMixin:
                 force_new_body = (merge_body_id == "__new_body__"),
             )
 
-        new_op.commit(self, extra or None)
+        commit_extra = dict(extra) if extra else {}
+        if preserved_body_ids:
+            commit_extra["_preserved_body_ids"] = preserved_body_ids
+        new_op.commit(self, commit_extra or None)
 
         # Cascade: replay all body chains after the newly inserted group so
         # downstream ops receive updated shapes (single ordered pass handles
@@ -711,6 +734,10 @@ class ExtrudeMixin:
         ok, err, _ = self.history.replay_all_from(new_idx + 1)
         if not ok:
             print(f"[Edit] Downstream replay failed: {err}")
+
+        # Advance cursor to tip so bodies created downstream (e.g. a boolean's
+        # result body) become visible in the parts panel and viewport.
+        self.history.seek(len(self.history.entries) - 1)
 
         # Full mesh rebuild — cheaper than tracking exactly what changed, and
         # ensures stale GL buffers for removed/replaced bodies are purged.

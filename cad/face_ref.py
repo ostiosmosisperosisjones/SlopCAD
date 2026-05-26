@@ -53,6 +53,66 @@ def _occ_face_normal(occ_face):
         return None
 
 
+def _occ_face_anchor_and_normal(occ_face):
+    """Return (anchor_xyz, unit_normal) sampled on the face surface.
+
+    First tries to project the area centroid onto the surface (good anchor for
+    trimmed/holed planar faces). Falls back to the UV-midpoint of the face's
+    bounds when projection is ambiguous (closed cylinders/spheres where the
+    centroid is equidistant from infinitely many surface points). Honors face
+    orientation. Returns (None, None) if sampling fails.
+    """
+    try:
+        from OCP.BRep import BRep_Tool
+        from OCP.BRepTools import BRepTools
+        from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+        from OCP.gp import gp_Pnt, gp_Vec
+        from OCP.TopAbs import TopAbs_REVERSED
+
+        surface = BRep_Tool.Surface_s(occ_face)
+        if surface is None:
+            return None, None
+
+        u = v = None
+        try:
+            c, _ = _occ_face_props(occ_face)
+            proj = GeomAPI_ProjectPointOnSurf(
+                gp_Pnt(float(c[0]), float(c[1]), float(c[2])), surface)
+            if proj.NbPoints() >= 1:
+                u, v = proj.LowerDistanceParameters()
+        except Exception:
+            pass
+
+        if u is None:
+            umin, umax, vmin, vmax = BRepTools.UVBounds_s(occ_face)
+            u = 0.5 * (umin + umax)
+            v = 0.5 * (vmin + vmax)
+
+        p   = gp_Pnt()
+        d1u = gp_Vec()
+        d1v = gp_Vec()
+        surface.D1(u, v, p, d1u, d1v)
+        anchor = np.array([p.X(), p.Y(), p.Z()], dtype=float)
+        n = np.array([d1u.Y() * d1v.Z() - d1u.Z() * d1v.Y(),
+                      d1u.Z() * d1v.X() - d1u.X() * d1v.Z(),
+                      d1u.X() * d1v.Y() - d1u.Y() * d1v.X()], dtype=float)
+        ln = np.linalg.norm(n)
+        if ln < 1e-12:
+            return None, None
+        n /= ln
+        if occ_face.Orientation() == TopAbs_REVERSED:
+            n = -n
+        return anchor, n
+    except Exception:
+        return None, None
+
+
+def _occ_face_normal_at_centroid(occ_face):
+    """Back-compat: return just the normal from _occ_face_anchor_and_normal."""
+    _, n = _occ_face_anchor_and_normal(occ_face)
+    return n
+
+
 # ---------------------------------------------------------------------------
 # FaceRef
 # ---------------------------------------------------------------------------
@@ -223,9 +283,15 @@ class AnyFaceRef:
 
     Matches by centroid position and area — sufficient to re-locate a
     face after operations that preserve face identity (thicken, offset).
+
+    category (optional) — 'plane' or 'curved', captured at commit time and
+    used as a topology-aware fallback when strict centroid/area matching
+    fails after upstream edits (e.g. draft turning a cylinder into a cone
+    keeps its centroid roughly fixed but changes area by hundreds of mm²).
     """
     centroid: tuple   # (x, y, z) world coords
     area:     float
+    category: str = ""   # 'plane' | 'curved' | '' (legacy: unknown)
 
     @classmethod
     def from_occ_face(cls, occ_face) -> "AnyFaceRef":
@@ -233,6 +299,7 @@ class AnyFaceRef:
         return cls(
             centroid = tuple(np.round(centroid, 6)),
             area     = round(float(area), 6),
+            category = _surface_category(occ_face),
         )
 
     def find_in(self, shape,
@@ -241,6 +308,12 @@ class AnyFaceRef:
                 ) -> tuple[int, object] | tuple[None, None]:
         """
         Find best matching face by centroid proximity and area.
+
+        Tries strict matching first (cheap, exact for replays with no
+        topology change); falls back to a tolerant category-aware match
+        when strict matching misses — survives upstream edits like draft
+        that move centroid by mm and area by hundreds of mm².
+
         Returns (face_index, b3d_face) or (None, None).
         """
         ref_c = np.array(self.centroid)
@@ -260,4 +333,47 @@ class AnyFaceRef:
                 best_idx   = idx
                 best_face  = face
 
-        return best_idx, best_face
+        if best_idx is not None:
+            return best_idx, best_face
+
+        # Strict match missed — fall back to category-aware scoring if we
+        # have a category recorded. Without one, behave as before (None).
+        if self.category:
+            return _find_face_by_category_score(shape, self)
+
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# Category-aware fallback used by AnyFaceRef.find_in()
+# ---------------------------------------------------------------------------
+
+# Faces with a score above this aren't trusted as a match — keeps false
+# positives out when nothing in the shape really corresponds to the ref.
+_FACE_SCORE_CUTOFF = 200.0
+
+
+def _surface_category(occ_face) -> str:
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Plane
+    return 'plane' if BRepAdaptor_Surface(occ_face).GetType() == GeomAbs_Plane else 'curved'
+
+
+def _find_face_by_category_score(shape, ref: "AnyFaceRef"):
+    """Lower-is-better scoring: centroid distance + 50 × relative area diff,
+    restricted to faces in the same surface category. Returns (idx, face) or
+    (None, None) if the best score exceeds the cutoff."""
+    ref_c = np.array(ref.centroid)
+    best_idx, best_face, best_score = None, None, float('inf')
+    for idx, face in enumerate(shape.faces()):
+        if _surface_category(face.wrapped) != ref.category:
+            continue
+        centroid, area = _occ_face_props(face.wrapped)
+        cdist = float(np.linalg.norm(centroid - ref_c))
+        adiff = abs(area - ref.area) / max(ref.area, 1.0)
+        score = cdist + 50.0 * adiff
+        if score < best_score:
+            best_score, best_idx, best_face = score, idx, face
+    if best_score > _FACE_SCORE_CUTOFF:
+        return None, None
+    return best_idx, best_face

@@ -218,6 +218,9 @@ class SketchModalMixin:
                 dep_ok, dep_err, _ = self.history.replay_sketch_dependents(sketch_entry_id)
                 if not dep_ok:
                     print(f"[Sketch] Dependent replay failed: {dep_err}")
+                # Advance cursor to tip so bodies created downstream (e.g. a
+                # boolean's result body) are visible after the edit.
+                self.history.seek(len(self.history.entries) - 1)
                 self._rebuild_all_meshes()
                 self.history_changed.emit()
                 self.update()
@@ -255,6 +258,40 @@ class SketchModalMixin:
         self.history_changed.emit()
         self.update()
         print(f"[Sketch] Committed {entity_count} entities to history.")
+
+    def _enter_sketch_on_offset_plane(self, entry_idx: int):
+        """Enter sketch mode on an OffsetPlaneOp datum entry."""
+        from cad.sketch import SketchMode
+        if self._sketch is not None:
+            return
+        entries = self.history.entries
+        if entry_idx < 0 or entry_idx >= len(entries):
+            return
+        entry = entries[entry_idx]
+        op    = entry.op
+        if op is None or entry.operation != "offset_plane":
+            return
+        try:
+            b3d_plane = op.plane_source.resolve(self.history, entry_idx + 1)
+        except Exception as ex:
+            print(f"[Sketch] Cannot sketch on '{entry.label}': {ex}")
+            return
+        n, wo = b3d_plane.z_dir, b3d_plane.origin
+        xd, yd = b3d_plane.x_dir, b3d_plane.y_dir
+        self.camera.snap_to_normal(n.X, n.Y, n.Z, origin=(wo.X, wo.Y, wo.Z),
+                                   x_dir=(xd.X, xd.Y, xd.Z),
+                                   y_dir=(yd.X, yd.Y, yd.Z))
+        self._sketch = SketchMode(b3d_plane, None, -1,
+                                  plane_source=op.plane_source)
+        self._selected_sketch_entry = None
+        self._selected_sketch_face  = None
+        self._selected_plane_idx    = None
+        self.selection.clear()
+        self.hover.clear()
+        self.selection_changed.emit()
+        self.sketch_mode_changed.emit(True)
+        self.update()
+        print(f"[Sketch] Entered sketch on '{entry.label}'")
 
     def _enter_sketch_on_plane(self, axis: str):
         """Enter sketch mode on one of the three world planes."""

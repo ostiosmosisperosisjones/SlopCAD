@@ -68,12 +68,18 @@ def _face_ref_from_dict(d: dict | None):
 def _plane_source_to_dict(ps) -> dict | None:
     if ps is None:
         return None
-    from cad.plane_ref import FacePlaneSource
-    d = ps.to_dict()
-    # FacePlaneSource.to_dict() was missing face_ref — add it here
+    from cad.plane_ref import FacePlaneSource, OffsetPlaneSource
+    # Recurse manually instead of using ps.to_dict() so we can attach face_ref
+    # at every nested FacePlaneSource node, not just the top-level one.
     if isinstance(ps, FacePlaneSource):
-        d["face_ref"] = _face_ref_to_dict(ps.face_ref)
-    return d
+        return {"type": "face", "body_id": ps.body_id,
+                "face_ref": _face_ref_to_dict(ps.face_ref)}
+    if isinstance(ps, OffsetPlaneSource):
+        return {"type": "offset",
+                "distance": ps.distance,
+                "parent":   _plane_source_to_dict(ps.parent)}
+    # WorldPlaneSource and any other source delegate to their own to_dict()
+    return ps.to_dict()
 
 
 def _plane_source_from_dict(d: dict | None):
@@ -336,6 +342,7 @@ def save(workspace, history, camera=None) -> bytes:
             "name":                 body.name,
             "visible":              body.visible,
             "created_at_entry_id":  body.created_at_entry_id,
+            "consumed_at_entry_id": body.consumed_at_entry_id,
         }
 
     entries = []
@@ -400,10 +407,11 @@ def load(data: bytes):
     # Restore bodies (no source_shape yet — set during replay)
     for bid, bd in doc["bodies"].items():
         body = Body(
-            id                  = bd["id"],
-            name                = bd["name"],
-            visible             = bd.get("visible", True),
-            created_at_entry_id = bd.get("created_at_entry_id"),
+            id                   = bd["id"],
+            name                 = bd["name"],
+            visible              = bd.get("visible", True),
+            created_at_entry_id  = bd.get("created_at_entry_id"),
+            consumed_at_entry_id = bd.get("consumed_at_entry_id"),
         )
         workspace.bodies[bid] = body
 

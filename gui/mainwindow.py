@@ -49,6 +49,10 @@ class MainWindow(QMainWindow):
         self._ops_toolbar.fillet_requested.connect(self._toolbar_fillet)
         self._ops_toolbar.sketch_requested.connect(self._toolbar_sketch)
         self._ops_toolbar.revolve_requested.connect(self._toolbar_revolve)
+        self._ops_toolbar.offset_plane_requested.connect(self._toolbar_offset_plane)
+        self._ops_toolbar.loft_requested.connect(self._toolbar_loft)
+        self._ops_toolbar.chamfer_requested.connect(self._toolbar_chamfer)
+        self._ops_toolbar.boolean_requested.connect(self._toolbar_boolean)
         self.addToolBar(self._ops_toolbar)
 
         self._sketch_toolbar = SketchToolbar(self)
@@ -97,8 +101,13 @@ class MainWindow(QMainWindow):
         if not self._viewport:
             return
         vp = self._viewport
+        # Selected offset plane takes precedence over a selected face.
+        if getattr(vp, '_selected_plane_idx', None) is not None:
+            vp._enter_sketch_on_offset_plane(vp._selected_plane_idx)
+            return
         if vp.selection.face_count == 0:
-            self.statusBar().showMessage("Select a face to sketch on.", 3000)
+            self.statusBar().showMessage(
+                "Select a face or offset plane to sketch on.", 3000)
             return
         sf = vp.selection.single_face or vp.selection.faces[0]
         vp._enter_sketch(sf.body_id, sf.face_idx)
@@ -180,6 +189,26 @@ class MainWindow(QMainWindow):
         if not self._viewport:
             return
         self._viewport._try_revolve()
+
+    def _toolbar_offset_plane(self):
+        if not self._viewport:
+            return
+        self._viewport._show_offset_plane_panel()
+
+    def _toolbar_loft(self):
+        if not self._viewport:
+            return
+        self._viewport._show_loft_panel()
+
+    def _toolbar_chamfer(self):
+        if not self._viewport:
+            return
+        self._viewport._try_chamfer()
+
+    def _toolbar_boolean(self):
+        if not self._viewport:
+            return
+        self._viewport._try_boolean()
 
     def _build_statusbar(self):
         sb = self.statusBar()
@@ -589,6 +618,10 @@ class MainWindow(QMainWindow):
         sidebar.history_panel.reopen_thicken_requested.connect(vp.reopen_thicken)
         sidebar.history_panel.reopen_revolve_requested.connect(vp.reopen_revolve)
         sidebar.history_panel.reopen_fillet_requested.connect(vp.reopen_fillet)
+        sidebar.history_panel.reopen_loft_requested.connect(vp.reopen_loft)
+        sidebar.history_panel.reopen_offset_plane_requested.connect(vp.reopen_offset_plane)
+        sidebar.history_panel.reopen_chamfer_requested.connect(vp.reopen_chamfer)
+        sidebar.history_panel.reopen_boolean_requested.connect(vp.reopen_boolean)
         sidebar.history_panel.delete_requested.connect(vp.do_delete)
         sidebar.history_panel.reorder_requested.connect(vp.do_reorder)
         sidebar.plane_visibility_changed.connect(vp.set_world_plane_visible)

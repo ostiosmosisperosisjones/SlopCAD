@@ -82,7 +82,7 @@ class Fillet3DMixin:
         # Pre-populate face and edge lists from initial selection
         if body_id is not None:
             body = self.workspace.bodies.get(body_id)
-            name = body.name if body else body_id
+            name = body.name if body else "Body"
             shape = self.workspace.current_shape(body_id)
             all_faces = list(shape.faces()) if shape is not None else []
             for fi in face_indices:
@@ -109,7 +109,7 @@ class Fillet3DMixin:
     def _fillet3d_face_label(self, body_id: str, face_idx: int,
                               all_faces: list) -> str:
         body = self.workspace.bodies.get(body_id)
-        name = body.name if body else body_id
+        name = body.name if body else "Body"
         return f"{name}  ·  face {face_idx}"
 
     def _position_fillet3d_panel(self):
@@ -223,7 +223,7 @@ class Fillet3DMixin:
             indices.append(edge_idx)
             self._fillet3d_edge_indices = indices
             body = self.workspace.bodies.get(body_id)
-            name = body.name if body else body_id
+            name = body.name if body else "Body"
             panel.add_edge_entry(body_id, edge_idx, f"{name}  ·  edge {edge_idx}")
             self._update_fillet3d_arrow()
             panel._emit_preview()
@@ -350,22 +350,20 @@ class Fillet3DMixin:
                 fi = face_indices[0]
                 if fi >= len(all_faces):
                     raise IndexError
-                from build123d import Plane
-                pl = Plane(all_faces[fi])
-                base   = np.array([pl.origin.X, pl.origin.Y, pl.origin.Z])
-                normal = np.array([pl.z_dir.X,  pl.z_dir.Y,  pl.z_dir.Z])
+                from cad.face_ref import _occ_face_anchor_and_normal
+                face = all_faces[fi]
+                anchor, normal = _occ_face_anchor_and_normal(face.wrapped)
+                if anchor is None or normal is None:
+                    raise ValueError("no surface anchor / normal")
+                base = anchor
             else:
                 mesh = self._meshes.get(body_id)
                 if mesh is None or edge_indices[0] >= len(mesh.topo_edges):
                     raise IndexError
                 pts  = mesh.topo_edges[edge_indices[0]]
                 base = np.array(pts[len(pts) // 2], dtype=float)
-                efn  = getattr(mesh, 'topo_edge_face_normals', None)
-                if efn and edge_indices[0] < len(efn):
-                    adj    = np.array(efn[edge_indices[0]], dtype=float)
-                    normal = adj.mean(axis=0) if adj.ndim == 2 else adj.flatten()[:3]
-                else:
-                    normal = np.array([0.0, 0.0, 1.0])
+                from viewer.mesh import edge_outward_normal
+                normal = edge_outward_normal(mesh, edge_indices[0])
 
             n = np.linalg.norm(normal)
             if n < 1e-10:
@@ -458,7 +456,7 @@ class Fillet3DMixin:
         if panel is not None and op.edge_indices:
             self._fillet3d_edge_indices = list(op.edge_indices)
             body = self.workspace.bodies.get(op.source_body_id)
-            name = body.name if body else op.source_body_id
+            name = body.name if body else "Body"
             for ei in op.edge_indices:
                 panel.add_edge_entry(op.source_body_id, ei,
                                      f"{name}  ·  edge {ei}")

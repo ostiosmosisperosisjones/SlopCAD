@@ -4,8 +4,9 @@
       "Read(//home/nico/Documents/cad/app/**)",
       "Bash(python *)",
       "Bash(timeout *)",
-      "Bash(true)"
+      "Bash(true)",
+      "Agent(Explore)"
     ]
   },
-  "$version": 3
+  "$version": 4
 }

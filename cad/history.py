@@ -275,7 +275,7 @@ class History:
         mutated_body_ids is the set of body IDs whose shape_after changed —
         callers can use this to rebuild only the affected meshes.
         """
-        from cad.op_types import ImportOp, SketchOp
+        from cad.op_types import ImportOp, SketchOp, OffsetPlaneOp
 
         if index < 0 or index >= len(self._entries):
             return True, "", set()
@@ -344,6 +344,21 @@ class History:
                         continue
                     entry.shape_before = current_shape
                     entry.shape_after  = current_shape
+                    continue
+
+                if isinstance(op, OffsetPlaneOp):
+                    # Datum plane — no shape change.  Resolve to surface
+                    # parametric errors (e.g. parent face vanished).  body_id
+                    # is None for offset planes, so no chain-broken cascade.
+                    try:
+                        op.execute(current_shape, self, i)
+                    except Exception as ex:
+                        entry.error = True; entry.error_msg = str(ex)
+                        entry.shape_before = None; entry.shape_after = None
+                        if not first_error: first_error = str(ex)
+                        continue
+                    entry.shape_before = None
+                    entry.shape_after  = None
                     continue
 
                 if current_shape is None and not op.creates_body_from_nothing(self, i):

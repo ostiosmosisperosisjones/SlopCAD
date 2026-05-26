@@ -200,12 +200,19 @@ def _extract_topo_edges(shape) -> tuple[list[np.ndarray], list, list]:
         for face_shape in face_list:
             face = TopoDS.Face_s(face_shape)
             try:
-                # Use build123d Plane to get correctly-oriented outward normal
+                # Planar fast path → Plane(face).z_dir; falls back to a
+                # surface-derivative normal sampled at the face's UV center
+                # for non-planar faces.
                 from build123d import Face as B3dFace, Plane as B3dPlane
-                b3d_face = B3dFace(face)
-                pl = B3dPlane(b3d_face)
-                zd = pl.z_dir
-                normals.append([zd.X, zd.Y, zd.Z])
+                try:
+                    pl = B3dPlane(B3dFace(face))
+                    zd = pl.z_dir
+                    normals.append([zd.X, zd.Y, zd.Z])
+                except Exception:
+                    from cad.face_ref import _occ_face_anchor_and_normal
+                    _, n = _occ_face_anchor_and_normal(face)
+                    if n is not None:
+                        normals.append([float(n[0]), float(n[1]), float(n[2])])
             except Exception:
                 pass
         midpt_to_normals[mkey] = normals
@@ -273,3 +280,29 @@ def _extract_topo_edges(shape) -> tuple[list[np.ndarray], list, list]:
         explorer.Next()
 
     return edges, edges_occ, edge_normals
+
+
+def edge_outward_normal(mesh, edge_idx: int) -> np.ndarray:
+    """Return a unit outward direction for an edge — for placing a drag arrow.
+
+    Sums the unit normals of the edge's adjacent faces. When the two adjacent
+    normals are anti-parallel (so the naive mean cancels to zero), falls back
+    to the first normal. Returns +Z if no normals are available.
+    """
+    efn = getattr(mesh, 'topo_edge_face_normals', None)
+    if not efn or edge_idx >= len(efn):
+        return np.array([0.0, 0.0, 1.0])
+    adj = np.array(efn[edge_idx], dtype=float)
+    if adj.ndim != 2 or adj.shape[0] == 0:
+        return np.array([0.0, 0.0, 1.0])
+    units = []
+    for row in adj:
+        ln = np.linalg.norm(row)
+        if ln > 1e-10:
+            units.append(row / ln)
+    if not units:
+        return np.array([0.0, 0.0, 1.0])
+    summed = np.sum(units, axis=0)
+    if np.linalg.norm(summed) < 1e-6:
+        return units[0]
+    return summed / np.linalg.norm(summed)

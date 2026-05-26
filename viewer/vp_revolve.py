@@ -768,6 +768,8 @@ class RevolveMixin:
             ok, err, _ = self.history.replay_all_from(new_idx + 1)
             if not ok:
                 print(f"[Revolve Edit] Downstream replay failed: {err}")
+            # Advance cursor to tip so bodies created downstream are visible.
+            self.history.seek(len(self.history.entries) - 1)
             self._rebuild_all_meshes()
             self.history_changed.emit()
             return
@@ -864,6 +866,8 @@ class RevolveMixin:
         if not ok:
             print(f"[Revolve Edit] Downstream replay failed: {err}")
 
+        # Advance cursor to tip so bodies created downstream are visible.
+        self.history.seek(len(self.history.entries) - 1)
         self._rebuild_all_meshes()
         self.history_changed.emit()
 

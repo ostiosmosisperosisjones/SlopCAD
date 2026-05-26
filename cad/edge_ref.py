@@ -11,7 +11,7 @@ SketchEdgeSource — line entity from a previously committed sketch
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 
 
@@ -29,18 +29,29 @@ class EdgeRef:
 
     Tolerances in find_in() are intentionally generous to survive boolean
     operations that may slightly perturb edge positions.
+
+    face_sigs (optional) — fingerprints of the two faces that share this
+    edge, used as a topology-aware fallback when geometric matching fails
+    (e.g. when draft moves the edge past mid_tol). Each sig is a dict:
+    {'category': 'plane'|'curved', 'centroid': (x,y,z), 'area': float}.
     """
-    midpoint: tuple    # (x, y, z) world mm
-    length:   float    # arc length mm
-    tangent:  tuple    # (tx, ty, tz) unit vector, canonicalised
+    midpoint:  tuple    # (x, y, z) world mm
+    length:    float    # arc length mm
+    tangent:   tuple    # (tx, ty, tz) unit vector, canonicalised
+    face_sigs: list = field(default_factory=list)   # optional adjacency hint
 
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_occ_edge(cls, occ_edge) -> "EdgeRef | None":
-        """Build an EdgeRef from a raw TopoDS_Edge. Returns None on failure."""
+    def from_occ_edge(cls, occ_edge, parent_shape=None) -> "EdgeRef | None":
+        """Build an EdgeRef from a raw TopoDS_Edge. Returns None on failure.
+
+        If parent_shape (raw TopoDS_Shape) is supplied, the ref also records
+        signatures for the two adjacent faces — used as a topology-aware
+        fallback in find_in() when geometric matching can't survive an edit.
+        """
         try:
             from OCP.BRepAdaptor import BRepAdaptor_Curve
             from OCP.GCPnts import GCPnts_AbscissaPoint
@@ -69,9 +80,14 @@ class EdgeRef:
                     break
             tangent = tuple(np.round(t, 8).tolist())
 
+            face_sigs = []
+            if parent_shape is not None:
+                face_sigs = _adjacent_face_sigs(parent_shape, occ_edge)
+
             return cls(midpoint=midpoint,
                        length=round(float(length), 6),
-                       tangent=tangent)
+                       tangent=tangent,
+                       face_sigs=face_sigs)
         except Exception:
             return None
 
@@ -86,6 +102,11 @@ class EdgeRef:
                 ) -> tuple[int, object, list] | tuple[None, None, None]:
         """
         Find the matching edge in a build123d shape.
+
+        Tries strict geometric matching first (cheap, exact for replays
+        without topology change); falls back to face-adjacency matching
+        via face_sigs when geometric matching misses (typical when an
+        upstream edit perturbs the edge — e.g. draft, scaling).
 
         Returns (edge_index, TopoDS_Edge, world_pts) where world_pts is a
         list of [x, y, z] floats sampled along the edge.
@@ -137,6 +158,15 @@ class EdgeRef:
             except Exception:
                 continue
 
+        if best[0] is not None:
+            return best
+
+        # Geometric match missed — fall back to face-pair adjacency if we have
+        # face signatures recorded. Survives upstream edits that move the edge
+        # past mid_tol/len_tol but preserve the adjacent face roles.
+        if len(self.face_sigs) >= 2:
+            return _find_edge_via_face_sigs(shape, self.face_sigs[0], self.face_sigs[1])
+
         return best
 
 
@@ -148,6 +178,109 @@ def _sample_edge(adaptor, u0: float, u1: float, n: int = 32) -> list:
         p = adaptor.Value(u)
         pts.append([p.X(), p.Y(), p.Z()])
     return pts
+
+
+# ---------------------------------------------------------------------------
+# Adjacency-based edge lookup
+# ---------------------------------------------------------------------------
+
+# Score threshold above which an adjacency match is considered too weak
+# to trust. Empirically a single-face match contributes ~10–50 depending
+# on how much the upstream edit deformed it; 200 is generous but excludes
+# total mismatches.
+_ADJACENCY_SCORE_CUTOFF = 200.0
+
+
+def _surface_category(occ_face) -> str:
+    """Coarse surface family — 'plane' or 'curved'. Stable across draft,
+    which turns a cylinder into a cone but keeps planes planar."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Plane
+    return 'plane' if BRepAdaptor_Surface(occ_face).GetType() == GeomAbs_Plane else 'curved'
+
+
+def _face_signature(occ_face) -> dict:
+    from cad.face_ref import _occ_face_props
+    centroid, area = _occ_face_props(occ_face)
+    return {
+        'category': _surface_category(occ_face),
+        'centroid': [float(c) for c in centroid],
+        'area':     float(area),
+    }
+
+
+def _adjacent_face_sigs(parent_shape_occ, occ_edge) -> list:
+    """Return signatures of the (≤2) faces adjacent to occ_edge in parent_shape_occ."""
+    from OCP.TopExp import TopExp
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    from OCP.TopoDS import TopoDS
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    m = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(parent_shape_occ, TopAbs_EDGE, TopAbs_FACE, m)
+    for i in range(1, m.Extent() + 1):
+        if m.FindKey(i).IsSame(occ_edge):
+            return [_face_signature(TopoDS.Face_s(f))
+                    for f in m.FindFromIndex(i)]
+    return []
+
+
+def _score_face_match(sig: dict, occ_face) -> float:
+    """Lower is better; +inf if surface category mismatches."""
+    if _surface_category(occ_face) != sig['category']:
+        return float('inf')
+    from cad.face_ref import _occ_face_props
+    centroid, area = _occ_face_props(occ_face)
+    cdist = float(np.linalg.norm(np.array(centroid) - np.array(sig['centroid'])))
+    adiff = abs(area - sig['area']) / max(sig['area'], 1.0)
+    return cdist + 50.0 * adiff
+
+
+def _find_edge_via_face_sigs(shape, sig_a: dict, sig_b: dict):
+    """
+    Locate the edge in shape (build123d) whose adjacent faces best match
+    sig_a and sig_b. Returns (idx, TopoDS_Edge, world_pts) like find_in().
+    """
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.TopExp import TopExp
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    from OCP.TopoDS import TopoDS
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+
+    shape_occ = shape.wrapped if hasattr(shape, 'wrapped') else shape
+    m = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(shape_occ, TopAbs_EDGE, TopAbs_FACE, m)
+
+    best_score = float('inf')
+    best_edge  = None
+    for i in range(1, m.Extent() + 1):
+        edge = TopoDS.Edge_s(m.FindKey(i))
+        fl   = list(m.FindFromIndex(i))
+        if len(fl) < 2:
+            continue
+        f0 = TopoDS.Face_s(fl[0])
+        f1 = TopoDS.Face_s(fl[1])
+        s1 = _score_face_match(sig_a, f0) + _score_face_match(sig_b, f1)
+        s2 = _score_face_match(sig_a, f1) + _score_face_match(sig_b, f0)
+        s  = min(s1, s2)
+        if s < best_score:
+            best_score = s
+            best_edge  = edge
+
+    if best_edge is None or best_score > _ADJACENCY_SCORE_CUTOFF:
+        return (None, None, None)
+
+    # Find the build123d edge wrapping this TopoDS_Edge so callers get a
+    # valid index for downstream code that uses shape.edges() ordering.
+    idx = None
+    for i, e in enumerate(shape.edges()):
+        if e.wrapped.IsSame(best_edge):
+            idx = i
+            break
+
+    adaptor = BRepAdaptor_Curve(best_edge)
+    u0 = adaptor.FirstParameter(); u1 = adaptor.LastParameter()
+    world_pts = _sample_edge(adaptor, u0, u1)
+    return (idx, best_edge, world_pts)
 
 
 # ---------------------------------------------------------------------------

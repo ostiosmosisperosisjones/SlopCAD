@@ -152,12 +152,17 @@ _SVG_REVOLVE = """
 # Loft: two profiles connected by smooth ruled surface
 _SVG_LOFT = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
-  <ellipse cx="18" cy="27" rx="10" ry="3.5" fill="#888" fill-opacity="0.1"
-           stroke="#888" stroke-width="1.3" stroke-dasharray="3,2" opacity="0.55"/>
-  <ellipse cx="18" cy="11" rx="5" ry="2" fill="#888" fill-opacity="0.1"
-           stroke="#888" stroke-width="1.3" stroke-dasharray="3,2" opacity="0.55"/>
-  <line x1="8" y1="27" x2="13" y2="11" stroke="#888" stroke-width="1" opacity="0.4"/>
-  <line x1="28" y1="27" x2="23" y2="11" stroke="#888" stroke-width="1" opacity="0.4"/>
+  <!-- side walls (rendered first so the profile ellipses sit on top) -->
+  <path d="M8,27 Q12,18 13,11" fill="none" stroke="#b39ddb" stroke-width="1.4"
+        stroke-linecap="round" opacity="0.85"/>
+  <path d="M28,27 Q24,18 23,11" fill="none" stroke="#b39ddb" stroke-width="1.4"
+        stroke-linecap="round" opacity="0.85"/>
+  <!-- bottom profile -->
+  <ellipse cx="18" cy="27" rx="10" ry="3.5" fill="#b39ddb" fill-opacity="0.25"
+           stroke="#b39ddb" stroke-width="1.3"/>
+  <!-- top profile (dashed: it's the second sketch on a different plane) -->
+  <ellipse cx="18" cy="11" rx="5" ry="2" fill="#b39ddb" fill-opacity="0.15"
+           stroke="#b39ddb" stroke-width="1.2" stroke-dasharray="3,2"/>
 </svg>
 """
 
@@ -180,27 +185,43 @@ _SVG_FILLET = """
 _SVG_CHAMFER = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
   <!-- original corner (faint) -->
-  <polyline points="7,29 7,7 29,7" fill="none" stroke="#888" stroke-width="1"
-            opacity="0.3" stroke-dasharray="2,2"/>
+  <polyline points="7,29 7,7 29,7" fill="none" stroke="#80cbc4" stroke-width="1"
+            opacity="0.4" stroke-dasharray="2,2"/>
   <!-- chamfered result -->
-  <path d="M7,29 L7,15 L15,7 L29,7" fill="none" stroke="#888" stroke-width="2"
-        stroke-linecap="round" stroke-linejoin="round" opacity="0.55"/>
+  <path d="M7,29 L7,15 L15,7 L29,7" fill="none" stroke="#80cbc4" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
   <!-- bevel line -->
-  <line x1="7" y1="15" x2="15" y2="7" stroke="#aaa" stroke-width="1.5"
-        opacity="0.6"/>
+  <line x1="7" y1="15" x2="15" y2="7" stroke="#b2dfdb" stroke-width="1.6"
+        opacity="0.85"/>
 </svg>
 """
 
 # Boolean: two overlapping circles (union/subtract/intersect)
 _SVG_BOOLEAN = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
-  <circle cx="14" cy="18" r="9" fill="#888" fill-opacity="0.1"
-          stroke="#888" stroke-width="1.3" stroke-dasharray="3,2" opacity="0.55"/>
-  <circle cx="22" cy="18" r="9" fill="#888" fill-opacity="0.1"
-          stroke="#888" stroke-width="1.3" stroke-dasharray="3,2" opacity="0.55"/>
+  <circle cx="14" cy="18" r="9" fill="#e57373" fill-opacity="0.15"
+          stroke="#e57373" stroke-width="1.3" opacity="0.85"/>
+  <circle cx="22" cy="18" r="9" fill="#64b5f6" fill-opacity="0.15"
+          stroke="#64b5f6" stroke-width="1.3" opacity="0.85"/>
   <!-- intersection highlight -->
   <path d="M18,9.3 Q26,14 26,18 Q26,22 18,26.7 Q10,22 10,18 Q10,14 18,9.3 Z"
-        fill="#888" fill-opacity="0.18"/>
+        fill="#ffb74d" fill-opacity="0.25"/>
+</svg>
+"""
+
+
+# Offset Plane: a face with a parallel translucent quad above it
+_SVG_OFFSET_PLANE = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <!-- base face (solid edge) -->
+  <polygon points="6,24 22,24 30,28 14,28" fill="#4a90d9" fill-opacity="0.18"
+           stroke="#4a90d9" stroke-width="1.3" opacity="0.85"/>
+  <!-- offset plane (translucent + dashed) -->
+  <polygon points="6,12 22,12 30,16 14,16" fill="#4a90d9" fill-opacity="0.10"
+           stroke="#4a90d9" stroke-width="1.2" stroke-dasharray="3,2" opacity="0.85"/>
+  <!-- offset arrow -->
+  <line x1="18" y1="26" x2="18" y2="15" stroke="#aacbe6" stroke-width="1.2"/>
+  <polygon points="16,16 20,16 18,12" fill="#aacbe6"/>
 </svg>
 """
 
@@ -210,11 +231,15 @@ _SVG_BOOLEAN = """
 # ---------------------------------------------------------------------------
 
 class OpsToolbar(QToolBar):
-    extrude_requested = pyqtSignal()
-    thicken_requested = pyqtSignal()
-    sketch_requested  = pyqtSignal()
-    revolve_requested = pyqtSignal()
-    fillet_requested  = pyqtSignal()
+    extrude_requested      = pyqtSignal()
+    thicken_requested      = pyqtSignal()
+    sketch_requested       = pyqtSignal()
+    revolve_requested      = pyqtSignal()
+    fillet_requested       = pyqtSignal()
+    chamfer_requested      = pyqtSignal()
+    offset_plane_requested = pyqtSignal()
+    loft_requested         = pyqtSignal()
+    boolean_requested      = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__("Operations", parent)
@@ -228,6 +253,9 @@ class OpsToolbar(QToolBar):
         self._btn_sketch = self._add_op_button(
             "Sketch", _SVG_SKETCH, self.sketch_requested,
             "Start a sketch on the selected face")
+        self._btn_offset_plane = self._add_op_button(
+            "Plane", _SVG_OFFSET_PLANE, self.offset_plane_requested,
+            "Create an offset datum plane (parented to a world plane or face)")
 
         self._add_separator()
 
@@ -245,17 +273,23 @@ class OpsToolbar(QToolBar):
         self._btn_revolve = self._add_op_button(
             "Revolve", _SVG_REVOLVE, self.revolve_requested,
             "Revolve a sketch profile around an axis")
-        self._btn_loft     = self._add_stub("Loft",     _SVG_LOFT,     "Loft between two or more profiles  [not yet implemented]")
+        self._btn_loft = self._add_op_button(
+            "Loft", _SVG_LOFT, self.loft_requested,
+            "Loft between two or more sketch profiles")
 
         self._btn_fillet   = self._add_op_button(
             "Fillet", _SVG_FILLET, self.fillet_requested,
             "Fillet selected edges  (F)")
 
-        self._btn_chamfer  = self._add_stub("Chamfer",  _SVG_CHAMFER,  "Bevel selected edges  [not yet implemented]")
+        self._btn_chamfer  = self._add_op_button(
+            "Chamfer", _SVG_CHAMFER, self.chamfer_requested,
+            "Chamfer selected edges with distance + angle")
 
         self._add_separator()
 
-        self._btn_boolean  = self._add_stub("Boolean",  _SVG_BOOLEAN,  "Boolean union / subtract / intersect  [not yet implemented]")
+        self._btn_boolean = self._add_op_button(
+            "Boolean", _SVG_BOOLEAN, self.boolean_requested,
+            "Boolean union / subtract / intersect between two bodies")
 
         self.set_enabled(False)
 
@@ -286,11 +320,14 @@ class OpsToolbar(QToolBar):
 
     def set_enabled(self, enabled: bool):
         self._btn_sketch.setEnabled(enabled)
+        self._btn_offset_plane.setEnabled(enabled)
         self._btn_extrude.setEnabled(enabled)
         self._btn_thicken.setEnabled(enabled)
         self._btn_revolve.setEnabled(enabled)
+        self._btn_loft.setEnabled(enabled)
         self._btn_fillet.setEnabled(enabled)
-        # other stubs stay disabled always
+        self._btn_chamfer.setEnabled(enabled)
+        self._btn_boolean.setEnabled(enabled)
 
 
 # ---------------------------------------------------------------------------

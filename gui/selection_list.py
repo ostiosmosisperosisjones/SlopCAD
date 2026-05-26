@@ -43,15 +43,22 @@ _RM_STYLE  = (
 
 
 class SelectionList(QWidget):
-    """Scrollable list of labelled entries with ✕ remove buttons and error state."""
+    """Scrollable list of labelled entries with ✕ remove buttons and error state.
 
-    entry_removed = pyqtSignal(int)   # index that was removed
+    When reorderable=True, each row gets ▲/▼ buttons to swap with its neighbor
+    and the label is prefixed with #N to make the order visible.
+    """
 
-    def __init__(self, empty_text: str = "Nothing selected", parent=None):
+    entry_removed  = pyqtSignal(int)        # index that was removed
+    order_changed  = pyqtSignal()           # fires after a successful move
+
+    def __init__(self, empty_text: str = "Nothing selected", parent=None,
+                 reorderable: bool = False):
         super().__init__(parent)
 
         # (key, label, valid, tooltip)
         self._entries: list[tuple] = []
+        self._reorderable = reorderable
 
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -118,6 +125,18 @@ class SelectionList(QWidget):
             self._entries[index] = (key, label, valid, tip)
             self._rebuild()
 
+    def move(self, src: int, dst: int):
+        """Move entry at src to dst, clamping dst. Fires order_changed if changed."""
+        if not (0 <= src < len(self._entries)):
+            return
+        dst = max(0, min(dst, len(self._entries) - 1))
+        if src == dst:
+            return
+        item = self._entries.pop(src)
+        self._entries.insert(dst, item)
+        self._rebuild()
+        self.order_changed.emit()
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -135,18 +154,35 @@ class SelectionList(QWidget):
             return
 
         self._empty_label.hide()
+        n = len(self._entries)
         for i, (key, label, valid, tooltip) in enumerate(self._entries):
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(4)
 
-            lbl = QLabel(label)
+            display_label = f"#{i + 1}  {label}" if self._reorderable else label
+            lbl = QLabel(display_label)
             lbl.setStyleSheet(_LABEL_OK if valid else _LABEL_ERR)
             lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             if tooltip:
                 lbl.setToolTip(tooltip)
             row_layout.addWidget(lbl)
+
+            if self._reorderable:
+                up = QPushButton("▲")
+                up.setFixedWidth(prefs.scaled_px(22))
+                up.setStyleSheet(prefs.scale_stylesheet(_RM_STYLE))
+                up.setEnabled(i > 0)
+                up.clicked.connect(lambda _, idx=i: self.move(idx, idx - 1))
+                row_layout.addWidget(up)
+
+                dn = QPushButton("▼")
+                dn.setFixedWidth(prefs.scaled_px(22))
+                dn.setStyleSheet(prefs.scale_stylesheet(_RM_STYLE))
+                dn.setEnabled(i < n - 1)
+                dn.clicked.connect(lambda _, idx=i: self.move(idx, idx + 1))
+                row_layout.addWidget(dn)
 
             rm = QPushButton("✕")
             rm.setFixedWidth(prefs.scaled_px(22))

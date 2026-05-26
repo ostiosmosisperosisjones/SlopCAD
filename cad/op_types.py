@@ -24,6 +24,10 @@ from cad.op_revolve_thicken import (
     SketchRevolveOp,
     CrossBodyRevolveCutOp,
 )
+from cad.op_offset_plane import OffsetPlaneOp
+from cad.op_loft import SketchLoftOp
+from cad.op_chamfer import ChamferOp
+from cad.op_boolean import BooleanOp
 
 from typing import Any
 
@@ -48,14 +52,21 @@ def _revolve_from_params(operation: str, params: dict) -> Op:
 
 
 _FROM_PARAMS: dict[str, Any] = {
-    "extrude":     _extrude_or_cut_from_params,
-    "cut":         _extrude_or_cut_from_params,
-    "sketch":      lambda op, p: SketchOp._from_params(p),
-    "import":      lambda op, p: ImportOp._from_params(p),
-    "thicken":     lambda op, p: ThickenOp._from_params(p),
-    "fillet":      lambda op, p: FaceFilletOp._from_params(p),
-    "revolve":     _revolve_from_params,
-    "revolve_cut": _revolve_from_params,
+    "extrude":      _extrude_or_cut_from_params,
+    "cut":          _extrude_or_cut_from_params,
+    "sketch":       lambda op, p: SketchOp._from_params(p),
+    "import":       lambda op, p: ImportOp._from_params(p),
+    "thicken":      lambda op, p: ThickenOp._from_params(p),
+    "fillet":       lambda op, p: FaceFilletOp._from_params(p),
+    "revolve":      _revolve_from_params,
+    "revolve_cut":  _revolve_from_params,
+    "offset_plane": lambda op, p: OffsetPlaneOp._from_params(p),
+    "loft":         lambda op, p: SketchLoftOp._from_params(p),
+    "loft_cut":     lambda op, p: SketchLoftOp._from_params(p),
+    "chamfer":      lambda op, p: ChamferOp._from_params(p),
+    "union":        lambda op, p: BooleanOp._from_params(p),
+    "subtract":     lambda op, p: BooleanOp._from_params(p),
+    "intersect":    lambda op, p: BooleanOp._from_params(p),
 }
 
 __all__ = [
@@ -63,5 +74,9 @@ __all__ = [
     "FaceExtrudeOp", "CrossBodyCutOp", "SketchExtrudeOp", "SketchOp", "ImportOp",
     "FaceFilletOp",
     "ThickenOp", "FaceRevolveOp", "SketchRevolveOp", "CrossBodyRevolveCutOp",
+    "OffsetPlaneOp",
+    "SketchLoftOp",
+    "ChamferOp",
+    "BooleanOp",
     "_FROM_PARAMS", "_extrude_or_cut_from_params",
 ]

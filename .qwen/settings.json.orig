@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Read(//home/nico/Documents/cad/app/**)"
+      "Read(//home/nico/Documents/cad/app/**)",
+      "Bash(python *)",
+      "Bash(timeout *)",
+      "Bash(true)"
     ]
-  }
+  },
+  "$version": 4
 }

@@ -61,4 +61,30 @@ def format_op_label(operation: str, params: dict) -> str:
     if operation == "revolve_cut":
         angle = params.get("angle_deg", 360)
         return f"Revolve cut  {angle:.1f}°"
+    if operation == "offset_plane":
+        ps   = params.get("plane_source") or {}
+        dist = float(ps.get("distance", 0.0)) if isinstance(ps, dict) else 0.0
+        name = params.get("name") or "Plane"
+        return f"{name}  ({format_value(abs(dist), unit, decimals)})"
+    if operation == "loft":
+        n = len(params.get("from_profiles") or
+                params.get("from_sketch_ids") or [])
+        return f"Loft  ({n} profiles)"
+    if operation == "loft_cut":
+        n = len(params.get("from_profiles") or
+                params.get("from_sketch_ids") or [])
+        return f"Loft cut  ({n} profiles)"
+    if operation == "chamfer":
+        dist  = params.get("distance", 0.0)
+        angle = params.get("angle_deg", 45.0)
+        return f"Chamfer  {format_value(dist, unit, decimals)} × {angle:.1f}°"
+    if operation == "union":
+        n = len(params.get("body_ids", []))
+        return f"Union  ({n} bodies)"
+    if operation == "subtract":
+        n = len(params.get("body_ids", [])) - 1  # subtract first (target)
+        return f"Subtract  ({n} tool(s))"
+    if operation == "intersect":
+        n = len(params.get("body_ids", []))
+        return f"Intersect  ({n} bodies)"
     return operation.capitalize()
