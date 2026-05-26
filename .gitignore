@@ -5,3 +5,4 @@ build/
 *.spec.bak
 AGENTS.md
 _tests/
+QWEN.md
