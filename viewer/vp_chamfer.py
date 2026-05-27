@@ -291,7 +291,7 @@ class ChamferMixin:
 
     def _launch_chamfer_thread(self, shape, params):
         import threading
-        from cad.operations.chamfer import chamfer_edges, chamfer_edges_validate
+        from cad.operations.chamfer import chamfer_edges
 
         face_indices, edge_occs, dist, angle, flip = params
         token = object()
@@ -325,15 +325,24 @@ class ChamferMixin:
             edge_owners.append(owner)
 
         def _compute():
-            errors = chamfer_edges_validate(shape, all_edges, dist, angle, flip)
+            # Errors come from chamfer_edges itself — no second validate pass.
+            # The list is positionally aligned with all_edges/edge_owners.
+            per_edge: list[tuple[int, str | None]] = []
             try:
-                result = chamfer_edges(shape, all_edges, dist, angle, flip)
+                result = chamfer_edges(shape, all_edges, dist, angle, flip,
+                                        per_edge_errors=per_edge)
                 from viewer.mesh import Mesh
                 preview_mesh = Mesh(result)
                 kernel_err   = None
             except Exception as ex:
                 preview_mesh = None
                 kernel_err   = str(ex)
+            # Reshape per_edge → flat list aligned with all_edges; if the
+            # native path succeeded chamfer_edges fills None for every entry.
+            errors = [None] * len(all_edges)
+            for i, msg in per_edge:
+                if 0 <= i < len(errors):
+                    errors[i] = msg
             QMetaObject.invokeMethod(
                 self, "_chamfer_preview_done",
                 Qt.ConnectionType.QueuedConnection,

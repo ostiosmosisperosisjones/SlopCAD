@@ -440,7 +440,13 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._modelview  = glGetDoublev(GL_MODELVIEW_MATRIX)
         self._projection = glGetDoublev(GL_PROJECTION_MATRIX)
         self._viewport   = glGetIntegerv(GL_VIEWPORT)
-        self.hover.rebuild(visible, self.workspace,
+        # Hover picks against LIVE meshes only — preview meshes (chamfer,
+        # fillet3d, etc.) have different edge indices, so feeding them to
+        # hover would cause the user's next pick to resolve to the wrong
+        # edge once their preview is on screen.
+        hover_meshes = {bid: m for bid, m in self._meshes.items()
+                        if self._body_visible.get(bid, True)}
+        self.hover.rebuild(hover_meshes, self.workspace,
                            self._modelview, self._projection,
                            self._viewport, self.devicePixelRatio(),
                            camera_eye=self.camera.get_eye(),
@@ -456,7 +462,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._draw_boolean_preview()
         self._draw_loft_preview()
 
-        self._dim_labels = draw_overlays(visible, self.selection,
+        # Selection and hover highlights are indexed against LIVE meshes
+        # (because selection was captured before any preview swap). Drawing
+        # them against `visible` — which may contain a preview mesh with
+        # different edge ordering — would highlight the wrong polylines.
+        self._dim_labels = draw_overlays(hover_meshes, self.selection,
                       self._hovered_vertex, self._hovered_edge,
                       sketch=self._sketch,
                       camera_distance=self.camera.distance,
