@@ -80,7 +80,21 @@ class RevolveMixin:
 
     def _close_revolve_panel(self):
         if hasattr(self, '_revolve_panel') and self._revolve_panel is not None:
-            self._revolve_panel.close()
+            panel = self._revolve_panel
+            # Disconnect preview signal BEFORE close — closing the widget
+            # can fire one last spinbox value_changed → preview_changed,
+            # which would otherwise repopulate the arrow/mesh after we
+            # cleared them below.
+            try:
+                panel.preview_changed.disconnect(self._on_revolve_preview)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                panel._preview_timer.stop()
+            except Exception:
+                pass
+            panel.close()
+            panel.deleteLater()
             self._revolve_panel = None
         self._revolve_axis_active   = False
         self._revolve_face_active   = False
@@ -91,6 +105,15 @@ class RevolveMixin:
         self._revolve_arrow_origin  = None
         self._revolve_arrow_dir     = None
         self._revolve_face_centroid = None
+        self._revolve_axis_point    = None
+        self._revolve_axis_dir      = None
+        self._revolve_preview_angle = 0.0
+        self._revolve_last_preview_params = None
+        # Bump gen so any in-flight background mesh compute that lands after
+        # this point is discarded — otherwise a worker that started during
+        # the last spin can revive the preview seconds after the panel closed.
+        self._revolve_mesh_gen     = getattr(self, '_revolve_mesh_gen', 0) + 1
+        self._revolve_mesh_pending = None
         if getattr(self, '_editing_history_idx', None) is not None:
             self._cancel_revolve_edit()
         self.update()
@@ -221,6 +244,12 @@ class RevolveMixin:
 
         def _deliver(result, finished_gen):
             self._revolve_mesh_inflight = False
+            # Panel closed while we were computing — drop the result, never
+            # assign it. Gen counter alone is not enough: a worker that started
+            # mid-drag and lands here after OK click would otherwise revive
+            # the preview because the gen was still current at start time.
+            if getattr(self, '_revolve_panel', None) is None:
+                return
             if getattr(self, '_revolve_mesh_gen', 0) == finished_gen:
                 self._revolve_preview_mesh = result
                 self.update()

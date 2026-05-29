@@ -94,6 +94,7 @@ class ThickenMixin:
         self._thicken_cage_key            = None
         self._thicken_last_preview_params = None
         self._thicken_mesh_gen            = getattr(self, '_thicken_mesh_gen', 0) + 1  # invalidate any inflight
+        self._thicken_mesh_pending        = None
         self._thicken_arrow_origin        = None
         self._thicken_arrow_dir           = None
         self.update()
@@ -284,6 +285,8 @@ class ThickenMixin:
 
         def _deliver(result, finished_gen):
             self._thicken_mesh_inflight = False
+            if getattr(self, '_thicken_panel', None) is None:
+                return
             if getattr(self, '_thicken_mesh_gen', 0) == finished_gen:
                 if result is not None:
                     tris_list, edges_list, errors = result

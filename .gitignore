@@ -6,3 +6,4 @@ build/
 AGENTS.md
 _tests/
 QWEN.md
+.qwen

@@ -244,6 +244,44 @@ class ExtrudeMixin:
             self._extrude_preview_mesh = None
         self.update()
 
+    def _extrude_face_centroid(self, sketch_idx, face_pairs):
+        """Best-effort centroid of the face(s) being extruded, in world space.
+        Returns None if nothing usable is available."""
+        import numpy as np
+        try:
+            from build123d import Plane
+            faces = []
+            if sketch_idx is not None:
+                all_sketch = self._sketch_faces.get(sketch_idx, [])
+                fidx_sel   = self._selected_sketch_face
+                if fidx_sel is not None:
+                    faces = [all_sketch[i][0] for i in fidx_sel
+                             if 0 <= i < len(all_sketch)]
+                else:
+                    faces = [f[0] for f in all_sketch]
+            elif face_pairs:
+                for bid, fi in face_pairs:
+                    shape = self.workspace.current_shape(bid)
+                    if shape is None:
+                        continue
+                    all_f = list(shape.faces())
+                    if fi < len(all_f):
+                        faces.append(all_f[fi])
+            if not faces:
+                return None
+            pts = []
+            for f in faces:
+                try:
+                    o = Plane(f).origin
+                    pts.append([o.X, o.Y, o.Z])
+                except Exception:
+                    pass
+            if not pts:
+                return None
+            return np.mean(np.asarray(pts, dtype=float), axis=0)
+        except Exception:
+            return None
+
     def _update_extrude_arrow(self, dist: float, direction,
                                sketch_idx, face_pairs, start_offset: float):
         """Store the world-space arrow base and direction for rendering."""
@@ -254,8 +292,15 @@ class ExtrudeMixin:
             self._extrude_arrow_dir    = None
             return
 
-        origin = panel._face_origin
+        # Prefer the actual sketch/body face centroid over panel._face_origin.
+        # For sketches on a default plane, plane_origin is the world origin —
+        # parking the arrow there even when the sketch is drawn far off-axis.
+        # Use Plane(face).origin (build123d puts it near the face center) so
+        # the arrow stays attached to the part, matching the other ops.
+        origin = self._extrude_face_centroid(sketch_idx, face_pairs)
         normal = panel._face_normal
+        if origin is None:
+            origin = panel._face_origin
         if origin is None or normal is None:
             self._extrude_arrow_origin = None
             self._extrude_arrow_dir    = None
