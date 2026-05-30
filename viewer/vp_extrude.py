@@ -1034,6 +1034,7 @@ class ExtrudeMixin:
             target_occ   = target_shape.wrapped
             original_solid_count = len(list(target_shape.solids()))
             op_params = {"distance": abs(distance), "merged_from": body_id,
+                         "merge_body_id": merge_body_id,
                          "face_pairs": [(bid, fi) for bid, fi in pairs],
                          "source_body_id": body_id}
             if direction is not None:

@@ -16,6 +16,56 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Shared merge helpers — build a tool solid from faces and fuse into a target.
+# Used by both the commit and replay paths of the "merge with part" extrude
+# flavors so the two can't drift (same family as the revolve merge fix).
+# ---------------------------------------------------------------------------
+
+def _extrude_faces_to_tool(faces, distance, direction,
+                           start_offset, end_offset, draft_angle):
+    """Extrude each face and fuse the results into one tool solid (build123d
+    Compound)."""
+    from cad.operations.extrude import _do_extrude_solid
+    from build123d import Compound
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from OCP.TopTools import TopTools_ListOfShape
+
+    tool = None
+    for face in faces:
+        s = _do_extrude_solid(face, distance, direction,
+                              start_offset=start_offset, end_offset=end_offset,
+                              draft_angle=draft_angle)
+        if tool is None:
+            tool = s
+        else:
+            lst_a = TopTools_ListOfShape(); lst_a.Append(tool.wrapped)
+            lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
+            fu = BRepAlgoAPI_Fuse()
+            fu.SetArguments(lst_a); fu.SetTools(lst_b)
+            fu.SetRunParallel(True); fu.Build()
+            if fu.IsDone():
+                tool = Compound(fu.Shape())
+    return tool
+
+
+def _fuse_tool_into_target(tool, target_occ):
+    """Fuse a tool solid into a target body's shape. Returns a build123d
+    Compound."""
+    from build123d import Compound
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from OCP.TopTools import TopTools_ListOfShape
+
+    lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
+    lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
+    fu = BRepAlgoAPI_Fuse()
+    fu.SetArguments(lst_a); fu.SetTools(lst_b)
+    fu.SetRunParallel(True); fu.Build()
+    if not fu.IsDone():
+        raise RuntimeError("Extrude fuse failed.")
+    return Compound(fu.Shape())
+
+
+# ---------------------------------------------------------------------------
 # FaceExtrudeOp  —  extrude or self-cut from a body face
 # ---------------------------------------------------------------------------
 
@@ -47,6 +97,7 @@ class FaceExtrudeOp(Op):
     face_indices:   list  = None   # face indices (single body, compat)
     face_refs:      list  = None   # FaceRef per face, built at commit
     face_pairs:     list  = None   # list of (body_id, face_idx) — multi-body support
+    merge_body_id:  str | None = None  # fuse the extruded tool into this body
 
     def __post_init__(self):
         if self.face_pairs is None:
@@ -86,6 +137,41 @@ class FaceExtrudeOp(Op):
         from build123d import Compound
         direction = (np.array(self.direction, dtype=float)
                      if self.direction is not None else None)
+
+        # Merge-into-target case: the entry is tagged to merge_body_id, so the
+        # `shape` passed in by replay IS that target body's current shape. The
+        # faces being extruded live on the SOURCE body, not the target, so we
+        # resolve them on the source shape, build the tool, and fuse it into
+        # `shape`. Without this, replay would self-extrude faces off the target
+        # (which don't exist there) or drop the merge entirely.
+        if self.merge_body_id is not None and not self.force_new_body:
+            if shape is None:
+                raise RuntimeError(
+                    "FaceExtrudeOp: merge target has no shape on replay")
+            refs = self.face_refs if self.face_refs else []
+            faces = []
+            for i, (bid, fi) in enumerate(self.face_pairs):
+                src_shape = history._shape_for_body_at(bid, entry_index)
+                if src_shape is None:
+                    raise RuntimeError(
+                        f"FaceExtrudeOp (merge): no shape for source body '{bid}'")
+                if i < len(refs):
+                    _, face_obj = refs[i].find_in(src_shape)
+                    if face_obj is None:
+                        raise RuntimeError(
+                            f"FaceExtrudeOp: could not re-locate face on body '{bid}'")
+                else:
+                    all_f = list(src_shape.faces())
+                    if fi >= len(all_f):
+                        raise RuntimeError(f"FaceExtrudeOp: face_idx {fi} out of range")
+                    face_obj = all_f[fi]
+                faces.append(face_obj)
+            tool = _extrude_faces_to_tool(faces, self.distance, direction,
+                                          self.start_offset, self.end_offset,
+                                          self.draft_angle)
+            if tool is None:
+                raise RuntimeError("FaceExtrudeOp: extrude produced no tool")
+            return _fuse_tool_into_target(tool, shape.wrapped)
 
         if self.force_new_body:
             from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
@@ -387,6 +473,8 @@ class FaceExtrudeOp(Op):
             p["draft_angle"] = self.draft_angle
         if self.force_new_body:
             p["force_new_body"] = True
+        if self.merge_body_id is not None:
+            p["merge_body_id"] = self.merge_body_id
         return p
 
     @classmethod
@@ -395,6 +483,11 @@ class FaceExtrudeOp(Op):
         dist     = float(params.get("distance", 0)) * sign
         fi       = int(params.get("face_idx", 0))
         src_body = params.get("source_body_id", "")
+        # "merged_from" is the legacy key the old face-merge commit path wrote;
+        # it stored the SOURCE body there and tagged the entry to the target,
+        # but never recorded the target id in params — so old entries can't be
+        # replayed as merges. New entries store "merge_body_id" (the target).
+        merge_body_id = params.get("merge_body_id")
         raw_pairs   = params.get("face_pairs")
         raw_indices = params.get("face_indices")
         if raw_pairs:
@@ -424,6 +517,7 @@ class FaceExtrudeOp(Op):
             end_offset     = float(params.get("end_offset", 0.0)),
             draft_angle    = float(params.get("draft_angle", 0.0)),
             force_new_body = bool(params.get("force_new_body", False)),
+            merge_body_id  = merge_body_id,
         )
 
 
@@ -873,9 +967,31 @@ class SketchExtrudeOp(Op):
 
         signed_dist = -abs(self.distance) if self.distance < 0 else abs(self.distance)
 
+        import numpy as np
+        direction = (np.array(self.direction, dtype=float)
+                     if self.direction is not None else None)
+
+        # Merge-into-target case: the entry is tagged to merge_body_id, so the
+        # `shape` passed in by replay IS that target body's current shape. Build
+        # the tool from the sketch profile and fuse it in, reproducing the
+        # commit. Without this, replay would diverge — dropping disjoint solids
+        # (only solids[0] is returned below) or reordering them by volume so the
+        # split-import children no longer line up.
+        if self.merge_body_id is not None and not self.force_new_body:
+            if shape is None:
+                raise RuntimeError(
+                    "SketchExtrudeOp: merge target has no shape on replay")
+            tool = _extrude_faces_to_tool(faces, signed_dist, direction,
+                                          self.start_offset, self.end_offset,
+                                          self.draft_angle)
+            if tool is None:
+                raise RuntimeError("SketchExtrudeOp: extrude produced no tool")
+            return _fuse_tool_into_target(tool, shape.wrapped)
+
         result = shape
         for face in faces:
             result = extrude_face_direct(result, face, signed_dist,
+                                         direction=direction,
                                          start_offset=self.start_offset,
                                          end_offset=self.end_offset,
                                          draft_angle=self.draft_angle)
@@ -978,9 +1094,13 @@ class SketchExtrudeOp(Op):
                 raise RuntimeError("[Extrude] Merge target has no shape.")
             target_occ = target_shape.wrapped
             original_solid_count = len(list(target_shape.solids()))
+            # Store merge_body_id (the target) so replay can reproduce the
+            # fuse. merged_from (the source) is kept for the reopen/edit UI.
             merge_params = {"distance": abs(distance), "merged_from": body_id,
+                            "merge_body_id": self.merge_body_id,
                             "from_sketch_id": self.from_sketch_id,
-                            "face_indices": face_indices}
+                            "face_indices": face_indices,
+                            "face_centroids": face_centroids}
             if direction is not None:
                 merge_params["direction"] = direction.tolist()
             if extra_params:
@@ -988,29 +1108,12 @@ class SketchExtrudeOp(Op):
             merge_body_id = self.merge_body_id
 
             def compute():
-                tool_solid = None
-                for face in faces:
-                    s = _do_extrude_solid(face, distance, direction,
-                                          start_offset=start_offset, end_offset=end_offset,
-                                          draft_angle=draft_angle)
-                    if tool_solid is None:
-                        tool_solid = s
-                    else:
-                        lst_a = TopTools_ListOfShape(); lst_a.Append(tool_solid.wrapped)
-                        lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
-                        fu = BRepAlgoAPI_Fuse()
-                        fu.SetArguments(lst_a); fu.SetTools(lst_b)
-                        fu.SetRunParallel(True); fu.Build()
-                        if fu.IsDone():
-                            tool_solid = Compound(fu.Shape())
-                lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
-                lst_b = TopTools_ListOfShape(); lst_b.Append(tool_solid.wrapped)
-                fu = BRepAlgoAPI_Fuse()
-                fu.SetArguments(lst_a); fu.SetTools(lst_b)
-                fu.SetRunParallel(True); fu.Build()
-                if not fu.IsDone():
-                    raise RuntimeError("Fuse failed.")
-                return Compound(fu.Shape())
+                tool_solid = _extrude_faces_to_tool(
+                    faces, distance, direction,
+                    start_offset, end_offset, draft_angle)
+                if tool_solid is None:
+                    raise RuntimeError("Extrude produced no tool.")
+                return _fuse_tool_into_target(tool_solid, target_occ)
 
             def finalize(merged):
                 _push_result(viewport, "extrude", merge_params, merge_body_id,

@@ -388,6 +388,47 @@ class FaceRevolveOp(Op):
 # SketchRevolveOp  —  revolve a sketch profile around an axis
 # ---------------------------------------------------------------------------
 
+def _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle_deg):
+    """Revolve each face and fuse the results into one tool solid (build123d
+    Compound). Shared by commit and replay so the two can't drift."""
+    from cad.operations.revolve import revolve_face_direct
+    from build123d import Compound
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from OCP.TopTools import TopTools_ListOfShape
+
+    tool = None
+    for face in faces:
+        s = revolve_face_direct(None, face, axis_pt, axis_dir, angle_deg)
+        if tool is None:
+            tool = s
+        else:
+            lst_a = TopTools_ListOfShape(); lst_a.Append(tool.wrapped)
+            lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
+            fu = BRepAlgoAPI_Fuse()
+            fu.SetArguments(lst_a); fu.SetTools(lst_b)
+            fu.SetRunParallel(True); fu.Build()
+            if fu.IsDone():
+                tool = Compound(fu.Shape())
+    return tool
+
+
+def _fuse_tool_into_target(tool, target_occ):
+    """Fuse a revolved tool solid into a target body's shape. Returns a
+    build123d Compound. Shared by commit and replay."""
+    from build123d import Compound
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from OCP.TopTools import TopTools_ListOfShape
+
+    lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
+    lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
+    fu = BRepAlgoAPI_Fuse()
+    fu.SetArguments(lst_a); fu.SetTools(lst_b)
+    fu.SetRunParallel(True); fu.Build()
+    if not fu.IsDone():
+        raise RuntimeError("Revolve fuse failed.")
+    return Compound(fu.Shape())
+
+
 @dataclass
 class SketchRevolveOp(Op):
     """
@@ -461,6 +502,21 @@ class SketchRevolveOp(Op):
         axis_pt  = np.array(self.axis_point, dtype=float)
         axis_dir = np.array(self.axis_dir,   dtype=float)
 
+        # Merge-into-target case: the entry is tagged to merge_body_id, so the
+        # `shape` passed in by replay IS that target body's current shape. We
+        # must reproduce the same fuse the commit did (build the tool, fuse it
+        # into the target) — otherwise replay would replace the target body
+        # with the bare revolve and silently drop the merge.
+        force_new = self.merge_body_id is None or self.merge_body_id == "__new_body__"
+        if not force_new:
+            if shape is None:
+                raise RuntimeError(
+                    "SketchRevolveOp: merge target has no shape on replay")
+            tool = _revolve_faces_to_tool(faces, axis_pt, axis_dir, self.angle_deg)
+            if tool is None:
+                raise RuntimeError("SketchRevolveOp: revolve produced no tool")
+            return _fuse_tool_into_target(tool, shape.wrapped)
+
         result = None
         for face in faces:
             result = revolve_face_direct(result, face, axis_pt, axis_dir, self.angle_deg)
@@ -505,8 +561,6 @@ class SketchRevolveOp(Op):
         import numpy as np
         from cad.operations.revolve import revolve_face_direct
         from build123d import Compound
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-        from OCP.TopTools import TopTools_ListOfShape
         from cad.face_ref import FaceRef
 
         entries    = viewport.history.entries
@@ -566,27 +620,10 @@ class SketchRevolveOp(Op):
             merge_params["merge_body_id"] = merge_body_id
 
             def compute():
-                tool = None
-                for face in faces:
-                    s = revolve_face_direct(None, face, axis_pt, axis_dir, angle_deg)
-                    if tool is None:
-                        tool = s
-                    else:
-                        lst_a = TopTools_ListOfShape(); lst_a.Append(tool.wrapped)
-                        lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
-                        fu = BRepAlgoAPI_Fuse()
-                        fu.SetArguments(lst_a); fu.SetTools(lst_b)
-                        fu.SetRunParallel(True); fu.Build()
-                        if fu.IsDone():
-                            tool = Compound(fu.Shape())
-                lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
-                lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
-                fu = BRepAlgoAPI_Fuse()
-                fu.SetArguments(lst_a); fu.SetTools(lst_b)
-                fu.SetRunParallel(True); fu.Build()
-                if not fu.IsDone():
-                    raise RuntimeError("Revolve fuse failed.")
-                return Compound(fu.Shape())
+                tool = _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle_deg)
+                if tool is None:
+                    raise RuntimeError("Revolve produced no tool.")
+                return _fuse_tool_into_target(tool, target_occ)
 
             def finalize(merged):
                 _push_result(viewport, "revolve", merge_params, merge_body_id,

@@ -34,22 +34,103 @@ def _build_edge_to_faces_map(shape_occ):
     return edge_face_map
 
 
-def _pick_reference_face(edge_occ, edge_face_map, flip: bool):
-    """Return one of the faces adjacent to *edge_occ*.
+def _face_area(face_occ) -> float:
+    """Return the surface area of a face."""
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    gp = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(face_occ, gp)
+    return abs(gp.Mass())
 
-    flip=False → the first face OCCT lists for this edge.
-    flip=True  → the second adjacent face if one exists, else the first.
 
-    Raises if the edge has no adjacent faces (a degenerate seam edge).
+def _face_normal_at_edge(edge_occ, face_occ):
+    """Return the face's outward unit normal sampled at the edge midpoint, as
+    an (x, y, z) tuple, or None if it can't be evaluated."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.GeomLProp import GeomLProp_SLProps
+    from OCP.TopAbs import TopAbs_REVERSED
+
+    adp = BRepAdaptor_Curve(edge_occ)
+    u0, u1 = adp.FirstParameter(), adp.LastParameter()
+    mid = adp.Value((u0 + u1) * 0.5)
+    surf = BRep_Tool.Surface_s(face_occ)
+    proj = GeomAPI_ProjectPointOnSurf(mid, surf)
+    if proj.NbPoints() == 0:
+        return None
+    u, v = proj.LowerDistanceParameters()
+    props = GeomLProp_SLProps(surf, u, v, 1, 1e-6)
+    if not props.IsNormalDefined():
+        return None
+    n = props.Normal()
+    nx, ny, nz = n.X(), n.Y(), n.Z()
+    if face_occ.Orientation() == TopAbs_REVERSED:
+        nx, ny, nz = -nx, -ny, -nz
+    return (nx, ny, nz)
+
+
+def _ordered_adjacent_faces(edge_occ, edge_face_map):
+    """Return the edge's adjacent faces in a geometry-deterministic order.
+
+    OCCT lists adjacent faces in an order that follows internal topology
+    iteration, NOT geometry — so two mirror-symmetric edges can receive their
+    adjacent faces in opposite order. Picking ".First()" then references
+    non-corresponding faces, producing asymmetric chamfers on symmetric edges
+    at any angle != 45 deg.
+
+    We instead order the two faces by descending surface area, so the larger
+    adjacent face is always the reference. Area is invariant under the mirror
+    and rotational symmetries that relate symmetric edges (a face maps to a
+    congruent, equal-area face), so corresponding faces are chosen on every
+    symmetric edge — this handles the common case (e.g. a non-cube box where
+    one adjacent face is genuinely larger).
+
+    When the two faces have equal area (a cube, where every face is congruent
+    and area can't decide), we tie-break by the face normal's alignment with
+    the global axes, preferring +Z then +Y then +X. That choice is invariant
+    under the part's symmetry: the symmetry that maps one symmetric edge to
+    another fixes the global up axis, so the same physical face (e.g. the top
+    cap rather than a lateral side) is picked on every edge of the group.
     """
     if not edge_face_map.Contains(edge_occ):
         raise RuntimeError("Chamfer: edge has no adjacent faces in this shape")
     face_list = edge_face_map.FindFromKey(edge_occ)
-    n = face_list.Extent()
-    if n == 0:
+    faces = [TopoDS.Face_s(f) for f in face_list]
+    if not faces:
         raise RuntimeError("Chamfer: edge has no adjacent faces")
-    pick = face_list.Last() if (flip and n >= 2) else face_list.First()
-    return TopoDS.Face_s(pick)
+    if len(faces) < 2:
+        return faces
+
+    def sort_key(face_occ):
+        # Primary: larger area first (negate so it sorts ahead).
+        area = round(_face_area(face_occ), 5)
+        # Tie-break: alignment with global +Z, +Y, +X (negate so "more
+        # aligned" sorts ahead). Symmetry-invariant for equal-area faces.
+        nrm = _face_normal_at_edge(edge_occ, face_occ)
+        if nrm is None:
+            align = (0.0, 0.0, 0.0)
+        else:
+            align = tuple((round(c, 5) or 0.0) for c in nrm)
+        return (-area, -align[2], -align[1], -align[0])
+
+    return sorted(faces, key=sort_key)
+
+
+def _pick_reference_face(edge_occ, edge_face_map, flip: bool):
+    """Return one of the faces adjacent to *edge_occ*.
+
+    The two adjacent faces are ordered deterministically by geometry (see
+    _ordered_adjacent_faces) so symmetric edges reference corresponding faces.
+
+    flip=False → the first face in geometric order.
+    flip=True  → the second adjacent face if one exists, else the first.
+
+    Raises if the edge has no adjacent faces (a degenerate seam edge).
+    """
+    faces = _ordered_adjacent_faces(edge_occ, edge_face_map)
+    pick = faces[1] if (flip and len(faces) >= 2) else faces[0]
+    return pick
 
 
 def chamfer_edges_validate(shape, edge_occs, distance: float, angle_deg: float,
@@ -284,14 +365,14 @@ def _get_cached_cutter(source_occ, edge_occ, distance: float,
         return hit
 
     edge_face_map = _build_edge_to_faces_map(source_occ)
-    if not edge_face_map.Contains(edge_occ):
-        raise RuntimeError("edge has no adjacent faces")
-    from OCP.TopoDS import TopoDS
-    faces = list(edge_face_map.FindFromKey(edge_occ))
+    # Order the two adjacent faces by geometry, not OCCT list order, so the
+    # cutter's reference face matches the native path and stays consistent
+    # across symmetric edges (same reasoning as _pick_reference_face).
+    faces = _ordered_adjacent_faces(edge_occ, edge_face_map)
     if len(faces) < 2:
         raise RuntimeError("edge needs two adjacent faces")
-    face_a = TopoDS.Face_s(faces[0])
-    face_b = TopoDS.Face_s(faces[1])
+    face_a = faces[0]
+    face_b = faces[1]
     if flip:
         face_a, face_b = face_b, face_a
     distance_b = distance * math.tan(angle_rad)
