@@ -765,6 +765,8 @@ class ExtrudeMixin:
                 end_offset     = float((extra or {}).get('end_offset', 0.0)),
                 draft_angle    = float((extra or {}).get('draft_angle', 0.0)),
                 force_new_body = (merge_body_id == "__new_body__"),
+                merge_body_id  = (None if merge_body_id in (None, "__new_body__")
+                                  else merge_body_id),
             )
 
         commit_extra = dict(extra) if extra else {}

@@ -307,6 +307,38 @@ class FaceExtrudeOp(Op):
         op_params.pop("_preserved_body_ids", None)
         original_solid_count = len(list(shape_before.solids()))
 
+        # Merge into another body: build the tool from the source face(s) and
+        # fuse it into the target. Tagged to merge_body_id so replay (which
+        # honors merge_body_id) reproduces the same fuse. Single-body picks
+        # only — multi-body picks are forced to new-body mode upstream.
+        if (self.merge_body_id is not None and not self.force_new_body
+                and len(self.face_pairs) <= 1):
+            target_shape = viewport.workspace.current_shape(self.merge_body_id)
+            if target_shape is None:
+                raise RuntimeError("[Extrude] Merge target has no shape.")
+            target_occ   = target_shape.wrapped
+            merge_target = self.merge_body_id
+            orig_merge_count = len(list(target_shape.solids()))
+            distance     = self.distance
+            start_offset = self.start_offset
+            end_offset   = self.end_offset
+            draft_angle  = self.draft_angle
+            # merged_from records the source body for the reopen/edit UI.
+            op_params["merged_from"] = self.source_body_id
+
+            def compute():
+                tool = _extrude_faces_to_tool(face_objs, distance, direction,
+                                              start_offset, end_offset, draft_angle)
+                if tool is None:
+                    raise RuntimeError("Extrude produced no tool.")
+                return _fuse_tool_into_target(tool, target_occ)
+
+            def finalize(merged):
+                _push_result(viewport, op_str, op_params, merge_target,
+                             None, target_shape, merged, orig_merge_count)
+
+            return compute, finalize
+
         if self.force_new_body:
             distance     = self.distance
             body_id      = self.source_body_id
@@ -425,6 +457,18 @@ class FaceExtrudeOp(Op):
         if self.distance < 0:
             panel._radio_cut.setChecked(True)
             panel._on_mode_changed(1)
+
+        # Restore the picked merge target so re-entering the panel keeps the
+        # user's body choice (only single-body picks can merge — multi-body is
+        # locked to new-body mode above).
+        if (self.merge_body_id and not self.force_new_body
+                and len(self.face_pairs) <= 1
+                and self.merge_body_id in vp.workspace.bodies):
+            panel.set_merge_body(
+                self.merge_body_id,
+                vp.workspace.bodies[self.merge_body_id].name)
+            panel._radio_merge.setChecked(True)
+            panel._on_op_changed(1)
 
         if self.direction is not None:
             panel.set_direction(np.array(self.direction, dtype=float))
@@ -1209,10 +1253,17 @@ class SketchExtrudeOp(Op):
             panel._radio_cut.setChecked(True)
             panel._on_mode_changed(1)
 
-        if self.merged_from and self.merged_from in vp.workspace.bodies:
+        # Restore the picked merge TARGET. merge_body_id is the body the user
+        # chose to merge into; merged_from is only a fallback for legacy entries
+        # saved before merge_body_id was persisted (it held the sketch's parent
+        # body, which is the target only when they happen to coincide).
+        merge_target = (self.merge_body_id
+                        if self.merge_body_id in vp.workspace.bodies
+                        else self.merged_from)
+        if merge_target and merge_target in vp.workspace.bodies:
             panel.set_merge_body(
-                self.merged_from,
-                vp.workspace.bodies[self.merged_from].name)
+                merge_target,
+                vp.workspace.bodies[merge_target].name)
             panel._radio_merge.setChecked(True)
             panel._on_op_changed(1)
 
