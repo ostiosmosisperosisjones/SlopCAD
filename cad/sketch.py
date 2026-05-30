@@ -1125,6 +1125,37 @@ class SketchEntry:
                 uv_loops.append(uv_pts)
         return uv_loops
 
+    def _ref_uv_polyline(self, ref) -> list:
+        """
+        UV polyline a ReferenceEntity should chain on for loop detection.
+
+        Prefers the OCCT edge geometry (sampled and projected onto the sketch
+        plane) so the endpoints match exactly what the snap engine offers — the
+        snap engine reports OCC curve endpoints, not the mesh-tessellated
+        ref.points.  Falls back to ref.points when no usable occ_edge exists.
+        """
+        if ref.occ_edges:
+            try:
+                from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC
+                from OCP.GCPnts import GCPnts_QuasiUniformAbscissa
+                pts = []
+                for occ_edge in ref.occ_edges:
+                    if occ_edge is None:
+                        continue
+                    adp = _BAC(occ_edge)
+                    sampler = GCPnts_QuasiUniformAbscissa()
+                    sampler.Initialize(adp, 33)
+                    for j in range(1, sampler.NbPoints() + 1):
+                        p = adp.Value(sampler.Parameter(j))
+                        d = np.array([p.X(), p.Y(), p.Z()]) - self.plane_origin
+                        pts.append(np.array([float(np.dot(d, self.plane_x_axis)),
+                                             float(np.dot(d, self.plane_y_axis))]))
+                if len(pts) >= 2:
+                    return pts
+            except Exception:
+                pass
+        return [np.array(p, dtype=np.float64) for p in ref.points]
+
     def _collect_drawn_loops_with_arcs(self, tol: float = 1e-3):
         """
         Chain LineEntity and ArcEntity into closed loops, preserving entity refs.
@@ -1157,6 +1188,26 @@ class SketchEntry:
         for e in self.entities:
             if isinstance(e, LineEntity):
                 segs.append((e, e.p0.copy(), e.p1.copy()))
+            elif isinstance(e, ReferenceEntity):
+                # Open included polylines (e.g. an included straight edge) can
+                # form part of a mixed drawn+included loop, so feed their
+                # segments to the chainer.  Self-closed refs (circles, included
+                # rectangles) are handled wholesale in _collect_uv_loops, so
+                # skip them here to avoid double-counting.
+                #
+                # Use the OCCT-edge UV polyline when available so the endpoints
+                # match exactly what the snap engine offers (snap uses the OCC
+                # curve endpoints, NOT the mesh-tessellated ref.points).  If we
+                # chained on ref.points instead, an arc/line that snapped to the
+                # OCC endpoint wouldn't meet the tessellated endpoint within tol
+                # and the loop would silently fail to close.
+                poly = self._ref_uv_polyline(e)
+                if len(poly) < 2:
+                    continue
+                if np.linalg.norm(poly[-1] - poly[0]) < tol:
+                    continue
+                for k in range(len(poly) - 1):
+                    segs.append((e, poly[k].copy(), poly[k + 1].copy()))
 
         # For each arc, collect all split angles from line endpoints
         for arc in self.entities:
@@ -1201,16 +1252,17 @@ class SketchEntry:
                 tail = chain[-1][2]
                 head = chain[0][1]
                 for i, (ent, a, b) in enumerate(remaining):
+                    # Always orient each appended segment so its first endpoint
+                    # is the connection point — for both lines and arcs — so the
+                    # tessellated polygon stays in continuous boundary order.
                     if np.linalg.norm(a - tail) < tol:
                         chain.append((ent, a, b)); remaining.pop(i); changed = True; break
                     if np.linalg.norm(b - tail) < tol:
-                        chain.append((ent, b, a) if isinstance(ent, LineEntity)
-                                     else (ent, a, b)); remaining.pop(i); changed = True; break
+                        chain.append((ent, b, a)); remaining.pop(i); changed = True; break
                     if np.linalg.norm(b - head) < tol:
                         chain.insert(0, (ent, a, b)); remaining.pop(i); changed = True; break
                     if np.linalg.norm(a - head) < tol:
-                        chain.insert(0, (ent, b, a) if isinstance(ent, LineEntity)
-                                     else (ent, a, b)); remaining.pop(i); changed = True; break
+                        chain.insert(0, (ent, b, a)); remaining.pop(i); changed = True; break
 
             # Only keep closed loops
             if np.linalg.norm(chain[-1][2] - chain[0][1]) > tol:
@@ -1220,15 +1272,31 @@ class SketchEntry:
             uv_pts = []
             for ent, ep0, ep1 in chain:
                 if isinstance(ent, ArcEntity):
-                    # Tessellate the specific sub-arc span (ep0→ep1 angles)
-                    a0 = float(_math.atan2(float(ep0[1] - ent.center[1]),
-                                           float(ep0[0] - ent.center[0])))
-                    a1 = float(_math.atan2(float(ep1[1] - ent.center[1]),
-                                           float(ep1[0] - ent.center[0])))
-                    span = (a1 - a0) % (2 * _math.pi)
-                    if span < tol:
-                        span = 2 * _math.pi
-                    angles = np.linspace(a0, a0 + span, 17)
+                    # Walk the sub-arc from ep0 to ep1 along the arc's own
+                    # stored CCW sweep [start_angle, end_angle].  The chainer
+                    # may hand us the segment reversed (ep0 == arc end), so we
+                    # measure each endpoint as a sweep fraction and walk in the
+                    # direction that actually connects them.  Using the stored
+                    # angles (not raw atan2 deltas) keeps major arcs (span > π)
+                    # and reversed traversal correct.
+                    sweep = ent.end_angle - ent.start_angle
+
+                    def _frac(pt):
+                        rel = (float(_math.atan2(float(pt[1] - ent.center[1]),
+                                                 float(pt[0] - ent.center[0])))
+                               - ent.start_angle) % (2 * _math.pi)
+                        # Clamp tiny over/undershoot from float error.
+                        if rel > sweep and rel - 2 * _math.pi > -tol:
+                            rel = 0.0
+                        return rel
+
+                    f0 = _frac(ep0)
+                    f1 = _frac(ep1)
+                    if abs(f1 - f0) < tol:          # full circle as a sub-arc
+                        f1 = f0 + sweep
+                    a0 = ent.start_angle + f0
+                    a1 = ent.start_angle + f1
+                    angles = np.linspace(a0, a1, 17)
                     uv_pts.extend(
                         (float(ent.center[0] + ent.radius * _math.cos(ang)),
                          float(ent.center[1] + ent.radius * _math.sin(ang)))
@@ -1372,8 +1440,25 @@ class SketchEntry:
         # ── ReferenceEntity closed loops — add as wire tools ─────────────
         def _project_ref_edge(edge):
             from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC
-            from OCP.GeomAbs import GeomAbs_Circle
+            from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Line
             adp = _BAC(edge)
+            if adp.GetType() == GeomAbs_Line:
+                # Project both endpoints onto the sketch plane so the included
+                # line is coplanar with the drawn geometry.  Without this an
+                # edge that lies even slightly off the plane (e.g. included from
+                # another body) floats above/below the big planar face and the
+                # splitter can't use it to bound a region — no face is built.
+                p0 = adp.Value(adp.FirstParameter())
+                p1 = adp.Value(adp.LastParameter())
+                def _to_uv(p):
+                    d = np.array([p.X(), p.Y(), p.Z()]) - self.plane_origin
+                    return (float(np.dot(d, self.plane_x_axis)),
+                            float(np.dot(d, self.plane_y_axis)))
+                u0, v0 = _to_uv(p0)
+                u1, v1 = _to_uv(p1)
+                em = BRepBuilderAPI_MakeEdge(_uv3d(u0, v0), _uv3d(u1, v1))
+                return em.Edge() if em.IsDone() else None
+
             if adp.GetType() == GeomAbs_Circle:
                 circ = adp.Circle()
                 # Check if circle is viewed edge-on (its normal is perpendicular
@@ -1489,13 +1574,23 @@ class SketchEntry:
         def _wire_uv_pts(wire):
             from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC2
             from OCP.GCPnts import GCPnts_QuasiUniformAbscissa
+            from OCP.TopAbs import TopAbs_REVERSED
             pts = []
             we = BRepTools_WireExplorer(wire)
             while we.More():
                 adp = _BAC2(we.Current())
                 sampler = GCPnts_QuasiUniformAbscissa()
                 sampler.Initialize(adp, 33)
-                for j in range(1, sampler.NbPoints()):
+                # WireExplorer yields edges in connected boundary order, but
+                # Value() samples along the edge's own parameter direction.
+                # When the edge sits REVERSED in the wire, emit its samples in
+                # reverse so the polygon stays boundary-ordered — otherwise the
+                # outline self-intersects and the shoelace area/containment test
+                # (used for picking) is wrong for arcs/reversed segments.
+                idx = range(1, sampler.NbPoints())
+                if we.Orientation() == TopAbs_REVERSED:
+                    idx = reversed(idx)
+                for j in idx:
                     p3d = adp.Value(sampler.Parameter(j))
                     world = np.array([p3d.X(), p3d.Y(), p3d.Z()])
                     delta = world - self.plane_origin
