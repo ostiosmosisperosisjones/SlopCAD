@@ -141,6 +141,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._extrude_face_active  = False
         self._extrude_sketch_idx   = None
         self._extrude_preview_mesh = None   # list of build123d solids | None
+        self._extrude_preview_buf  = None   # (solids, (tri_verts, edge_verts)) cache
         self._extrude_preview_dist = 0.0
         self._extrude_arrow_origin = None
         self._extrude_arrow_dir    = None
@@ -409,6 +410,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._position_fillet_panel()
 
     def paintGL(self):
+        from cad.profiler import profiler
+        profiler.frame_begin()
+
         self._set_projection(self.width(), self.height())
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
@@ -419,8 +423,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                   c.target[0], c.target[1], c.target[2],
                   up[0], up[1], up[2])
 
-        visible = self._visible_meshes()
-        draw_opaque(visible, self.workspace, self.selection)
+        with profiler.section("visible_meshes"):
+            visible = self._visible_meshes()
+        with profiler.section("draw_opaque"):
+            draw_opaque(visible, self.workspace, self.selection)
 
         # World planes drawn after opaque geometry so they never occlude it
         if any(self.workspace.world_plane_visible.values()):
@@ -449,40 +455,46 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         # edge once their preview is on screen.
         hover_meshes = {bid: m for bid, m in self._meshes.items()
                         if self._body_visible.get(bid, True)}
-        self.hover.rebuild(hover_meshes, self.workspace,
-                           self._modelview, self._projection,
-                           self._viewport, self.devicePixelRatio(),
-                           camera_eye=self.camera.get_eye(),
-                           history=self.history,
-                           active_sketch=self._sketch,
-                           editing_sketch_idx=self._editing_sketch_history_idx)
+        with profiler.section("hover.rebuild"):
+            self.hover.rebuild(hover_meshes, self.workspace,
+                               self._modelview, self._projection,
+                               self._viewport, self.devicePixelRatio(),
+                               camera_eye=self.camera.get_eye(),
+                               history=self.history,
+                               active_sketch=self._sketch,
+                               editing_sketch_idx=self._editing_sketch_history_idx)
 
-        self._draw_sketch_faces()
-        self._draw_extrude_preview()
-        self._draw_thicken_preview()
-        self._draw_revolve_preview()
-        self._draw_fillet3d_preview()
-        self._draw_chamfer_preview()
-        self._draw_boolean_preview()
-        self._draw_loft_preview()
+        with profiler.section("sketch_faces"):
+            self._draw_sketch_faces()
+        with profiler.section("previews"):
+            self._draw_extrude_preview()
+            self._draw_thicken_preview()
+            self._draw_revolve_preview()
+            self._draw_fillet3d_preview()
+            self._draw_chamfer_preview()
+            self._draw_boolean_preview()
+            self._draw_loft_preview()
 
         # Selection and hover highlights are indexed against LIVE meshes
         # (because selection was captured before any preview swap). Drawing
         # them against `visible` — which may contain a preview mesh with
         # different edge ordering — would highlight the wrong polylines.
-        self._dim_labels = draw_overlays(hover_meshes, self.selection,
-                      self._hovered_vertex, self._hovered_edge,
-                      sketch=self._sketch,
-                      camera_distance=self.camera.distance,
-                      history=self.history,
-                      editing_sketch_idx=self._editing_sketch_history_idx,
-                      in_sketch=self._sketch is not None) or []
+        with profiler.section("draw_overlays"):
+            self._dim_labels = draw_overlays(hover_meshes, self.selection,
+                          self._hovered_vertex, self._hovered_edge,
+                          sketch=self._sketch,
+                          camera_distance=self.camera.distance,
+                          history=self.history,
+                          editing_sketch_idx=self._editing_sketch_history_idx,
+                          in_sketch=self._sketch is not None) or []
 
-        self._draw_sketch_vertex_overlays()
+            self._draw_sketch_vertex_overlays()
 
-        R = _quat_to_matrix(self.camera.rotation)
-        self._view_cube.draw(R, self.width(), self.height(),
-                             self.devicePixelRatio())
+            R = _quat_to_matrix(self.camera.rotation)
+            self._view_cube.draw(R, self.width(), self.height(),
+                                 self.devicePixelRatio())
+
+        profiler.frame_end()
 
     def _draw_sketch_vertex_overlays(self):
         """Draw selected and hovered sketch vertex points (not in real mesh)."""
@@ -534,7 +546,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
     def paintEvent(self, event):
         """GL content first, then QPainter for dimension text labels."""
         super().paintEvent(event)
-        if not self._dim_labels or self._modelview is None:
+        if (not self._dim_labels or self._modelview is None):
+            self._draw_profiler_hud()
             return
 
         from PyQt6.QtGui import QPainter, QFont, QColor, QPen, QBrush, QFontMetrics
@@ -583,6 +596,57 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             painter.setPen(QPen(QColor(140, 200, 255, txt_alpha)))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
+        painter.end()
+        self._draw_profiler_hud()
+
+    def _toggle_profiler(self):
+        """F8 handler: flip the profiler and drive continuous repaints while on.
+
+        A free-running 0 ms timer forces back-to-back frames so the FPS / frame
+        readout reflects real steady-state cost (otherwise the viewport only
+        repaints on input and FPS would look artificially idle)."""
+        from cad.profiler import profiler
+        from PyQt6.QtCore import QTimer
+        on = profiler.toggle()
+        if getattr(self, "_profiler_timer", None) is None:
+            self._profiler_timer = QTimer(self)
+            self._profiler_timer.setInterval(0)
+            self._profiler_timer.timeout.connect(self.update)
+        if on:
+            self._profiler_timer.start()
+        else:
+            self._profiler_timer.stop()
+        self.update()
+
+    def _draw_profiler_hud(self):
+        """Overlay live profiler stats in the top-left corner (F8 to toggle)."""
+        from cad.profiler import profiler
+        if not profiler.enabled:
+            return
+        from PyQt6.QtGui import QPainter, QFont, QColor, QPen, QBrush
+        from PyQt6.QtCore import Qt, QRect
+
+        lines = profiler.hud_lines()
+        painter = QPainter(self)
+        font = QFont("monospace", 9)
+        painter.setFont(font)
+        from PyQt6.QtGui import QFontMetrics
+        fm = QFontMetrics(font)
+        line_h = fm.height()
+        w = max(fm.horizontalAdvance(s) for s in lines) + 16
+        h = line_h * len(lines) + 12
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
+        painter.drawRoundedRect(QRect(8, 8, w, h), 6, 6)
+
+        y = 8 + line_h
+        for i, s in enumerate(lines):
+            # Header line in amber, section rows in light grey.
+            painter.setPen(QPen(QColor(255, 200, 80) if i == 0
+                                else QColor(210, 210, 210)))
+            painter.drawText(16, y, s)
+            y += line_h
         painter.end()
 
     # ------------------------------------------------------------------
@@ -1001,6 +1065,16 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         from PyQt6.QtWidgets import QApplication
 
         if QApplication.activeModalWidget() is not None:
+            return
+
+        # Profiler: F8 toggles the live HUD, F9 dumps a full table to stdout.
+        # Works in any mode (sketch or not), checked before everything else.
+        if e.key() == Qt.Key.Key_F8:
+            self._toggle_profiler()
+            return
+        if e.key() == Qt.Key.Key_F9:
+            from cad.profiler import profiler
+            profiler.dump()
             return
 
         if e.key() == Qt.Key.Key_Escape:

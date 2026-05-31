@@ -19,20 +19,32 @@ class Mesh:
         self.occt_faces = list(shape.faces())
         self.shape      = shape
 
+        # Tessellation deviation is a CHORDAL tolerance in millimetres, so a
+        # fixed absolute value (e.g. 0.01) demands a fraction-of-a-percent
+        # relative precision on a large part — which explodes the triangle
+        # count and tessellation time (a ~1.9 m part hit 800k triangles / 25 s
+        # at deviation=0.01). Scale the deviation to the part's bounding-box
+        # diagonal so quality is roughly constant regardless of size, with an
+        # absolute floor so small parts stay crisp and an angular tolerance
+        # that keeps curves smooth either way.
+        diag = _bbox_diagonal(shape)
+        base = max(0.05, diag * 0.001)   # 0.1% of size, ≥0.05 mm
         # Retry with progressively looser tolerances if the tessellator returns
         # a face count that doesn't match shape.faces() (ocp_tessellate bug).
         # A caller-supplied deviation skips to that quality tier immediately.
         _attempts = [
-            dict(deviation=0.01,  quality=0.01,  angular_tolerance=0.1),
-            dict(deviation=0.05,  quality=0.05,  angular_tolerance=0.3),
-            dict(deviation=0.1,   quality=0.1,   angular_tolerance=0.5),
+            dict(deviation=base,       quality=base,       angular_tolerance=0.3),
+            dict(deviation=base * 3,   quality=base * 3,   angular_tolerance=0.5),
+            dict(deviation=base * 8,   quality=base * 8,   angular_tolerance=0.8),
         ]
         if deviation is not None:
             _attempts = [dict(deviation=deviation, quality=deviation,
                               angular_tolerance=deviation * 5)] + _attempts
+        from cad.profiler import profiler
         tess = None
         for attempt in _attempts:
-            t = tessellate(shape.wrapped, cache_key=cache_key, **attempt)
+            with profiler.section("mesh.tessellate"):
+                t = tessellate(shape.wrapped, cache_key=cache_key, **attempt)
             tri_per_face = np.array(t['triangles_per_face'], dtype=np.int32)
             if len(tri_per_face) == len(self.occt_faces):
                 tess = t
@@ -58,13 +70,15 @@ class Mesh:
         self.bbox_max = self.verts.max(axis=0)
 
         # True topological vertices — actual CAD corners where edges meet.
-        self.topo_verts = _extract_topo_verts(shape)
+        with profiler.section("mesh.topo_verts"):
+            self.topo_verts = _extract_topo_verts(shape)
 
         # True topological edges — each is a (N,3) polyline in world mm.
         # topo_edges_occ is the parallel list of raw TopoDS_Edge objects,
         # used when projecting reference geometry to preserve true curve type.
-        self.topo_edges, self.topo_edges_occ, self.topo_edge_face_normals = \
-            _extract_topo_edges(shape)
+        with profiler.section("mesh.topo_edges"):
+            self.topo_edges, self.topo_edges_occ, self.topo_edge_face_normals = \
+                _extract_topo_edges(shape)
 
         # Legacy compatibility
         self.center = np.array([0.0, 0.0, 0.0])
@@ -129,6 +143,22 @@ class Mesh:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _bbox_diagonal(shape) -> float:
+    """Bounding-box diagonal length in mm, used to size tessellation tolerance.
+
+    Falls back to a neutral default if the bbox can't be computed (degenerate
+    or empty shape) so callers always get a usable, finite number."""
+    try:
+        bb = shape.bounding_box()
+        dx, dy, dz = bb.max.X - bb.min.X, bb.max.Y - bb.min.Y, bb.max.Z - bb.min.Z
+        diag = (dx * dx + dy * dy + dz * dz) ** 0.5
+        if diag > 1e-6 and np.isfinite(diag):
+            return float(diag)
+    except Exception:
+        pass
+    return 100.0
+
 
 def _extract_topo_verts(shape) -> np.ndarray:
     from OCP.BRep import BRep_Tool

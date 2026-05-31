@@ -328,21 +328,25 @@ class SketchPickMixin:
         """
         Draw semi-transparent extrude preview solids.
         Blue for positive (add), red for negative (cut).
+
+        The solids are tessellated to flat vertex buffers ONCE per preview
+        change (keyed by the solid-list identity) and cached on the widget.
+        Re-meshing the OCCT solid and walking it in immediate mode every frame
+        was the dominant lag during a drag (>100 ms/frame on a ~1.2 m drafted
+        extrude); the preview geometry only changes when the user drags, so
+        there is no reason to rebuild it on every repaint.
         """
         solids = getattr(self, '_extrude_preview_mesh', None)
         if not solids:
+            self._extrude_preview_buf = None
             return
 
         dist = getattr(self, '_extrude_preview_dist', 0.0)
         is_cut = dist < 0
 
-        from OCP.BRep import BRep_Tool
-        from OCP.BRepMesh import BRepMesh_IncrementalMesh
-        from OCP.TopExp import TopExp_Explorer
-        from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
-        from OCP.TopoDS import TopoDS
-        from OCP.BRepAdaptor import BRepAdaptor_Curve
-        from OCP.GCPnts import GCPnts_UniformAbscissa
+        buf = self._extrude_preview_render_buffers(solids)
+        if buf is None:
+            return
 
         glDisable(GL_LIGHTING)
         glEnable(GL_DEPTH_TEST)
@@ -360,59 +364,101 @@ class SketchPickMixin:
             fill_color   = (r, g, b, op)
             edge_color   = (min(r + 0.23, 1.0), min(g + 0.30, 1.0), min(b + 0.15, 1.0), min(op + 0.35, 1.0))
 
+        tris, edges = buf
+        glEnableClientState(GL_VERTEX_ARRAY)
+        if len(tris):
+            glColor4f(*fill_color)
+            glVertexPointer(3, GL_FLOAT, 0, tris)
+            glDrawArrays(GL_TRIANGLES, 0, len(tris) // 3)
+        if len(edges):
+            glColor4f(*edge_color)
+            glLineWidth(1.4)
+            glVertexPointer(3, GL_FLOAT, 0, edges)
+            glDrawArrays(GL_LINES, 0, len(edges) // 3)
+            glLineWidth(1.0)
+        glDisableClientState(GL_VERTEX_ARRAY)
+
+        glDisable(GL_BLEND)
+        glEnable(GL_CULL_FACE)
+        glEnable(GL_LIGHTING)
+
+    def _extrude_preview_render_buffers(self, solids):
+        """Return (tri_verts, edge_verts) flat float32 arrays for `solids`,
+        rebuilding only when the solid list changes. Cached on the widget so
+        repeated repaints during a drag are nearly free."""
+        import numpy as np
+        cache = getattr(self, '_extrude_preview_buf', None)
+        if cache is not None and cache[0] is solids:
+            return cache[1]
+
+        from OCP.BRep import BRep_Tool
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
+        from OCP.TopoDS import TopoDS
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GCPnts import GCPnts_UniformAbscissa
+
+        tri_pts: list = []
+        edge_pts: list = []
         for solid in solids:
             try:
                 wrapped = solid.wrapped
-                BRepMesh_IncrementalMesh(wrapped, 0.15)
+                # Size-adaptive deflection: absolute 0.15 mm exploded triangle
+                # counts on metre-scale parts. 0.2% of the bbox diagonal keeps
+                # the preview cheap and visually identical at any scale.
+                from viewer.mesh import _bbox_diagonal
+                defl = max(0.15, _bbox_diagonal(solid) * 0.002)
+                BRepMesh_IncrementalMesh(wrapped, defl)
 
-                # Filled triangles — fetch with face location, then apply transform
-                glColor4f(*fill_color)
                 exp = TopExp_Explorer(wrapped, TopAbs_FACE)
                 while exp.More():
                     face = TopoDS.Face_s(exp.Current())
                     loc  = face.Location()
                     tri  = BRep_Tool.Triangulation_s(face, loc)
                     if tri is not None:
-                        has_trsf = not loc.IsIdentity()
-                        trsf = loc.Transformation() if has_trsf else None
-                        glBegin(GL_TRIANGLES)
+                        trsf = None if loc.IsIdentity() else loc.Transformation()
                         for i in range(1, tri.NbTriangles() + 1):
                             n1, n2, n3 = tri.Triangle(i).Get()
                             for ni in (n1, n2, n3):
                                 p = tri.Node(ni)
                                 if trsf is not None:
                                     p = p.Transformed(trsf)
-                                glVertex3f(p.X(), p.Y(), p.Z())
-                        glEnd()
+                                tri_pts.append((p.X(), p.Y(), p.Z()))
                     exp.Next()
 
-                # Edges
-                glColor4f(*edge_color)
-                glLineWidth(1.4)
                 exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
                 while exp2.More():
-                    edge = exp2.Current()
                     try:
+                        # Explorer yields TopoDS_Shape; BRepAdaptor_Curve needs
+                        # a TopoDS_Edge — without the cast it raises TypeError,
+                        # which the old code silently swallowed (dropping every
+                        # preview edge). Cast so edges actually render.
+                        edge = TopoDS.Edge_s(exp2.Current())
                         adaptor = BRepAdaptor_Curve(edge)
                         disc    = GCPnts_UniformAbscissa()
                         disc.Initialize(adaptor, 24)
                         if disc.IsDone() and disc.NbPoints() >= 2:
-                            glBegin(GL_LINE_STRIP)
+                            prev = None
                             for pi in range(1, disc.NbPoints() + 1):
                                 p = adaptor.Value(disc.Parameter(pi))
-                                glVertex3f(p.X(), p.Y(), p.Z())
-                            glEnd()
+                                cur = (p.X(), p.Y(), p.Z())
+                                # GL_LINES: emit each segment as a pair
+                                if prev is not None:
+                                    edge_pts.append(prev)
+                                    edge_pts.append(cur)
+                                prev = cur
                     except Exception:
                         pass
                     exp2.Next()
-                glLineWidth(1.0)
-
             except Exception as ex:
-                print(f"[Preview] draw error: {ex}")
+                print(f"[Preview] build error: {ex}")
 
-        glDisable(GL_BLEND)
-        glEnable(GL_CULL_FACE)
-        glEnable(GL_LIGHTING)
+        tris  = np.array(tri_pts,  dtype=np.float32).reshape(-1) if tri_pts else np.zeros(0, np.float32)
+        edges = np.array(edge_pts, dtype=np.float32).reshape(-1) if edge_pts else np.zeros(0, np.float32)
+        buf = (tris, edges)
+        self._extrude_preview_buf = (solids, buf)
+        return buf
 
         self._draw_extrude_arrow()
 

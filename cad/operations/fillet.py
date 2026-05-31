@@ -72,10 +72,80 @@ def _run_fillet(source_occ, unique_edges, radius: float):
 
 
 def fillet_edges(shape, face_indices: list, edge_occs: list, radius: float):
-    """Commit-quality fillet from face indices and/or direct edge objects."""
+    """Commit-quality fillet from face indices and/or direct edge objects.
+
+    OCCT's fillet kernel sometimes rejects valid-but-imperfect geometry with
+    "no suitable edges for chamfer or fillet" (common on STEP imports and on
+    BSpline faces from drafted/oblique extrudes). When the first attempt fails
+    that way, heal the shape (same pipeline as STEP import) and retry once —
+    this rescues the healable cases. Geometry that is genuinely hostile to the
+    fillet solver still raises, so callers can surface a clear message.
+    """
     source_occ = shape.wrapped if hasattr(shape, 'wrapped') else shape
     unique = _collect_edges(shape, face_indices, edge_occs)
-    return _run_fillet(source_occ, unique, radius)
+    try:
+        return _run_fillet(source_occ, unique, radius)
+    except RuntimeError:
+        healed = _healed_with_edges(shape, face_indices, edge_occs)
+        if healed is None:
+            raise
+        healed_shape, healed_source, healed_edges = healed
+        # Retry on the healed shape; if it still fails, propagate so the panel
+        # can tell the user this geometry can't be filleted.
+        return _run_fillet(healed_source, healed_edges, radius)
+
+
+def _healed_with_edges(shape, face_indices, edge_occs):
+    """Heal `shape` and re-resolve the requested edges against the healed body.
+
+    Returns (healed_shape, healed_source_occ, healed_edge_list) or None if
+    healing produced nothing usable. Edges are re-matched by midpoint because
+    healing creates new TopoDS sub-shapes that won't be IsSame() as the
+    originals."""
+    try:
+        from cad.importer import _heal
+        from build123d import Compound as _Compound
+        source_occ = shape.wrapped if hasattr(shape, 'wrapped') else shape
+        healed_occ = _heal(source_occ)
+        healed_shape = _Compound(healed_occ)
+        solids = list(healed_shape.solids())
+        if solids:
+            healed_shape = solids[0]
+        # Original edges we were asked to fillet (pre-heal), as TopoDS_Edge.
+        wanted = _collect_edges(shape, face_indices, edge_occs)
+        healed_edges = _rematch_edges(healed_shape, wanted)
+        if not healed_edges:
+            return None
+        healed_source = healed_shape.wrapped
+        return healed_shape, healed_source, healed_edges
+    except Exception:
+        return None
+
+
+def _rematch_edges(healed_shape, wanted_occ_edges):
+    """Find edges in `healed_shape` whose midpoints match `wanted_occ_edges`."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+
+    def _mid(e_occ):
+        a = BRepAdaptor_Curve(e_occ)
+        p = a.Value((a.FirstParameter() + a.LastParameter()) * 0.5)
+        return (round(p.X(), 2), round(p.Y(), 2), round(p.Z(), 2))
+
+    wanted_mids = set()
+    for e in wanted_occ_edges:
+        try:
+            wanted_mids.add(_mid(e))
+        except Exception:
+            continue
+
+    matched = []
+    for e in healed_shape.edges():
+        try:
+            if _mid(e.wrapped) in wanted_mids:
+                matched.append(e.wrapped)
+        except Exception:
+            continue
+    return matched
 
 
 def fillet_preview(shape, face_indices: list, edge_occs: list, radius: float):
