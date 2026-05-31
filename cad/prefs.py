@@ -61,7 +61,7 @@ KEYBIND_DEFAULTS: dict[str, str] = {
     "sketch_geometric":  "",
     "sketch_square":     "S",
     "sketch_construction": "G",
-    "sketch_mirror":     "K",
+    "sketch_mirror":     "M",
     "sketch_commit":     "Return",
     # Sketch mode — snap declarations (take priority over tool switches when tool active)
     "snap_endpoint":     "E",

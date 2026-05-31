@@ -74,6 +74,10 @@ class MainWindow(QMainWindow):
             lambda: self._sketch_set_tool("OFFSET"))
         self._sketch_toolbar.tool_include_requested.connect(
             self._sketch_include)
+        self._sketch_toolbar.tool_mirror_requested.connect(
+            self._sketch_mirror)
+        self._sketch_toolbar.tool_construction_requested.connect(
+            self._sketch_construction)
         self._sketch_toolbar.tool_constraint_requested.connect(
             self._sketch_set_constraint)
         self._sketch_toolbar.commit_requested.connect(
@@ -160,6 +164,16 @@ class MainWindow(QMainWindow):
         if not n:
             vp._sketch._entity_snapshots.pop()
         vp.update()
+
+    def _sketch_mirror(self):
+        """Toolbar Mirror — same path as the M keybind (uses current selection)."""
+        if self._viewport and self._viewport._sketch:
+            self._viewport._activate_mirror()
+
+    def _sketch_construction(self):
+        """Toolbar Construction — same path as the G keybind."""
+        if self._viewport and self._viewport._sketch:
+            self._viewport._toggle_construction()
 
     def _on_sketch_mode_changed(self, in_sketch: bool):
         self._ops_toolbar.setVisible(not in_sketch)
@@ -288,7 +302,7 @@ class MainWindow(QMainWindow):
             tools_hint = (
                 "L=line  A=arc  C=circle  T=trim  D=divide  "
                 "F=fillet  O=offset  P=point  H/V=h/v line  "
-                "G=construction  K=mirror  Return=commit"
+                "G=construction  M=mirror  Return=commit"
             )
             con_html = ''
             if getattr(sketch, 'constraints', None):

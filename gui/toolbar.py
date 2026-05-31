@@ -404,6 +404,26 @@ _SVG_INCLUDE = """
             stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>"""
 
+# Mirror: a shape and its reflection across a dashed axis
+_SVG_MIRROR = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <line x1="18" y1="4" x2="18" y2="32" stroke="#64b5f6" stroke-width="1.4"
+        stroke-dasharray="3,2" opacity="0.8"/>
+  <polyline points="13,9 6,18 13,27" fill="none" stroke="#ffb74d" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"/>
+  <polyline points="23,9 30,18 23,27" fill="none" stroke="#ffb74d" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+</svg>"""
+
+# Construction: a dashed reference line with endpoint nodes
+_SVG_CONSTRUCTION = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <line x1="6" y1="28" x2="30" y2="8" stroke="#9e9e9e" stroke-width="2"
+        stroke-linecap="round" stroke-dasharray="4,3"/>
+  <circle cx="6"  cy="28" r="2.5" fill="none" stroke="#9e9e9e" stroke-width="1.4"/>
+  <circle cx="30" cy="8"  r="2.5" fill="none" stroke="#9e9e9e" stroke-width="1.4"/>
+</svg>"""
+
 _SVG_COMMIT = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
   <polyline points="6,18 14,27 30,9" fill="none" stroke="#66bb6a"
@@ -567,6 +587,8 @@ class SketchToolbar(QToolBar):
     tool_fillet_requested  = pyqtSignal()
     tool_offset_requested  = pyqtSignal()
     tool_include_requested     = pyqtSignal()
+    tool_mirror_requested        = pyqtSignal()
+    tool_construction_requested  = pyqtSignal()
     tool_constraint_requested  = pyqtSignal(str)   # emits constraint mode
     commit_requested           = pyqtSignal()
 
@@ -611,6 +633,12 @@ class SketchToolbar(QToolBar):
         self._btn_include = self._add_btn(
             "Include  I", _SVG_INCLUDE, self.tool_include_requested,
             "Include geometry  (I)")
+        self._btn_mirror = self._add_btn(
+            "Mirror  M", _SVG_MIRROR, self.tool_mirror_requested,
+            "Mirror selected geometry across a line  (M)")
+        self._btn_construction = self._add_btn(
+            "Constr  G", _SVG_CONSTRUCTION, self.tool_construction_requested,
+            "Toggle selected geometry construction/normal  (G)")
 
         self._add_separator()
 
@@ -721,11 +749,13 @@ class SketchToolbar(QToolBar):
             "OFFSET":    self._btn_offset,
             "DIMENSION": self._btn_constraint,
             "GEOMETRIC": self._btn_constraint,
+            "MIRROR":    self._btn_mirror,
             "NONE":      None,
         }
         for btn in [self._btn_line, self._btn_arc, self._btn_circle,
                     self._btn_trim, self._btn_divide, self._btn_fillet,
-                    self._btn_offset, self._btn_include, self._btn_constraint]:
+                    self._btn_offset, self._btn_include, self._btn_mirror,
+                    self._btn_construction, self._btn_constraint]:
             btn.setChecked(False)
         active = mapping.get(tool_name or "NONE")
         if active is not None:
