@@ -167,15 +167,20 @@ def _entity_to_dict(ent) -> dict:
             d["p0_snap"] = [ent.p0_snap[0], ent.p0_snap[1].name]
         if ent.p1_snap is not None:
             d["p1_snap"] = [ent.p1_snap[0], ent.p1_snap[1].name]
+        if getattr(ent, "construction", False):
+            d["construction"] = True
         return d
     if isinstance(ent, ArcEntity):
-        return {
+        d = {
             "type":        "arc",
             "center":      _arr(ent.center),
             "radius":      ent.radius,
             "start_angle": ent.start_angle,
             "end_angle":   ent.end_angle,
         }
+        if getattr(ent, "construction", False):
+            d["construction"] = True
+        return d
     if isinstance(ent, PointEntity):
         return {"type": "point", "pos": _arr(ent.pos)}
     if isinstance(ent, ReferenceEntity):
@@ -193,7 +198,8 @@ def _entity_from_dict(d: dict):
     from cad.sketch import LineEntity, ArcEntity, PointEntity, ReferenceEntity
     t = d["type"]
     if t == "line":
-        ent = LineEntity(d["p0"], d["p1"])
+        ent = LineEntity(d["p0"], d["p1"],
+                         construction=bool(d.get("construction", False)))
         if "p0_snap" in d:
             from cad.sketch_tools.snap import SnapType
             ent.p0_snap = (int(d["p0_snap"][0]), SnapType[d["p0_snap"][1]])
@@ -203,7 +209,8 @@ def _entity_from_dict(d: dict):
         return ent
     if t == "arc":
         return ArcEntity(d["center"], float(d["radius"]),
-                         float(d["start_angle"]), float(d["end_angle"]))
+                         float(d["start_angle"]), float(d["end_angle"]),
+                         construction=bool(d.get("construction", False)))
     if t == "point":
         return PointEntity(d["pos"])
     if t == "reference":

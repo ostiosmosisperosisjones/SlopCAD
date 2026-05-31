@@ -925,6 +925,38 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
     # Keyboard
     # ------------------------------------------------------------------
 
+    def _toggle_construction(self):
+        """Flip the construction flag on the selected active-sketch entities.
+
+        Construction geometry stays drawn and snappable but is excluded from
+        profile/face building.  Mixed selections are normalised: if any picked
+        entity is not yet construction, all become construction; otherwise all
+        revert to normal.
+        """
+        from cad.sketch import LineEntity, ArcEntity
+        if self._sketch is None:
+            return
+        idxs = sorted({se.entity_idx for se in self.selection.sketch_edges
+                       if se.history_idx == -1})
+        ents = [self._sketch.entities[i] for i in idxs
+                if i < len(self._sketch.entities)
+                and isinstance(self._sketch.entities[i], (LineEntity, ArcEntity))]
+        if not ents:
+            print("[Sketch] Select sketch lines or arcs first to toggle "
+                  "construction.")
+            return
+        # If any is normal, make all construction; else clear all.
+        make_construction = any(not e.construction for e in ents)
+        self._sketch.push_undo_snapshot()
+        for e in ents:
+            e.construction = make_construction
+        verb = "construction" if make_construction else "normal"
+        print(f"[Sketch] Set {len(ents)} "
+              f"{'entity' if len(ents) == 1 else 'entities'} to {verb}.")
+        self._rebuild_sketch_faces()
+        self.sketch_mode_changed.emit(True)
+        self.update()
+
     def event(self, e):
         from PyQt6.QtCore import QEvent
         from cad.sketch import SketchTool
@@ -1054,6 +1086,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     self._sketch._entity_snapshots.pop()
                     print("[Sketch] Nothing selected to include — "
                           "select edges, vertices, or sketch lines first.")
+                return
+            elif prefs.matches("sketch_construction", e):
+                self._toggle_construction()
                 return
             elif prefs.matches("sketch_commit", e):
                 self._complete_sketch()

@@ -255,12 +255,22 @@ class SketchOverlay:
 
         glLineWidth(prefs.sketch_line_width)
         for j, ent in enumerate(sketch.entities):
+            is_construction = getattr(ent, "construction", False)
             if j in sel:
                 glColor3f(*prefs.edge_selected_color)
             elif j == hov_entity_idx:
                 glColor3f(*prefs.edge_hovered_color)
+            elif is_construction:
+                # Dimmed so construction geometry reads as reference-only.
+                r, g, b = prefs.sketch_line_color
+                glColor3f(r * 0.6, g * 0.6, b * 0.6)
             else:
                 glColor3f(*prefs.sketch_line_color)
+            # Dashed line style for construction geometry (unless highlighted).
+            stipple = is_construction and j not in sel and j != hov_entity_idx
+            if stipple:
+                glEnable(GL_LINE_STIPPLE)
+                glLineStipple(2, 0x00FF)
             if isinstance(ent, LineEntity):
                 glBegin(GL_LINES)
                 glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))
@@ -272,6 +282,8 @@ class SketchOverlay:
                 for p in pts:
                     glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
                 glEnd()
+            if stipple:
+                glDisable(GL_LINE_STIPPLE)
         glLineWidth(1.0)
 
     def _draw_preview(self, sketch: SketchMode):
@@ -921,12 +933,19 @@ class SketchOverlay:
         r, g, b = prefs.sketch_line_color
         glLineWidth(prefs.sketch_line_width)
         for j, ent in enumerate(entry.entities):
+            is_construction = getattr(ent, "construction", False)
             if j in sel:
                 glColor4f(*prefs.edge_selected_color, 1.0)
             elif j == hov_entity_idx:
                 glColor4f(*prefs.edge_hovered_color, 1.0)
+            elif is_construction:
+                glColor4f(r, g, b, 0.30)
             else:
                 glColor4f(r, g, b, 0.55)
+            stipple = is_construction and j not in sel and j != hov_entity_idx
+            if stipple:
+                glEnable(GL_LINE_STIPPLE)
+                glLineStipple(2, 0x00FF)
             if isinstance(ent, LineEntity):
                 glBegin(GL_LINES)
                 glVertex3f(*self._pt_from_entry(entry, ent.p0[0], ent.p0[1]))
@@ -938,6 +957,8 @@ class SketchOverlay:
                 for p in pts:
                     glVertex3f(*self._pt_from_entry(entry, p[0], p[1]))
                 glEnd()
+            if stipple:
+                glDisable(GL_LINE_STIPPLE)
         glLineWidth(1.0)
 
     def _draw_committed_references(self, entry):

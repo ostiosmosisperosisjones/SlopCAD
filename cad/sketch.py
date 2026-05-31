@@ -48,7 +48,8 @@ class SketchTool(Enum):
 
 class LineEntity:
     """A 2-D line segment in sketch (u, v) coordinates (world mm)."""
-    def __init__(self, p0: tuple[float, float], p1: tuple[float, float]):
+    def __init__(self, p0: tuple[float, float], p1: tuple[float, float],
+                 construction: bool = False):
         self.p0 = np.array(p0, dtype=np.float64)
         self.p1 = np.array(p1, dtype=np.float64)
         # Snap metadata: (entity_idx, SnapType) if endpoint was snapped to a
@@ -56,6 +57,10 @@ class LineEntity:
         # the constraint solver to emit coincidence constraints.
         self.p0_snap: tuple[int, object] | None = None
         self.p1_snap: tuple[int, object] | None = None
+        # Construction (reference) geometry: drawn and snappable like normal
+        # geometry, but excluded from profile/face building.  Toggled after
+        # the fact via the construction tool — never drawn as construction.
+        self.construction = bool(construction)
 
 
 class PointEntity:
@@ -81,11 +86,15 @@ class ArcEntity:
     (the arc sweeps CCW from start_angle to end_angle).
     """
     def __init__(self, center: tuple[float, float], radius: float,
-                 start_angle: float, end_angle: float):
+                 start_angle: float, end_angle: float,
+                 construction: bool = False):
         self.center      = np.array(center, dtype=np.float64)
         self.radius      = float(radius)
         self.start_angle = float(start_angle)
         self.end_angle   = float(end_angle)
+        # Construction (reference) geometry — excluded from profile/face
+        # building.  See LineEntity.construction.
+        self.construction = bool(construction)
 
     @property
     def p0(self) -> np.ndarray:
@@ -1186,6 +1195,9 @@ class SketchEntry:
         # Build (entity, p0, p1) list, splitting arcs where lines touch them.
         segs = []
         for e in self.entities:
+            # Construction geometry never participates in a profile loop.
+            if getattr(e, "construction", False):
+                continue
             if isinstance(e, LineEntity):
                 segs.append((e, e.p0.copy(), e.p1.copy()))
             elif isinstance(e, ReferenceEntity):
@@ -1212,6 +1224,8 @@ class SketchEntry:
         # For each arc, collect all split angles from line endpoints
         for arc in self.entities:
             if not isinstance(arc, ArcEntity):
+                continue
+            if getattr(arc, "construction", False):
                 continue
             split_angles = set()
             for e in self.entities:
@@ -1402,6 +1416,9 @@ class SketchEntry:
 
         # ── Drawn LineEntity edges — each edge is its own wire tool ──────
         for ent in self.entities:
+            # Construction geometry is reference-only — never part of a profile.
+            if getattr(ent, "construction", False):
+                continue
             if isinstance(ent, LineEntity):
                 e = BRepBuilderAPI_MakeEdge(_uv3d(ent.p0[0], ent.p0[1]),
                                             _uv3d(ent.p1[0], ent.p1[1])).Edge()

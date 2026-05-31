@@ -30,7 +30,7 @@ class SnapType(Enum):
     CENTER       = auto()
     NEAREST      = auto()
     TANGENT      = auto()
-    INTERSECTION = auto()   # future
+    INTERSECTION = auto()   # nearest crossing of any two entities
     ANGLE        = auto()   # angle-locked to 15° increments from anchor
 
 

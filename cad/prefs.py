@@ -60,6 +60,7 @@ KEYBIND_DEFAULTS: dict[str, str] = {
     "sketch_dimension":  "",
     "sketch_geometric":  "",
     "sketch_square":     "S",
+    "sketch_construction": "G",
     "sketch_commit":     "Return",
     # Sketch mode — snap declarations (take priority over tool switches when tool active)
     "snap_endpoint":     "E",
@@ -85,6 +86,7 @@ KEYBINDS_SKETCH: frozenset[str] = frozenset({
     "sketch_line", "sketch_arc", "sketch_circle", "sketch_trim",
     "sketch_divide", "sketch_point", "sketch_offset", "sketch_fillet",
     "sketch_include", "sketch_dimension", "sketch_geometric", "sketch_square",
+    "sketch_construction",
     "sketch_commit", "snap_endpoint", "snap_midpoint", "snap_center",
     "snap_nearest", "snap_tangent", "snap_intersection",
     "sketch_hline", "sketch_vline", "sketch_projection_toggle",
@@ -111,6 +113,7 @@ KEYBIND_LABELS: dict[str, tuple[str, str]] = {
     "sketch_dimension":         ("Sketch",     "Dimension tool (length constraint)"),
     "sketch_geometric":         ("Sketch",     "Geometric constraint tool"),
     "sketch_square":            ("Sketch",     "Square tool (2-point)"),
+    "sketch_construction":      ("Sketch",     "Toggle selected geometry construction/normal"),
     "snap_endpoint":            ("Sketch",     "Force snap: endpoint"),
     "snap_midpoint":            ("Sketch",     "Force snap: midpoint"),
     "snap_center":              ("Sketch",     "Force snap: center"),
