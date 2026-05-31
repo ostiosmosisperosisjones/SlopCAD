@@ -451,7 +451,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                            self._viewport, self.devicePixelRatio(),
                            camera_eye=self.camera.get_eye(),
                            history=self.history,
-                           active_sketch=self._sketch)
+                           active_sketch=self._sketch,
+                           editing_sketch_idx=self._editing_sketch_history_idx)
 
         self._draw_sketch_faces()
         self._draw_extrude_preview()

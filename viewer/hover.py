@@ -124,13 +124,18 @@ class HoverState:
 
     def rebuild(self, meshes, workspace, modelview, projection, viewport, dpr,
                 camera_eye: np.ndarray = None, history=None,
-                active_sketch=None):
+                active_sketch=None, editing_sketch_idx=None):
         """
         Project all topo verts/edges, committed sketch line entities,
         and active sketch line entities to screen space.
 
-        history       : History | None
-        active_sketch : SketchMode | None — the live sketch session if any
+        history            : History | None
+        active_sketch      : SketchMode | None — the live sketch session if any
+        editing_sketch_idx : int | None — history index of the sketch currently
+            being edited.  Its committed edges are skipped so they don't shadow
+            the active sketch's (-1) edges in the hover cache, which would make
+            picks resolve to the committed entry and break active-sketch
+            selection (mirror/construction toggle) after re-entry.
         """
         self._ready = False
         if modelview is None:
@@ -199,14 +204,15 @@ class HoverState:
         # keyed by the synthetic sketch key so the viewport can identify it.
         # ------------------------------------------------------------------
         if history is not None:
-            self._add_sketch_edges(history, _project)
+            self._add_sketch_edges(history, _project,
+                                   skip_idx=editing_sketch_idx)
 
         if active_sketch is not None:
             self._add_active_sketch_edges(active_sketch, _project)
 
         self._ready = True
 
-    def _add_sketch_edges(self, history, project_fn):
+    def _add_sketch_edges(self, history, project_fn, skip_idx=None):
         """Project committed sketch LineEntity/ArcEntity objects into the hover cache."""
         from cad.sketch import LineEntity, ArcEntity, SketchEntry
         cursor = history.cursor
@@ -214,6 +220,10 @@ class HoverState:
             if i > cursor:
                 break
             if entry.operation != "sketch":
+                continue
+            # The sketch being edited is represented by the active (-1) cache;
+            # skip its committed copy so picks don't resolve to the wrong key.
+            if skip_idx is not None and i == skip_idx:
                 continue
             se = entry.params.get("sketch_entry")
             if se is None or not se.visible:
