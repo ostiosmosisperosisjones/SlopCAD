@@ -76,6 +76,8 @@ class MainWindow(QMainWindow):
             self._sketch_include)
         self._sketch_toolbar.tool_mirror_requested.connect(
             self._sketch_mirror)
+        self._sketch_toolbar.tool_pattern_requested.connect(
+            self._sketch_pattern)
         self._sketch_toolbar.tool_construction_requested.connect(
             self._sketch_construction)
         self._sketch_toolbar.tool_constraint_requested.connect(
@@ -169,6 +171,11 @@ class MainWindow(QMainWindow):
         """Toolbar Mirror — same path as the M keybind (uses current selection)."""
         if self._viewport and self._viewport._sketch:
             self._viewport._activate_mirror()
+
+    def _sketch_pattern(self, mode: str):
+        """Toolbar Pattern (linear/circular) — uses the current selection."""
+        if self._viewport and self._viewport._sketch:
+            self._viewport._activate_pattern(mode)
 
     def _sketch_construction(self):
         """Toolbar Construction — same path as the G keybind."""
@@ -337,6 +344,8 @@ class MainWindow(QMainWindow):
                 SketchTool.DIMENSION: "DIMENSION — click a line",
                 SketchTool.GEOMETRIC: "CONSTRAINTS — click a line  (Tab=cycle mode)",
                 SketchTool.MIRROR:    "MIRROR — click a line to use as the axis",
+                SketchTool.PATTERN_LINEAR:   "LINEAR PATTERN — click a line for the direction",
+                SketchTool.PATTERN_CIRCULAR: "CIRCULAR PATTERN — click a point for the center",
             }
 
             if tool == SketchTool.LINE and isinstance(active, LineTool):

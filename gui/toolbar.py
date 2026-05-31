@@ -415,6 +415,31 @@ _SVG_MIRROR = """
             stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
 </svg>"""
 
+# Linear pattern: a shape repeated along a row
+_SVG_PATTERN_LINEAR = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <rect x="4"  y="14" width="7" height="7" rx="1" fill="#ffb74d" fill-opacity="0.25"
+        stroke="#ffb74d" stroke-width="1.6"/>
+  <rect x="14" y="14" width="7" height="7" rx="1" fill="none"
+        stroke="#ffb74d" stroke-width="1.4" opacity="0.6"/>
+  <rect x="24" y="14" width="7" height="7" rx="1" fill="none"
+        stroke="#ffb74d" stroke-width="1.4" opacity="0.6"/>
+</svg>"""
+
+# Circular pattern: a shape repeated around a center
+_SVG_PATTERN_CIRCULAR = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <circle cx="18" cy="18" r="2" fill="#ffb74d" opacity="0.6"/>
+  <rect x="15" y="3"  width="6" height="6" rx="1" fill="#ffb74d" fill-opacity="0.25"
+        stroke="#ffb74d" stroke-width="1.5"/>
+  <rect x="27" y="15" width="6" height="6" rx="1" fill="none"
+        stroke="#ffb74d" stroke-width="1.3" opacity="0.6"/>
+  <rect x="15" y="27" width="6" height="6" rx="1" fill="none"
+        stroke="#ffb74d" stroke-width="1.3" opacity="0.6"/>
+  <rect x="3"  y="15" width="6" height="6" rx="1" fill="none"
+        stroke="#ffb74d" stroke-width="1.3" opacity="0.6"/>
+</svg>"""
+
 # Construction: a dashed reference line with endpoint nodes
 _SVG_CONSTRUCTION = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
@@ -588,6 +613,7 @@ class SketchToolbar(QToolBar):
     tool_offset_requested  = pyqtSignal()
     tool_include_requested     = pyqtSignal()
     tool_mirror_requested        = pyqtSignal()
+    tool_pattern_requested       = pyqtSignal(str)   # emits "linear" | "circular"
     tool_construction_requested  = pyqtSignal()
     tool_constraint_requested  = pyqtSignal(str)   # emits constraint mode
     commit_requested           = pyqtSignal()
@@ -636,6 +662,8 @@ class SketchToolbar(QToolBar):
         self._btn_mirror = self._add_btn(
             "Mirror  M", _SVG_MIRROR, self.tool_mirror_requested,
             "Mirror selected geometry across a line  (M)")
+        self._btn_pattern = self._make_pattern_btn()
+        self.addWidget(self._btn_pattern)
         self._btn_construction = self._add_btn(
             "Constr  G", _SVG_CONSTRUCTION, self.tool_construction_requested,
             "Toggle selected geometry construction/normal  (G)")
@@ -699,6 +727,38 @@ class SketchToolbar(QToolBar):
         self._circle_mode = mode
         self.tool_circle_requested.emit(mode)
 
+    def _make_pattern_btn(self) -> QToolButton:
+        btn = QToolButton(self)
+        self._pattern_mode = "linear"
+        btn.setText("Pattern")
+        btn.setIcon(_svg_icon(_SVG_PATTERN_LINEAR))
+        btn.setToolTip("Pattern — click arrow for linear / circular")
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+
+        menu = QMenu(btn)
+        self._pattern_actions = {}
+        for mode, label in (("linear", "Linear pattern"),
+                            ("circular", "Circular pattern")):
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setData(mode)
+            act.triggered.connect(lambda checked, m=mode: self._set_pattern_mode(m))
+            self._pattern_actions[mode] = act
+        self._pattern_actions[self._pattern_mode].setChecked(True)
+
+        btn.setMenu(menu)
+        btn.clicked.connect(
+            lambda: self.tool_pattern_requested.emit(self._pattern_mode))
+        return btn
+
+    def _set_pattern_mode(self, mode: str):
+        for m, act in self._pattern_actions.items():
+            act.setChecked(m == mode)
+        self._pattern_mode = mode
+        icon = _SVG_PATTERN_LINEAR if mode == "linear" else _SVG_PATTERN_CIRCULAR
+        self._btn_pattern.setIcon(_svg_icon(icon))
+        self.tool_pattern_requested.emit(mode)
+
     def _make_constraint_btn(self) -> QToolButton:
         btn = QToolButton(self)
         self._constraint_mode = 'distance'
@@ -750,12 +810,15 @@ class SketchToolbar(QToolBar):
             "DIMENSION": self._btn_constraint,
             "GEOMETRIC": self._btn_constraint,
             "MIRROR":    self._btn_mirror,
+            "PATTERN_LINEAR":   self._btn_pattern,
+            "PATTERN_CIRCULAR": self._btn_pattern,
             "NONE":      None,
         }
         for btn in [self._btn_line, self._btn_arc, self._btn_circle,
                     self._btn_trim, self._btn_divide, self._btn_fillet,
                     self._btn_offset, self._btn_include, self._btn_mirror,
-                    self._btn_construction, self._btn_constraint]:
+                    self._btn_pattern, self._btn_construction,
+                    self._btn_constraint]:
             btn.setChecked(False)
         active = mapping.get(tool_name or "NONE")
         if active is not None:

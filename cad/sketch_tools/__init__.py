@@ -26,11 +26,13 @@ from cad.sketch_tools.dimension import DimensionTool
 from cad.sketch_tools.geometric import GeometricConstraintTool
 from cad.sketch_tools.square  import SquareTool
 from cad.sketch_tools.mirror  import MirrorTool
+from cad.sketch_tools.pattern import PatternTool, LINEAR, CIRCULAR
 from cad.sketch_tools.snap    import SnapEngine, SnapResult, SnapType
 
+from functools import partial
 from cad.sketch import SketchTool
 
-# Maps SketchTool enum value → tool class (instantiated fresh on activation)
+# Maps SketchTool enum value → tool factory (called with no args on activation).
 TOOLS: dict[SketchTool, type[BaseTool]] = {
     SketchTool.LINE:      LineTool,
     SketchTool.ARC3:      Arc3Tool,
@@ -44,6 +46,8 @@ TOOLS: dict[SketchTool, type[BaseTool]] = {
     SketchTool.DIMENSION: DimensionTool,
     SketchTool.GEOMETRIC: GeometricConstraintTool,
     SketchTool.MIRROR:    MirrorTool,
+    SketchTool.PATTERN_LINEAR:   partial(PatternTool, mode=LINEAR),
+    SketchTool.PATTERN_CIRCULAR: partial(PatternTool, mode=CIRCULAR),
 }
 
 # IncludeTool is a one-shot action, not a persistent drawing tool.

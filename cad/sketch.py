@@ -41,6 +41,8 @@ class SketchTool(Enum):
     GEOMETRIC = auto()
     SQUARE    = auto()
     MIRROR    = auto()
+    PATTERN_LINEAR   = auto()
+    PATTERN_CIRCULAR = auto()
 
 
 # ---------------------------------------------------------------------------

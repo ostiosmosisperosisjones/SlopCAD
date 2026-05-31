@@ -32,6 +32,7 @@ from viewer.vp_thicken import ThickenMixin
 from viewer.vp_revolve import RevolveMixin
 from viewer.vp_async import AsyncOpMixin
 from viewer.vp_offset import VpOffsetMixin
+from viewer.vp_pattern import VpPatternMixin
 from viewer.vp_fillet import VpFilletMixin
 from viewer.vp_fillet3d import Fillet3DMixin
 from viewer.vp_offset_plane import OffsetPlaneMixin
@@ -43,7 +44,7 @@ from cad.history import History
 from cad.selection import SelectionSet
 
 
-class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, ExtrudeMixin, ThickenMixin, RevolveMixin, VpOffsetMixin, VpFilletMixin, Fillet3DMixin, OffsetPlaneMixin, LoftMixin, ChamferMixin, BooleanMixin, QOpenGLWidget):
+class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, ExtrudeMixin, ThickenMixin, RevolveMixin, VpOffsetMixin, VpPatternMixin, VpFilletMixin, Fillet3DMixin, OffsetPlaneMixin, LoftMixin, ChamferMixin, BooleanMixin, QOpenGLWidget):
     history_changed     = pyqtSignal()
     selection_changed   = pyqtSignal()
     sketch_mode_changed = pyqtSignal(bool)
@@ -97,6 +98,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.camera_projection_changed = None
         self.request_extrude_distance  = None
         self._offset_panel         = None
+        self._pattern_panel        = None
         self._fillet_panel         = None
         self._offset_plane_panel        = None
         self._offset_plane_face_active  = False
@@ -1002,6 +1004,12 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
         if e.key() == Qt.Key.Key_Escape:
             if self._sketch is not None:
+                if getattr(self, '_pattern_panel', None) is not None:
+                    # Pattern is mid-parameter — close panel (also cancels tool).
+                    self._close_pattern_panel()
+                    self.sketch_mode_changed.emit(True)
+                    self.update()
+                    return
                 if self._sketch.snap.declared_type is not None:
                     self._sketch.snap.consume_declared()
                     self.sketch_mode_changed.emit(True)
@@ -1066,6 +1074,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
             # Hide HUD on any tool switch (LINE tool will re-show it on move)
             self._line_hud.hide()
+
+            # A tool key while the pattern panel is open abandons the pattern.
+            if getattr(self, '_pattern_panel', None) is not None:
+                self._close_pattern_panel()
 
             # Tool switches + actions
             if prefs.matches("sketch_line", e):
@@ -1467,6 +1479,16 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         if (self._sketch.tool == SketchTool.MIRROR and consumed):
                             self._sketch.cancel_tool()
                             self._rebuild_sketch_faces()
+                        # Pattern: once the reference is picked, open the panel.
+                        from cad.sketch_tools.pattern import PatternTool
+                        if (self._sketch.tool in (SketchTool.PATTERN_LINEAR,
+                                                  SketchTool.PATTERN_CIRCULAR)
+                                and consumed
+                                and isinstance(self._sketch._active_tool, PatternTool)
+                                and self._sketch._active_tool._state ==
+                                    PatternTool.STATE_PARAMS
+                                and getattr(self, '_pattern_panel', None) is None):
+                            self._show_pattern_panel()
                         if (self._sketch.tool == SketchTool.OFFSET and
                                 isinstance(self._sketch._active_tool, OffsetTool) and
                                 self._sketch._active_tool._state == OffsetTool.STATE_SELECTED and

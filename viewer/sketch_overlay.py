@@ -386,6 +386,61 @@ class SketchOverlay:
         elif sketch.tool == SketchTool.MIRROR:
             self._draw_mirror_preview(sketch)
 
+        elif sketch.tool in (SketchTool.PATTERN_LINEAR,
+                             SketchTool.PATTERN_CIRCULAR):
+            self._draw_pattern_preview(sketch)
+
+        glLineWidth(1.0)
+
+    def _draw_pattern_preview(self, sketch: SketchMode):
+        """Reference highlight (PICK_REF) or ghosted copies (PARAMS)."""
+        from cad.sketch_tools.pattern import PatternTool
+        from cad.sketch import LineEntity, ArcEntity
+        tool = sketch._active_tool
+        if not isinstance(tool, PatternTool):
+            return
+
+        if tool._state == PatternTool.STATE_PICK_REF:
+            if tool.mode == "linear" and tool.hovered_line is not None:
+                ln = tool.hovered_line
+                glColor4f(0.40, 0.85, 1.00, 0.95)
+                glLineWidth(2.0)
+                glBegin(GL_LINES)
+                glVertex3f(*self._pt(sketch.plane, ln.p0[0], ln.p0[1]))
+                glVertex3f(*self._pt(sketch.plane, ln.p1[0], ln.p1[1]))
+                glEnd()
+            elif tool.mode == "circular" and tool.hovered_point is not None:
+                p = tool.hovered_point
+                glColor4f(0.40, 0.85, 1.00, 0.95)
+                glPointSize(8.0)
+                glBegin(GL_POINTS)
+                glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
+                glEnd()
+                glPointSize(1.0)
+            return
+
+        # PARAMS: ghost the generated copies.
+        glColor4f(0.40, 0.85, 1.00, 0.45)
+        glLineWidth(1.4)
+        for ent in tool.generate_copies(sketch):
+            if isinstance(ent, LineEntity):
+                glBegin(GL_LINES)
+                glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))
+                glVertex3f(*self._pt(sketch.plane, ent.p1[0], ent.p1[1]))
+                glEnd()
+            elif isinstance(ent, ArcEntity):
+                glBegin(GL_LINE_STRIP)
+                for q in ent.tessellate(48):
+                    glVertex3f(*self._pt(sketch.plane, q[0], q[1]))
+                glEnd()
+        # Mark the circular center.
+        if tool.mode == "circular" and tool._center is not None:
+            glColor4f(0.40, 0.85, 1.00, 0.9)
+            glPointSize(7.0)
+            glBegin(GL_POINTS)
+            glVertex3f(*self._pt(sketch.plane, tool._center[0], tool._center[1]))
+            glEnd()
+            glPointSize(1.0)
         glLineWidth(1.0)
 
     def _draw_mirror_preview(self, sketch: SketchMode):
