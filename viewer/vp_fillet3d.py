@@ -13,6 +13,29 @@ from __future__ import annotations
 from PyQt6.QtCore import pyqtSlot, QMetaObject, Qt, Q_ARG
 
 
+def _fillet_cache_key(shape, face_indices, edge_occs, radius):
+    """Identity for a fillet computation: shape + faces + edges + radius.
+
+    Edges are keyed by their rounded midpoint (stable across the resolve done
+    in preview vs commit, which may produce different TopoDS_Edge wrappers for
+    the same geometric edge)."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    mids = []
+    for e in edge_occs:
+        try:
+            a = BRepAdaptor_Curve(e)
+            p = a.Value((a.FirstParameter() + a.LastParameter()) * 0.5)
+            mids.append((round(p.X(), 3), round(p.Y(), 3), round(p.Z(), 3)))
+        except Exception:
+            mids.append(None)
+    return (
+        hash(shape.wrapped) if hasattr(shape, "wrapped") else hash(shape),
+        tuple(sorted(face_indices)),
+        tuple(sorted(m for m in mids if m is not None)),
+        round(float(radius), 6),
+    )
+
+
 class Fillet3DMixin:
 
     # ------------------------------------------------------------------
@@ -145,6 +168,7 @@ class Fillet3DMixin:
         self._fillet3d_preview_mesh  = None
         self._fillet3d_computing     = False
         self._fillet3d_pending       = None
+        self._fillet3d_result_cache  = None
         self._fillet3d_arrow_base    = None
         self._fillet3d_arrow_origin  = None
         self._fillet3d_arrow_dir     = None
@@ -284,6 +308,7 @@ class Fillet3DMixin:
         face_indices, edge_occs, radius = params
         token = object()
         self._fillet3d_preview_token = token
+        key = _fillet_cache_key(shape, face_indices, edge_occs, radius)
 
         def _compute():
             try:
@@ -291,7 +316,12 @@ class Fillet3DMixin:
                 from viewer.mesh import Mesh
                 preview_mesh = Mesh(result)
             except Exception:
+                result = None
                 preview_mesh = None
+            # Stash the commit-quality solid so commit can reuse it instead of
+            # recomputing — an edge fillet on a long BSpline edge costs ~75s in
+            # the kernel, and the preview already paid that exact cost.
+            self._fillet3d_result_cache = (key, result) if result is not None else None
             QMetaObject.invokeMethod(
                 self, "_fillet3d_preview_done",
                 Qt.ConnectionType.QueuedConnection,

@@ -123,6 +123,17 @@ class FaceFilletOp(Op):
         radius = self.radius
 
         def compute():
+            # The live preview already computed this exact fillet on a worker
+            # thread (preview == commit quality). Reuse its solid if the cached
+            # inputs match — a fillet on a long BSpline edge costs ~75s in the
+            # kernel, so recomputing it on commit doubled the wall-clock wait.
+            cached = getattr(viewport, "_fillet3d_result_cache", None)
+            if cached is not None:
+                from viewer.vp_fillet3d import _fillet_cache_key
+                key, solid = cached
+                if solid is not None and key == _fillet_cache_key(
+                        shape_before, face_indices, edge_occs, radius):
+                    return solid
             return fillet_edges(shape_before, face_indices, edge_occs, radius)
 
         def finalize(shape_after):
