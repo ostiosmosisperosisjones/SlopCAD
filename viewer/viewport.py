@@ -98,6 +98,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.camera_projection_changed = None
         self.request_extrude_distance  = None
         self._offset_panel         = None
+        self._offset_preview       = []     # ghosted offset result entities
         self._pattern_panel        = None
         self._fillet_panel         = None
         self._offset_plane_panel        = None
@@ -1106,7 +1107,12 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 self._close_offset_panel()
                 self._sketch.set_tool(SketchTool.DIVIDE)
             elif prefs.matches("sketch_offset", e):
-                self._sketch.set_tool(SketchTool.OFFSET)
+                # Select-first: if lines/arcs are selected, offset them all and
+                # open the panel; otherwise fall back to click-to-select.
+                if not self._activate_offset_selection():
+                    self._sketch.set_tool(SketchTool.OFFSET)
+                else:
+                    return
             elif prefs.matches("sketch_include", e):
                 from cad.sketch_tools.include import IncludeTool
                 self._sketch.push_undo_snapshot()

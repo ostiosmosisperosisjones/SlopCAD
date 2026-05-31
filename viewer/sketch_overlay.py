@@ -710,24 +710,31 @@ class SketchOverlay:
             entities = tool.hovered_entities
             color = (1.00, 0.80, 0.20, 0.75)  # yellow = hover
 
-        if not entities:
-            return
+        def _draw(ent_list, width):
+            glLineWidth(width)
+            for ent in ent_list:
+                if isinstance(ent, LineEntity):
+                    glBegin(GL_LINES)
+                    glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))
+                    glVertex3f(*self._pt(sketch.plane, ent.p1[0], ent.p1[1]))
+                    glEnd()
+                elif isinstance(ent, ArcEntity):
+                    glBegin(GL_LINE_STRIP)
+                    for p in ent.tessellate(64):
+                        glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
+                    glEnd()
 
         glEnable(GL_BLEND)
-        glColor4f(*color)
-        glLineWidth(3.0)
-        for ent in entities:
-            if isinstance(ent, LineEntity):
-                glBegin(GL_LINES)
-                glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))
-                glVertex3f(*self._pt(sketch.plane, ent.p1[0], ent.p1[1]))
-                glEnd()
-            elif isinstance(ent, ArcEntity):
-                pts = ent.tessellate(64)
-                glBegin(GL_LINE_STRIP)
-                for p in pts:
-                    glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
-                glEnd()
+        if entities:
+            glColor4f(*color)
+            _draw(entities, 3.0)
+
+        # Ghost the offset result (set live by the panel via the tool).
+        ghost = getattr(tool, 'preview', None)
+        if ghost:
+            glColor4f(0.40, 0.85, 1.00, 0.55)
+            _draw(ghost, 1.6)
+
         glLineWidth(1.0)
         glDisable(GL_BLEND)
 

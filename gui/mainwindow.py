@@ -71,7 +71,7 @@ class MainWindow(QMainWindow):
         self._sketch_toolbar.tool_fillet_requested.connect(
             lambda: self._sketch_set_tool("FILLET"))
         self._sketch_toolbar.tool_offset_requested.connect(
-            lambda: self._sketch_set_tool("OFFSET"))
+            self._sketch_offset)
         self._sketch_toolbar.tool_include_requested.connect(
             self._sketch_include)
         self._sketch_toolbar.tool_mirror_requested.connect(
@@ -176,6 +176,17 @@ class MainWindow(QMainWindow):
         """Toolbar Pattern (linear/circular) — uses the current selection."""
         if self._viewport and self._viewport._sketch:
             self._viewport._activate_pattern(mode)
+
+    def _sketch_offset(self):
+        """Toolbar Offset — select-first if a selection exists, else click-select."""
+        vp = self._viewport
+        if not vp or not vp._sketch:
+            return
+        from cad.sketch import SketchTool
+        if not vp._activate_offset_selection():
+            vp._sketch.set_tool(SketchTool.OFFSET)
+            vp.sketch_mode_changed.emit(True)
+            vp.update()
 
     def _sketch_construction(self):
         """Toolbar Construction — same path as the G keybind."""

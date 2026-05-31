@@ -49,6 +49,8 @@ QPushButton#ok:hover { background: #1e5a8a; }
 class OffsetPanel(QWidget):
     confirmed  = pyqtSignal(float)   # distance_mm
     cancelled  = pyqtSignal()
+    changed    = pyqtSignal()        # distance edited (live preview)
+    flipped    = pyqtSignal()        # flip-direction toggled
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -75,6 +77,10 @@ class OffsetPanel(QWidget):
         row.addWidget(self._spinbox)
         root.addLayout(row)
 
+        flip = QPushButton("⇄  Flip direction")
+        flip.clicked.connect(self.flipped.emit)
+        root.addWidget(flip)
+
         btns = QHBoxLayout()
         ok = QPushButton("OK")
         ok.setObjectName("ok")
@@ -85,7 +91,7 @@ class OffsetPanel(QWidget):
         btns.addWidget(ok)
         root.addLayout(btns)
 
-        self._spinbox.value_changed.connect(lambda _: None)   # keep live
+        self._spinbox.value_changed.connect(lambda _: self.changed.emit())
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):

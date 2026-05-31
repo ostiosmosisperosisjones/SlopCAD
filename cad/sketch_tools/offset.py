@@ -155,10 +155,11 @@ def offset_arc(arc, dist: float):
 
 
 def offset_entities(entities: list, dist: float, click_pt: np.ndarray,
-                    is_loop: bool) -> list:
+                    is_loop: bool, sign_override: float | None = None) -> list:
     """
     Offset a list of entities by dist.  The sign of dist is determined by
-    the click position relative to the geometry.
+    the click position relative to the geometry, unless sign_override (±1) is
+    given (used by the Flip-direction toggle / select-first flow).
     Returns a list of new offset entities (may be empty on failure).
     """
     from cad.sketch import LineEntity, ArcEntity
@@ -166,7 +167,9 @@ def offset_entities(entities: list, dist: float, click_pt: np.ndarray,
     if not entities:
         return []
 
-    if is_loop:
+    if sign_override is not None:
+        sign = float(sign_override)
+    elif is_loop:
         inside = _loop_contains(click_pt, entities)
         sign = 1.0 if inside else -1.0
     else:
@@ -306,9 +309,67 @@ class OffsetTool(BaseTool):
         self.selected_is_loop:  bool = False
         self.selected_click_pt: np.ndarray | None = None
 
+        # Direction flip applied on top of the auto-derived side.  For the
+        # select-first flow (no click point), the base sign is +1 and Flip
+        # toggles it; for click-select, Flip inverts the click-derived side.
+        self.flip: bool = False
+
+        # Ghosted offset result for the overlay (set by generate_offset).
+        self.preview: list = []
+
     @property
     def cursor_2d(self) -> np.ndarray | None:
         return self._cursor_2d
+
+    def on_activate(self, sketch, selected_indices):
+        """Select-first flow: if entities were pre-selected, offset all of them
+        together and jump straight to the panel (skip click-to-select)."""
+        from cad.sketch import LineEntity, ArcEntity
+        ents = [sketch.entities[i] for i in selected_indices
+                if i < len(sketch.entities)
+                and isinstance(sketch.entities[i], (LineEntity, ArcEntity))]
+        if not ents:
+            return
+        self.selected_entities = ents
+        self.selected_is_loop  = _is_closed_chain(ents)
+        # No click point in select-first mode — direction is purely the
+        # flip toggle (base sign +1).
+        self.selected_click_pt = None
+        self._state = self.STATE_SELECTED
+
+    def _base_sign(self) -> float:
+        """Sign before the flip toggle is applied."""
+        if self.selected_click_pt is not None and self.selected_entities:
+            e = self.selected_entities[0]
+            from cad.sketch import LineEntity
+            if self.selected_is_loop:
+                return 1.0 if _loop_contains(self.selected_click_pt,
+                                             self.selected_entities) else -1.0
+            if isinstance(e, LineEntity):
+                return (1.0 if _point_side_of_line(self.selected_click_pt,
+                                                   e.p0, e.p1) >= 0 else -1.0)
+            return (1.0 if _point_side_of_arc(self.selected_click_pt, e) >= 0
+                    else -1.0)
+        return 1.0   # select-first: base outward/left, Flip toggles
+
+    def current_sign(self) -> float:
+        s = self._base_sign()
+        return -s if self.flip else s
+
+    def flip_direction(self):
+        self.flip = not self.flip
+
+    def generate_offset(self, dist_mm: float, sketch) -> list:
+        """Preview of the offset result for the current distance + flip state.
+        Caches the result on self.preview for the overlay; returns it too."""
+        if not self.selected_entities or dist_mm <= 0:
+            self.preview = []
+            return []
+        self.preview = offset_entities(
+            self.selected_entities, dist_mm,
+            self.selected_click_pt, self.selected_is_loop,
+            sign_override=self.current_sign())
+        return self.preview
 
     def handle_mouse_move(self, snap_result, sketch) -> None:
         self._cursor_2d = (snap_result.cursor_raw.copy()
@@ -374,11 +435,12 @@ class OffsetTool(BaseTool):
 
     def apply_offset(self, dist_mm: float, sketch) -> bool:
         """Called by the panel when the user confirms a distance."""
-        if not self.selected_entities or self.selected_click_pt is None:
+        if not self.selected_entities:
             return False
 
         result = offset_entities(self.selected_entities, dist_mm,
-                                 self.selected_click_pt, self.selected_is_loop)
+                                 self.selected_click_pt, self.selected_is_loop,
+                                 sign_override=self.current_sign())
         if not result:
             return False
 
@@ -389,6 +451,8 @@ class OffsetTool(BaseTool):
         self._state = self.STATE_HOVER
         self.selected_entities = []
         self.selected_click_pt = None
+        self.flip = False
+        self.preview = []
         return True
 
     def cancel(self) -> None:
@@ -397,3 +461,13 @@ class OffsetTool(BaseTool):
         self.hovered_entities  = []
         self.selected_entities = []
         self.selected_click_pt = None
+        self.flip = False
+        self.preview = []
+
+
+def _is_closed_chain(entities: list, tol: float = 1e-3) -> bool:
+    """True if the entities form one closed chain (so corners get reconnected)."""
+    if len(entities) < 2:
+        return False
+    loop = _find_loop_for_entity(entities[0], entities, tol=tol)
+    return loop is not None and len(loop) == len(entities)
