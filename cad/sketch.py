@@ -43,6 +43,7 @@ class SketchTool(Enum):
     MIRROR    = auto()
     PATTERN_LINEAR   = auto()
     PATTERN_CIRCULAR = auto()
+    SPLINE    = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +123,69 @@ class ArcEntity:
         angles = np.linspace(self.start_angle, self.end_angle, n + 1)
         return [self.center + self.radius * np.array([np.cos(a), np.sin(a)])
                 for a in angles]
+
+
+class SplineEntity:
+    """
+    A 2-D spline that interpolates (passes through) a sequence of fit points,
+    in sketch (u, v) coordinates (world mm).
+
+    points : list of (u, v) — the interpolation points, in order.
+    closed : if True, the curve is periodic and returns to points[0].
+
+    The actual curve is an OCCT B-spline fit through the points; we keep only
+    the fit points as the parametric data (the solver can own them later) and
+    derive geometry on demand.
+    """
+    def __init__(self, points, closed: bool = False,
+                 construction: bool = False):
+        self.points = [np.array(p, dtype=np.float64) for p in points]
+        self.closed = bool(closed)
+        self.construction = bool(construction)
+
+    @property
+    def p0(self) -> np.ndarray:
+        return self.points[0]
+
+    @property
+    def p1(self) -> np.ndarray:
+        # A closed spline ends where it began.
+        return self.points[0] if self.closed else self.points[-1]
+
+    def _occ_curve(self):
+        """Build (and return) the Geom_BSplineCurve through the fit points in the
+        sketch UV plane (z=0).  Returns None if it can't be built."""
+        from OCP.TColgp import TColgp_Array1OfPnt
+        from OCP.gp import gp_Pnt
+        from OCP.GeomAPI import GeomAPI_PointsToBSpline
+        pts = self.points
+        if self.closed and len(pts) >= 1:
+            pts = list(pts) + [pts[0]]
+        if len(pts) < 2:
+            return None
+        arr = TColgp_Array1OfPnt(1, len(pts))
+        for i, p in enumerate(pts, start=1):
+            arr.SetValue(i, gp_Pnt(float(p[0]), float(p[1]), 0.0))
+        try:
+            return GeomAPI_PointsToBSpline(arr).Curve()
+        except Exception:
+            return None
+
+    def tessellate(self, n: int = 64) -> list[np.ndarray]:
+        """Return ~n+1 points along the spline (UV).  Falls back to the raw
+        fit-point polyline if the B-spline can't be built."""
+        curve = self._occ_curve()
+        if curve is None:
+            pts = list(self.points)
+            if self.closed and pts:
+                pts = pts + [pts[0]]
+            return pts
+        u0, u1 = curve.FirstParameter(), curve.LastParameter()
+        out = []
+        for t in np.linspace(u0, u1, max(n, 2)):
+            p = curve.Value(float(t))
+            out.append(np.array([p.X(), p.Y()], dtype=np.float64))
+        return out
 
 
 class ReferenceEntity:
@@ -1097,13 +1161,23 @@ class SketchEntry:
                 if isinstance(e, ReferenceEntity) and len(e.points) >= 2]
 
     def closed_loops(self, tol: float = 1e-3) -> list[list[tuple[float, float]]]:
-        """All closed chains from LineEntity/ArcEntity segments and ReferenceEntity polylines."""
+        """All closed chains from LineEntity/ArcEntity segments, ReferenceEntity
+        polylines, and closed SplineEntity curves."""
         closed = []
         for _chain, uv_pts in self._collect_drawn_loops_with_arcs(tol=tol):
             closed.append(uv_pts)
         for chain in self.reference_chains():
             if np.linalg.norm(np.array(chain[-1]) - np.array(chain[0])) < tol:
                 closed.append(chain)
+        for ent in self.entities:
+            if (isinstance(ent, SplineEntity)
+                    and not getattr(ent, "construction", False)):
+                is_closed = ent.closed or (len(ent.points) >= 3 and
+                    np.linalg.norm(ent.points[-1] - ent.points[0]) < tol)
+                if is_closed:
+                    uv = [(float(p[0]), float(p[1]))
+                          for p in ent.tessellate(64)]
+                    closed.append(uv)
         return closed
 
     def has_closed_loop(self, tol: float = 1e-3) -> bool:
@@ -1170,6 +1244,23 @@ class SketchEntry:
             uv = [(float(p[0]), float(p[1])) for p in raw]
             if len(uv) >= 3:
                 uv_loops.append(uv)
+
+        # Closed splines are standalone profile loops.
+        for ent in self.entities:
+            if (isinstance(ent, SplineEntity)
+                    and not getattr(ent, "construction", False)):
+                is_closed = ent.closed or (len(ent.points) >= 3 and
+                    np.linalg.norm(ent.points[-1] - ent.points[0]) < tol)
+                if not is_closed:
+                    continue
+                tess = ent.tessellate(64)
+                uv = [(float(p[0]), float(p[1])) for p in tess]
+                # Drop a duplicated closing point if present.
+                if len(uv) >= 2 and abs(uv[0][0] - uv[-1][0]) < tol \
+                        and abs(uv[0][1] - uv[-1][1]) < tol:
+                    uv = uv[:-1]
+                if len(uv) >= 3:
+                    uv_loops.append(uv)
 
         for _chain, uv_pts in self._collect_drawn_loops_with_arcs(tol=tol):
             if len(uv_pts) >= 3:
@@ -1495,6 +1586,25 @@ class SketchEntry:
                         tools_list.Append(w)
                 except Exception as ex:
                     print(f"[Sketch] build_faces: arc edge error — {ex}")
+
+            elif isinstance(ent, SplineEntity):
+                try:
+                    from OCP.TColgp import TColgp_Array1OfPnt
+                    from OCP.GeomAPI import GeomAPI_PointsToBSpline
+                    pts = list(ent.points)
+                    if ent.closed and pts:
+                        pts = pts + [pts[0]]
+                    if len(pts) >= 2:
+                        arr = TColgp_Array1OfPnt(1, len(pts))
+                        for i, p in enumerate(pts, start=1):
+                            arr.SetValue(i, _uv3d(p[0], p[1]))
+                        curve = GeomAPI_PointsToBSpline(arr).Curve()
+                        sp_edge = BRepBuilderAPI_MakeEdge(curve).Edge()
+                        w = _single_edge_wire(sp_edge)
+                        if w is not None:
+                            tools_list.Append(w)
+                except Exception as ex:
+                    print(f"[Sketch] build_faces: spline edge error — {ex}")
 
         # ── ReferenceEntity closed loops — add as wire tools ─────────────
         def _project_ref_edge(edge):

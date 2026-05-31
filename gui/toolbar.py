@@ -404,6 +404,16 @@ _SVG_INCLUDE = """
             stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>"""
 
+# Spline: a smooth curve through node dots
+_SVG_SPLINE = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <path d="M5,28 C10,8 16,30 21,16 C24,8 28,12 31,8" fill="none"
+        stroke="#ffb74d" stroke-width="2.2" stroke-linecap="round"/>
+  <circle cx="5"  cy="28" r="2.2" fill="#ffb74d"/>
+  <circle cx="21" cy="16" r="2.0" fill="#ffb74d" opacity="0.7"/>
+  <circle cx="31" cy="8"  r="2.2" fill="#ffb74d"/>
+</svg>"""
+
 # Mirror: a shape and its reflection across a dashed axis
 _SVG_MIRROR = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
@@ -606,6 +616,7 @@ class SketchToolbar(QToolBar):
     tool_line_requested    = pyqtSignal()
     tool_arc_requested     = pyqtSignal()
     tool_square_requested  = pyqtSignal()
+    tool_spline_requested  = pyqtSignal()
     tool_circle_requested  = pyqtSignal(str)   # emits CircleMode value
     tool_trim_requested    = pyqtSignal()
     tool_divide_requested  = pyqtSignal()
@@ -638,6 +649,9 @@ class SketchToolbar(QToolBar):
         self._btn_square = self._add_btn(
             "Square  S", _SVG_SQUARE, self.tool_square_requested,
             "2-point square  (S)")
+        self._btn_spline = self._add_btn(
+            "Spline  B", _SVG_SPLINE, self.tool_spline_requested,
+            "Spline through points  (B) — Enter or click start to finish")
 
         # Circle button with drop-down corner menu for sub-mode
         self._btn_circle = self._make_circle_btn()
@@ -802,6 +816,7 @@ class SketchToolbar(QToolBar):
             "LINE":      self._btn_line,
             "ARC3":      self._btn_arc,
             "SQUARE":     self._btn_square,
+            "SPLINE":    self._btn_spline,
             "CIRCLE":    self._btn_circle,
             "TRIM":      self._btn_trim,
             "DIVIDE":    self._btn_divide,
@@ -814,7 +829,8 @@ class SketchToolbar(QToolBar):
             "PATTERN_CIRCULAR": self._btn_pattern,
             "NONE":      None,
         }
-        for btn in [self._btn_line, self._btn_arc, self._btn_circle,
+        for btn in [self._btn_line, self._btn_arc, self._btn_square,
+                    self._btn_spline, self._btn_circle,
                     self._btn_trim, self._btn_divide, self._btn_fillet,
                     self._btn_offset, self._btn_include, self._btn_mirror,
                     self._btn_pattern, self._btn_construction,

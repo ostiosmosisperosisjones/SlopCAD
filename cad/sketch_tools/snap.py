@@ -355,7 +355,8 @@ class SnapEngine:
     # ------------------------------------------------------------------
 
     def _snap_endpoint(self, cursor, entities, radius, plane):
-        from cad.sketch import LineEntity, ReferenceEntity, ArcEntity, PointEntity
+        from cad.sketch import (LineEntity, ReferenceEntity, ArcEntity,
+                                PointEntity, SplineEntity)
         best_d = radius
         best_p = None
         best_i = None
@@ -376,6 +377,10 @@ class SnapEngine:
                 candidates = [ent.p0, ent.p1]
             elif isinstance(ent, ArcEntity):
                 candidates = [ent.p0, ent.p1]
+            elif isinstance(ent, SplineEntity):
+                # Every fit point is a snappable node; chaining usually targets
+                # the open endpoints.
+                candidates = list(ent.points)
             elif isinstance(ent, ReferenceEntity):
                 if ent.occ_edges:
                     if _all_edges_closed(ent.occ_edges):

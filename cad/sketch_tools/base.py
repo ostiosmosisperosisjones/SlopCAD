@@ -50,5 +50,11 @@ class BaseTool:
         default."""
         pass
 
+    def finish(self, sketch) -> bool:
+        """Enter/Return pressed while this tool is active.  Return True to
+        consume it (e.g. a spline commits its accumulated points); False lets
+        Enter fall through to committing the whole sketch.  No-op by default."""
+        return False
+
     def cancel(self) -> None:
         pass

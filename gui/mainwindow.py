@@ -62,6 +62,8 @@ class MainWindow(QMainWindow):
             lambda: self._sketch_set_tool("ARC3"))
         self._sketch_toolbar.tool_square_requested.connect(
             lambda: self._sketch_set_tool("SQUARE"))
+        self._sketch_toolbar.tool_spline_requested.connect(
+            lambda: self._sketch_set_tool("SPLINE"))
         self._sketch_toolbar.tool_circle_requested.connect(
             self._sketch_set_circle)
         self._sketch_toolbar.tool_trim_requested.connect(
@@ -320,7 +322,7 @@ class MainWindow(QMainWindow):
             tools_hint = (
                 "L=line  A=arc  C=circle  T=trim  D=divide  "
                 "F=fillet  O=offset  P=point  H/V=h/v line  "
-                "G=construction  M=mirror  Return=commit"
+                "B=spline  G=construction  M=mirror  Return=commit"
             )
             con_html = ''
             if getattr(sketch, 'constraints', None):
@@ -350,6 +352,7 @@ class MainWindow(QMainWindow):
                 SketchTool.DIVIDE: "DIVIDE — click entity to split",
                 SketchTool.FILLET:    "FILLET — click corner",
                 SketchTool.SQUARE:    "SQUARE — click two corners",
+                SketchTool.SPLINE:    "SPLINE — click points; Enter or click start to finish",
                 SketchTool.OFFSET:    "OFFSET — click entity or loop",
                 SketchTool.POINT:     "POINT — click to place",
                 SketchTool.DIMENSION: "DIMENSION — click a line",

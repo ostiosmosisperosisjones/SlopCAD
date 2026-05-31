@@ -13,7 +13,7 @@ import numpy as np
 from OpenGL.GL import *
 import math
 from cad.sketch import (SketchMode, SketchTool, LineEntity, ArcEntity,
-                        PointEntity, ReferenceEntity)
+                        PointEntity, ReferenceEntity, SplineEntity)
 from cad.prefs import prefs
 
 
@@ -276,7 +276,7 @@ class SketchOverlay:
                 glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))
                 glVertex3f(*self._pt(sketch.plane, ent.p1[0], ent.p1[1]))
                 glEnd()
-            elif isinstance(ent, ArcEntity):
+            elif isinstance(ent, (ArcEntity, SplineEntity)):
                 pts = ent.tessellate(64)
                 glBegin(GL_LINE_STRIP)
                 for p in pts:
@@ -383,6 +383,9 @@ class SketchOverlay:
         elif sketch.tool == SketchTool.SQUARE:
             self._draw_square_preview(sketch)
 
+        elif sketch.tool == SketchTool.SPLINE:
+            self._draw_spline_preview(sketch)
+
         elif sketch.tool == SketchTool.MIRROR:
             self._draw_mirror_preview(sketch)
 
@@ -391,6 +394,37 @@ class SketchOverlay:
             self._draw_pattern_preview(sketch)
 
         glLineWidth(1.0)
+
+    def _draw_spline_preview(self, sketch: SketchMode):
+        """In-progress spline: placed nodes + live curve through them + cursor."""
+        from cad.sketch_tools.spline import SplineTool
+        tool = sketch._active_tool
+        if not isinstance(tool, SplineTool):
+            return
+        pts = list(tool.points)
+        # Draw placed nodes.
+        glColor4f(1.00, 0.72, 0.20, 0.9)
+        glPointSize(5.0)
+        glBegin(GL_POINTS)
+        for p in pts:
+            glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
+        glEnd()
+        glPointSize(1.0)
+        # Live curve through placed points + the current cursor.
+        preview_pts = list(pts)
+        if tool.cursor_2d is not None:
+            preview_pts = preview_pts + [tool.cursor_2d]
+        if len(preview_pts) >= 2:
+            from cad.sketch import SplineEntity
+            tess = SplineEntity(preview_pts).tessellate(48)
+            r, g, b = prefs.sketch_preview_color
+            glColor3f(r, g, b)
+            glLineWidth(1.6)
+            glBegin(GL_LINE_STRIP)
+            for q in tess:
+                glVertex3f(*self._pt(sketch.plane, q[0], q[1]))
+            glEnd()
+            glLineWidth(1.0)
 
     def _draw_pattern_preview(self, sketch: SketchMode):
         """Reference highlight (PICK_REF) or ghosted copies (PARAMS)."""
@@ -1052,7 +1086,7 @@ class SketchOverlay:
                 glVertex3f(*self._pt_from_entry(entry, ent.p0[0], ent.p0[1]))
                 glVertex3f(*self._pt_from_entry(entry, ent.p1[0], ent.p1[1]))
                 glEnd()
-            elif isinstance(ent, ArcEntity):
+            elif isinstance(ent, (ArcEntity, SplineEntity)):
                 pts = ent.tessellate(64)
                 glBegin(GL_LINE_STRIP)
                 for p in pts:

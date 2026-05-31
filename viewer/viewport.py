@@ -1090,6 +1090,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             elif prefs.matches("sketch_square", e):
                 self._close_offset_panel()
                 self._sketch.set_tool(SketchTool.SQUARE)
+            elif prefs.matches("sketch_spline", e):
+                self._close_offset_panel()
+                self._sketch.set_tool(SketchTool.SPLINE)
             elif prefs.matches("sketch_circle", e):
                 self._close_offset_panel()
                 self._sketch.set_tool(SketchTool.CIRCLE)
@@ -1136,6 +1139,15 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 self._activate_mirror()
                 return
             elif prefs.matches("sketch_commit", e):
+                # Give the active tool first crack at Enter (e.g. spline commits
+                # its accumulated points).  If it consumes it, the sketch stays
+                # open; otherwise Enter commits the whole sketch.
+                tool = self._sketch._active_tool
+                if tool is not None and tool.finish(self._sketch):
+                    self._rebuild_sketch_faces()
+                    self.sketch_mode_changed.emit(True)
+                    self.update()
+                    return
                 self._complete_sketch()
                 return
             elif prefs.matches("sketch_projection_toggle", e):

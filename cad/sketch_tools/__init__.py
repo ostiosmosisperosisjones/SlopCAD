@@ -27,6 +27,7 @@ from cad.sketch_tools.geometric import GeometricConstraintTool
 from cad.sketch_tools.square  import SquareTool
 from cad.sketch_tools.mirror  import MirrorTool
 from cad.sketch_tools.pattern import PatternTool, LINEAR, CIRCULAR
+from cad.sketch_tools.spline  import SplineTool
 from cad.sketch_tools.snap    import SnapEngine, SnapResult, SnapType
 
 from functools import partial
@@ -48,6 +49,7 @@ TOOLS: dict[SketchTool, type[BaseTool]] = {
     SketchTool.MIRROR:    MirrorTool,
     SketchTool.PATTERN_LINEAR:   partial(PatternTool, mode=LINEAR),
     SketchTool.PATTERN_CIRCULAR: partial(PatternTool, mode=CIRCULAR),
+    SketchTool.SPLINE:    SplineTool,
 }
 
 # IncludeTool is a one-shot action, not a persistent drawing tool.

@@ -214,7 +214,7 @@ class HoverState:
 
     def _add_sketch_edges(self, history, project_fn, skip_idx=None):
         """Project committed sketch LineEntity/ArcEntity objects into the hover cache."""
-        from cad.sketch import LineEntity, ArcEntity, SketchEntry
+        from cad.sketch import LineEntity, ArcEntity, SketchEntry, SplineEntity
         cursor = history.cursor
         for i, entry in enumerate(history.entries):
             if i > cursor:
@@ -237,7 +237,7 @@ class HoverState:
                 if isinstance(ent, LineEntity):
                     pts3d = np.array([_uv_to_world(ent.p0),
                                       _uv_to_world(ent.p1)], dtype=np.float32)
-                elif isinstance(ent, ArcEntity):
+                elif isinstance(ent, (ArcEntity, SplineEntity)):
                     pts3d = np.array([_uv_to_world(p)
                                       for p in ent.tessellate(64)], dtype=np.float32)
                 else:
@@ -267,13 +267,13 @@ class HoverState:
         parse_sketch_key returns (-1, entity_idx) and the viewport can
         distinguish active vs committed sketch edges.
         """
-        from cad.sketch import LineEntity, ArcEntity
+        from cad.sketch import LineEntity, ArcEntity, SplineEntity
         for j, ent in enumerate(sketch.entities):
             if isinstance(ent, LineEntity):
                 p0_world = sketch.plane.to_3d(float(ent.p0[0]), float(ent.p0[1]))
                 p1_world = sketch.plane.to_3d(float(ent.p1[0]), float(ent.p1[1]))
                 pts3d = np.array([p0_world, p1_world], dtype=np.float32)
-            elif isinstance(ent, ArcEntity):
+            elif isinstance(ent, (ArcEntity, SplineEntity)):
                 pts3d = np.array([sketch.plane.to_3d(float(p[0]), float(p[1]))
                                   for p in ent.tessellate(64)], dtype=np.float32)
             else:

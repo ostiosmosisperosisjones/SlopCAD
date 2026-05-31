@@ -156,7 +156,7 @@ def _edge_source_from_dict(d: dict | None):
 # ---------------------------------------------------------------------------
 
 def _entity_to_dict(ent) -> dict:
-    from cad.sketch import LineEntity, ArcEntity, PointEntity, ReferenceEntity
+    from cad.sketch import LineEntity, ArcEntity, PointEntity, ReferenceEntity, SplineEntity
     if isinstance(ent, LineEntity):
         d: dict[str, Any] = {
             "type": "line",
@@ -181,6 +181,15 @@ def _entity_to_dict(ent) -> dict:
         if getattr(ent, "construction", False):
             d["construction"] = True
         return d
+    if isinstance(ent, SplineEntity):
+        d = {
+            "type":   "spline",
+            "points": [_arr(p) for p in ent.points],
+            "closed": bool(ent.closed),
+        }
+        if getattr(ent, "construction", False):
+            d["construction"] = True
+        return d
     if isinstance(ent, PointEntity):
         return {"type": "point", "pos": _arr(ent.pos)}
     if isinstance(ent, ReferenceEntity):
@@ -195,7 +204,7 @@ def _entity_to_dict(ent) -> dict:
 
 
 def _entity_from_dict(d: dict):
-    from cad.sketch import LineEntity, ArcEntity, PointEntity, ReferenceEntity
+    from cad.sketch import LineEntity, ArcEntity, PointEntity, ReferenceEntity, SplineEntity
     t = d["type"]
     if t == "line":
         ent = LineEntity(d["p0"], d["p1"],
@@ -211,6 +220,11 @@ def _entity_from_dict(d: dict):
         return ArcEntity(d["center"], float(d["radius"]),
                          float(d["start_angle"]), float(d["end_angle"]),
                          construction=bool(d.get("construction", False)))
+    if t == "spline":
+        return SplineEntity(
+            [np.array(p, dtype=np.float64) for p in d["points"]],
+            closed=bool(d.get("closed", False)),
+            construction=bool(d.get("construction", False)))
     if t == "point":
         return PointEntity(d["pos"])
     if t == "reference":
