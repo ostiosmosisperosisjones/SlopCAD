@@ -288,7 +288,7 @@ class MainWindow(QMainWindow):
             tools_hint = (
                 "L=line  A=arc  C=circle  T=trim  D=divide  "
                 "F=fillet  O=offset  P=point  H/V=h/v line  "
-                "Return=commit"
+                "G=construction  K=mirror  Return=commit"
             )
             con_html = ''
             if getattr(sketch, 'constraints', None):
@@ -322,6 +322,7 @@ class MainWindow(QMainWindow):
                 SketchTool.POINT:     "POINT — click to place",
                 SketchTool.DIMENSION: "DIMENSION — click a line",
                 SketchTool.GEOMETRIC: "CONSTRAINTS — click a line  (Tab=cycle mode)",
+                SketchTool.MIRROR:    "MIRROR — click a line to use as the axis",
             }
 
             if tool == SketchTool.LINE and isinstance(active, LineTool):

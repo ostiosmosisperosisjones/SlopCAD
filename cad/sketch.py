@@ -40,6 +40,7 @@ class SketchTool(Enum):
     DIMENSION = auto()
     GEOMETRIC = auto()
     SQUARE    = auto()
+    MIRROR    = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -256,16 +257,30 @@ class SketchMode:
         # Last resolved snap result — read by overlay for indicator drawing
         self.last_snap: object = None   # SnapResult | None
 
+        # Entity indices the next tool should operate on (set by the viewport
+        # when activating a selection-driven tool like Mirror).  Consumed and
+        # cleared on tool activation.
+        self.pending_selection: list[int] = []
+
     # ------------------------------------------------------------------
     # Tool management
     # ------------------------------------------------------------------
 
     def set_tool(self, tool_enum: SketchTool):
-        """Activate a tool by enum value.  Creates a fresh tool instance."""
+        """Activate a tool by enum value.  Creates a fresh tool instance.
+
+        If pending_selection was set (a selection-driven tool like Mirror), it
+        is handed to the new tool via on_activate() and then cleared.
+        """
         from cad.sketch_tools import TOOLS
         self.tool = tool_enum
         cls = TOOLS.get(tool_enum)
         self._active_tool = cls() if cls is not None else None
+        if self._active_tool is not None and self.pending_selection:
+            on_activate = getattr(self._active_tool, "on_activate", None)
+            if on_activate is not None:
+                on_activate(self, list(self.pending_selection))
+        self.pending_selection = []
 
     def cancel_tool(self):
         """ESC within a tool — discard in-progress state and return to NONE.
@@ -633,6 +648,31 @@ class SketchEntry:
                 a, b = con.indices
                 if a in slvs_lines and b in slvs_lines:
                     slvs.equal(slvs_lines[a], slvs_lines[b], wp)
+            elif con.type == 'symmetric':
+                # (src_idx, copy_idx, axis_line_idx): reflect each corresponding
+                # point of src/copy across the axis line.
+                if len(con.indices) != 3:
+                    continue
+                src_i, cpy_i, axis_i = con.indices
+                if (src_i >= len(self.entities) or cpy_i >= len(self.entities)
+                        or axis_i not in slvs_lines):
+                    continue
+                src_e, cpy_e = self.entities[src_i], self.entities[cpy_i]
+                if type(src_e) is not type(cpy_e):
+                    continue
+                axis_line = slvs_lines[axis_i]
+                if isinstance(src_e, LineEntity):
+                    whichs = ('p0', 'p1')
+                elif isinstance(src_e, ArcEntity):
+                    whichs = ('center', 'p0', 'p1')
+                else:
+                    continue
+                for which in whichs:
+                    try:
+                        slvs.symmetric(_pt(src_i, which), _pt(cpy_i, which),
+                                       axis_line, wp)
+                    except Exception:
+                        pass
 
     def compute_constraint_status(self) -> tuple[str, int]:
         """

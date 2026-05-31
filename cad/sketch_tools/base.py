@@ -44,5 +44,11 @@ class BaseTool:
     def handle_mouse_move(self, snap_result, sketch) -> None:
         pass
 
+    def on_activate(self, sketch, selected_indices: list[int]) -> None:
+        """Hook for selection-driven tools (e.g. Mirror) — receives the entity
+        indices that were selected when the tool was activated.  No-op by
+        default."""
+        pass
+
     def cancel(self) -> None:
         pass

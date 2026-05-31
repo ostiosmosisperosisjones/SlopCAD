@@ -957,6 +957,29 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.sketch_mode_changed.emit(True)
         self.update()
 
+    def _activate_mirror(self):
+        """Stash the selected active-sketch entities and activate Mirror so the
+        next click picks the axis line."""
+        from cad.sketch import SketchTool, LineEntity, ArcEntity
+        if self._sketch is None:
+            return
+        idxs = sorted({se.entity_idx for se in self.selection.sketch_edges
+                       if se.history_idx == -1
+                       and se.entity_idx < len(self._sketch.entities)
+                       and isinstance(self._sketch.entities[se.entity_idx],
+                                      (LineEntity, ArcEntity))})
+        if not idxs:
+            print("[Sketch] Select lines or arcs to mirror first, then press "
+                  "mirror and click a line as the axis.")
+            return
+        self._sketch.pending_selection = idxs
+        self._sketch.set_tool(SketchTool.MIRROR)
+        self.selection.clear()
+        self.selection_changed.emit()
+        print(f"[Sketch] Mirror: click a line to use as the axis "
+              f"({len(idxs)} {'entity' if len(idxs) == 1 else 'entities'} "
+              f"selected).")
+
     def event(self, e):
         from PyQt6.QtCore import QEvent
         from cad.sketch import SketchTool
@@ -1089,6 +1112,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 return
             elif prefs.matches("sketch_construction", e):
                 self._toggle_construction()
+                return
+            elif prefs.matches("sketch_mirror", e):
+                self._activate_mirror()
                 return
             elif prefs.matches("sketch_commit", e):
                 self._complete_sketch()
@@ -1429,13 +1455,17 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                                      Qt.KeyboardModifier.ShiftModifier)
                         self._sketch.snap.set_angle_snap(shift)
                         self._sketch.snap.snap_radius_mm = self._snap_radius_mm()
-                        self._sketch.handle_click(
+                        consumed = self._sketch.handle_click(
                             origin, direction, self.camera.distance)
                         self.sketch_mode_changed.emit(True)
                         # Open panels when tools transition to SELECTED
                         from cad.sketch import SketchTool
                         from cad.sketch_tools.offset import OffsetTool
                         from cad.sketch_tools.fillet import FilletTool
+                        # Mirror is one-shot: return to NONE once it commits.
+                        if (self._sketch.tool == SketchTool.MIRROR and consumed):
+                            self._sketch.cancel_tool()
+                            self._rebuild_sketch_faces()
                         if (self._sketch.tool == SketchTool.OFFSET and
                                 isinstance(self._sketch._active_tool, OffsetTool) and
                                 self._sketch._active_tool._state == OffsetTool.STATE_SELECTED and

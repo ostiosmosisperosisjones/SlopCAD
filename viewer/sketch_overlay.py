@@ -383,6 +383,45 @@ class SketchOverlay:
         elif sketch.tool == SketchTool.SQUARE:
             self._draw_square_preview(sketch)
 
+        elif sketch.tool == SketchTool.MIRROR:
+            self._draw_mirror_preview(sketch)
+
+        glLineWidth(1.0)
+
+    def _draw_mirror_preview(self, sketch: SketchMode):
+        """Highlight the candidate axis line and ghost the reflected copies."""
+        from cad.sketch_tools.mirror import MirrorTool, reflect_entity
+        from cad.sketch import LineEntity, ArcEntity
+        tool = sketch._active_tool
+        if not isinstance(tool, MirrorTool):
+            return
+        axis = tool.hovered_axis
+        if axis is None:
+            return
+        # Highlight the axis candidate.
+        glColor4f(0.40, 0.85, 1.00, 0.95)
+        glLineWidth(2.0)
+        glBegin(GL_LINES)
+        glVertex3f(*self._pt(sketch.plane, axis.p0[0], axis.p0[1]))
+        glVertex3f(*self._pt(sketch.plane, axis.p1[0], axis.p1[1]))
+        glEnd()
+        # Ghost the reflected geometry.
+        glColor4f(0.40, 0.85, 1.00, 0.45)
+        glLineWidth(1.4)
+        for si in tool._src_indices:
+            if si >= len(sketch.entities):
+                continue
+            copy = reflect_entity(sketch.entities[si], axis.p0, axis.p1)
+            if isinstance(copy, LineEntity):
+                glBegin(GL_LINES)
+                glVertex3f(*self._pt(sketch.plane, copy.p0[0], copy.p0[1]))
+                glVertex3f(*self._pt(sketch.plane, copy.p1[0], copy.p1[1]))
+                glEnd()
+            elif isinstance(copy, ArcEntity):
+                glBegin(GL_LINE_STRIP)
+                for p in copy.tessellate(48):
+                    glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
+                glEnd()
         glLineWidth(1.0)
 
     def _draw_arc_preview(self, sketch: SketchMode):

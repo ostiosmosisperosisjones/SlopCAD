@@ -25,6 +25,7 @@ from cad.sketch_tools.include   import IncludeTool
 from cad.sketch_tools.dimension import DimensionTool
 from cad.sketch_tools.geometric import GeometricConstraintTool
 from cad.sketch_tools.square  import SquareTool
+from cad.sketch_tools.mirror  import MirrorTool
 from cad.sketch_tools.snap    import SnapEngine, SnapResult, SnapType
 
 from cad.sketch import SketchTool
@@ -42,6 +43,7 @@ TOOLS: dict[SketchTool, type[BaseTool]] = {
     SketchTool.FILLET:    FilletTool,
     SketchTool.DIMENSION: DimensionTool,
     SketchTool.GEOMETRIC: GeometricConstraintTool,
+    SketchTool.MIRROR:    MirrorTool,
 }
 
 # IncludeTool is a one-shot action, not a persistent drawing tool.
