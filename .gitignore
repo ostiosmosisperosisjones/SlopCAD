@@ -7,3 +7,4 @@ AGENTS.md
 _tests/
 QWEN.md
 .qwen
+.claude/scheduled_tasks.lock
