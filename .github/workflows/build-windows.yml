@@ -5,9 +5,30 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag/name for the release (a tag is created if it doesn't exist)"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the release as a pre-release"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
+
+# Resolve the release tag once for all jobs:
+#   - tag push       → the pushed tag (e.g. v1.2.3)
+#   - manual dispatch → the tag you type, or an auto "build-<run#>-<sha>" so you
+#                       never have to bump/push a version just to cut a build.
+env:
+  RELEASE_TAG: >-
+    ${{ github.event_name == 'push'
+        && github.ref_name
+        || (inputs.release_tag != ''
+            && inputs.release_tag
+            || format('build-{0}-{1}', github.run_number, github.sha)) }}
 
 jobs:
 
@@ -37,6 +58,9 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
           files: dist/cadapp-windows.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -116,6 +140,9 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
           files: cadapp-linux.AppImage
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
