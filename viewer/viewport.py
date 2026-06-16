@@ -667,6 +667,79 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         n    = np.linalg.norm(d)
         return (near, d / n) if n > 1e-10 else (None, None)
 
+    def _edge_pick_mode_active(self) -> bool:
+        return bool(
+            getattr(self, '_extrude_pick_active', False) or
+            getattr(self, '_revolve_axis_active', False) or
+            getattr(self, '_fillet3d_pick_edge', False) or
+            getattr(self, '_chamfer_pick_edge', False))
+
+    def _face_pick_mode_active(self) -> bool:
+        thicken = getattr(self, '_thicken_panel', None)
+        return bool(
+            getattr(self, '_extrude_face_active', False) or
+            getattr(self, '_revolve_face_active', False) or
+            getattr(self, '_fillet3d_pick_face', False) or
+            getattr(self, '_chamfer_pick_face', False) or
+            getattr(self, '_offset_plane_face_active', False) or
+            (thicken is not None and getattr(thicken, '_picking_face', False)))
+
+    def _route_active_pick(self, e, hov_ebody, hov_eidx) -> bool:
+        """When an "Add Edge/Face" pick mode is active, route the click to the
+        owning op before passive hover/selection can swallow it. Returns True
+        if the click was consumed.
+
+        Priority: an active edge-pick consumes a hovered edge first; an active
+        face-pick then tries sketch-face, then body-face (ray pick). Each
+        route self-guards on its own mode flag, so only the active op consumes.
+        """
+        edge_active = self._edge_pick_mode_active()
+        face_active = self._face_pick_mode_active()
+        if not edge_active and not face_active:
+            return False
+
+        # Edge picks: honour the hovered body edge (skip sketch edges — those
+        # have their own dedicated routing in the main handler).
+        if edge_active and hov_ebody is not None:
+            from viewer.hover import parse_sketch_key
+            if parse_sketch_key(hov_ebody) is None:
+                if self.route_edge_pick_for_revolve(hov_eidx, hov_ebody):
+                    return True
+                if self.route_edge_pick_for_extrude(hov_eidx, hov_ebody):
+                    return True
+                if self.route_edge_pick_for_fillet3d(hov_eidx, hov_ebody):
+                    return True
+                if self.route_edge_pick_for_chamfer(hov_eidx, hov_ebody):
+                    return True
+
+        if face_active:
+            origin, direction = self.get_ray(e.position().x(), e.position().y())
+            if origin is None:
+                return False
+            # Sketch-face (loop) picks take precedence over body faces.
+            if self._sketch_faces:
+                hidx, fidx = self._pick_sketch_face(origin, direction)
+                if hidx is not None:
+                    if self.route_sketch_face_pick_for_extrude(hidx, fidx):
+                        self.update(); return True
+                    if self.route_sketch_face_pick_for_revolve(hidx, fidx):
+                        self.update(); return True
+            body_id, idx = self._pick_at(e.position())
+            if idx is not None:
+                if self.route_face_pick_for_fillet3d(body_id, idx):
+                    return True
+                if self.route_face_pick_for_chamfer(body_id, idx):
+                    return True
+                if self.route_face_pick_for_thicken(body_id, idx):
+                    return True
+                if self.route_face_pick_for_extrude(body_id, idx):
+                    return True
+                if self.route_face_pick_for_revolve(body_id, idx):
+                    return True
+                if self.route_face_pick_for_offset_plane(body_id, idx):
+                    return True
+        return False
+
     def _pick_at(self, pos):
         from cad.picker import pick_face
         origin, direction = self.get_ray(pos.x(), pos.y())
@@ -1598,6 +1671,15 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             hov_body,  hov_idx  = self._hovered_vertex
             hov_ebody, hov_eidx = self._hovered_edge
 
+            # While an op panel's "Add Face/Edge" pick mode is active, the pick
+            # must win over passive hover/selection — otherwise a body edge or
+            # vertex under the cursor (common while a preview overlaps the
+            # target, e.g. on re-entry) swallows the click and nothing gets
+            # added. _route_active_pick handles sketch-face, body-face, and
+            # body-edge picks for every op uniformly.
+            if self._route_active_pick(e, hov_ebody, hov_eidx):
+                return
+
             if hov_body is not None:
                 from viewer.hover import parse_sketch_vtx_key
                 is_sketch_vtx = parse_sketch_vtx_key(hov_body) is not None
@@ -1675,6 +1757,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                             self.update()
                             return
                         if self.route_sketch_face_pick_for_loft(hidx, fidx):
+                            self.update()
+                            return
+                        if self.route_sketch_face_pick_for_revolve(hidx, fidx):
                             self.update()
                             return
                         self._selected_sketch_entry = hidx

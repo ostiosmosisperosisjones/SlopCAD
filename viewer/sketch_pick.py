@@ -382,6 +382,8 @@ class SketchPickMixin:
         glEnable(GL_CULL_FACE)
         glEnable(GL_LIGHTING)
 
+        self._draw_extrude_arrow()
+
     def _extrude_preview_render_buffers(self, solids):
         """Return (tri_verts, edge_verts) flat float32 arrays for `solids`,
         rebuilding only when the solid list changes. Cached on the widget so
@@ -459,8 +461,6 @@ class SketchPickMixin:
         buf = (tris, edges)
         self._extrude_preview_buf = (solids, buf)
         return buf
-
-        self._draw_extrude_arrow()
 
     # ------------------------------------------------------------------
     # Screen-space snap radius

@@ -66,9 +66,42 @@ def _run_fillet(source_occ, unique_edges, radius: float):
         except Exception as ex:
             raise RuntimeError(f"Fillet: build failed — {ex}")
     if not nf.IsDone():
-        raise RuntimeError(f"Fillet failed — kernel returned: {nf.Error()}")
+        raise RuntimeError(f"Fillet failed — {_fillet_failure_reason(nf)}")
 
     return Compound(nf.Shape())
+
+
+def _fillet_failure_reason(nf) -> str:
+    """Human-readable reason a BRepFilletAPI_MakeFillet build didn't complete.
+
+    BRepFilletAPI_MakeFillet has no .Error() in this OCP build; query the real
+    status surface instead (contour stripe status + faulty vertices/contours).
+    A faulty vertex is the usual cause: the fillet runs into a high-valence
+    junction (e.g. a corner from a boolean union of many parts) and the kernel
+    can't resolve the rounded surface there — often only a smaller radius fits.
+    """
+    parts = []
+    try:
+        nfv = nf.NbFaultyVertices()
+        if nfv:
+            parts.append(f"{nfv} faulty vertex/vertices (corner too complex "
+                         f"for this radius — try a smaller radius)")
+    except Exception:
+        pass
+    try:
+        nfc = nf.NbFaultyContours()
+        if nfc:
+            parts.append(f"{nfc} faulty contour(s)")
+    except Exception:
+        pass
+    try:
+        for i in range(1, nf.NbContours() + 1):
+            st = nf.StripeStatus(i)
+            if "Ok" not in str(st):
+                parts.append(f"contour {i}: {st}")
+    except Exception:
+        pass
+    return "; ".join(parts) if parts else "kernel could not build the fillet"
 
 
 def fillet_edges(shape, face_indices: list, edge_occs: list, radius: float):

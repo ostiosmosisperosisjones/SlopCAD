@@ -55,6 +55,7 @@ class RevolveMixin:
 
         panel.revolve_requested.connect(self._on_revolve_panel_ok)
         panel.cancelled.connect(self._close_revolve_panel)
+        panel.face_entry_removed.connect(self._on_revolve_face_removed)
         panel.picking_axis_changed.connect(self._on_revolve_pick_axis)
         panel.picking_face_changed.connect(self._on_revolve_pick_face)
         panel.picking_body_changed.connect(self._on_revolve_pick_body)
@@ -574,6 +575,62 @@ class RevolveMixin:
         self._revolve_face_pairs.append((body_id, face_idx))
         return True
 
+    def _on_revolve_face_removed(self, index: int):
+        """Remove a profile entry from the revolve panel's face list."""
+        sketch_idx = getattr(self, '_revolve_sketch_idx', None)
+        panel = getattr(self, '_revolve_panel', None)
+        if sketch_idx is not None:
+            # Sketch-loop mode: drop the loop at this list index.
+            faces = list(self._selected_sketch_face or [])
+            if 0 <= index < len(faces):
+                faces.pop(index)
+            self._selected_sketch_face = faces if faces else None
+            if panel is not None:
+                panel._emit_preview()
+            return
+        pairs = getattr(self, '_revolve_face_pairs', [])
+        if 0 <= index < len(pairs):
+            self._revolve_face_pairs = [p for i, p in enumerate(pairs)
+                                        if i != index]
+        if panel is not None:
+            panel._emit_preview()
+
+    def route_sketch_face_pick_for_revolve(self, sketch_idx: int,
+                                           face_idx: int) -> bool:
+        """Route a sketch-face (loop) click to the revolve panel while the
+        '+ Add Face' pick mode is active.  Toggles individual loops in
+        _selected_sketch_face so the user can build the profile from one or
+        more loops of a single sketch."""
+        if not getattr(self, '_revolve_face_active', False):
+            return False
+        panel = getattr(self, '_revolve_panel', None)
+        if panel is None:
+            return False
+
+        current_indices = list(self._selected_sketch_face or []) \
+            if getattr(self, '_revolve_sketch_idx', None) == sketch_idx else []
+
+        # Toggle: clicking an already-selected loop removes it.
+        if face_idx in current_indices:
+            current_indices.remove(face_idx)
+        else:
+            current_indices.append(face_idx)
+
+        self._revolve_sketch_idx    = sketch_idx
+        self._revolve_face_pairs    = []
+        self._selected_sketch_entry = sketch_idx
+        self._selected_sketch_face  = current_indices if current_indices else None
+
+        panel.clear_face_entries()
+        if current_indices:
+            for i in current_indices:
+                panel.add_face_entry(None, None,
+                                     f"Sketch {sketch_idx}  ·  face {i}")
+        else:
+            panel.add_face_entry(None, None, f"Sketch {sketch_idx}")
+        panel._emit_preview()
+        return True
+
     def route_body_pick_for_revolve(self, body_id: str) -> bool:
         if not getattr(self, '_revolve_body_active', False):
             return False
@@ -725,10 +782,11 @@ class RevolveMixin:
             print("[Revolve cut] Sketch has no faces."); return
         fidx_sel = self._selected_sketch_face
         if fidx_sel is not None:
-            tool_faces = [all_sketch[i][0] for i in fidx_sel
-                          if 0 <= i < len(all_sketch)]
+            cut_face_indices = [i for i in fidx_sel
+                                if 0 <= i < len(all_sketch)]
         else:
-            tool_faces = [f[0] for f in all_sketch]
+            cut_face_indices = list(range(len(all_sketch)))
+        tool_faces = [all_sketch[i][0] for i in cut_face_indices]
         if not tool_faces:
             print("[Revolve cut] No tool faces."); return
 
@@ -760,6 +818,7 @@ class RevolveMixin:
                 angle_deg        = angle_deg,
                 axis_point       = list(axis_pt),
                 axis_dir         = list(axis_d),
+                face_indices     = cut_face_indices,
             )
 
         fan_out_cut(self, tool_solid, build_op, None, op_label="Revolve cut")

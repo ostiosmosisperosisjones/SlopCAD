@@ -927,11 +927,13 @@ class ExtrudeMixin:
             all_sketch = self._sketch_faces.get(sketch_idx, [])
             fidx_sel = self._selected_sketch_face
             if fidx_sel is not None:
-                tool_faces = [all_sketch[i][0] for i in fidx_sel
-                              if 0 <= i < len(all_sketch)]
+                cut_face_indices = [i for i in fidx_sel
+                                    if 0 <= i < len(all_sketch)]
             else:
-                tool_faces = [f[0] for f in all_sketch]
+                cut_face_indices = list(range(len(all_sketch)))
+            tool_faces = [all_sketch[i][0] for i in cut_face_indices]
         else:
+            cut_face_indices = None
             src_body_id = body_id
             src_shape = self.workspace.current_shape(body_id)
             if src_shape is None or face_idx is None:
@@ -990,6 +992,7 @@ class ExtrudeMixin:
                 start_offset     = start_off,
                 end_offset       = end_off,
                 draft_angle      = draft_angle,
+                face_indices     = cut_face_indices,
             )
 
         fan_out_cut(self, tool_solid, build_op, extra, op_label="Cut")
