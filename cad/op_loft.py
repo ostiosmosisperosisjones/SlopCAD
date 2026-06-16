@@ -204,6 +204,26 @@ class SketchLoftOp(Op):
         solids = list(loft_solid.solids())
         if not solids:
             raise RuntimeError("SketchLoftOp: result contains no solids")
+
+        # entry_index can point past the end when an op is executed outside a
+        # pushed history slot (e.g. preview/tests); guard the lookup.
+        entry = (history._entries[entry_index]
+                 if 0 <= entry_index < len(history._entries) else None)
+        child_body_ids = entry.params.get("child_body_ids", []) if entry else []
+        # force_new_body split mirror — see SketchExtrudeOp.execute. Assign each
+        # loft lump to its child body by SolidRef so the mapping survives reload.
+        if self.force_new_body and child_body_ids:
+            from cad.solid_ref import assign_solids_to_children, solid_refs_from_dicts
+            refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
+            assigned = assign_solids_to_children(
+                loft_solid, child_body_ids, refs, history._workspace,
+                history, entry_index)
+            if assigned[0] is None:
+                raise RuntimeError(
+                    "SketchLoftOp: could not assign a solid to the primary "
+                    "child body")
+            return assigned[0]
+
         return solids[0]
 
     # ------------------------------------------------------------------
@@ -325,10 +345,12 @@ class SketchLoftOp(Op):
                 se = viewport.history.entries[first_idx].params.get("sketch_entry")
                 if se is not None and se.body_id and se.body_id in ws.bodies:
                     base_name = ws.bodies[se.body_id].name
+            from cad.solid_ref import solid_refs_to_dicts
             solids = list(shape_after.solids())
             if not solids:
                 raise RuntimeError("Loft produced no solids.")
             op_params["child_body_ids"] = []
+            op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
             new_bodies = []
             for i, solid in enumerate(solids):
                 new_name = _next_split_name(base_name, ws)

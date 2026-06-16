@@ -233,12 +233,11 @@ class FaceRevolveOp(Op):
         entry = history._entries[entry_index]
         child_body_ids = entry.params.get("child_body_ids", [])
         if child_body_ids and history._workspace is not None:
-            solids = list(result.solids())
-            for i, bid in enumerate(child_body_ids):
-                body = history._workspace.bodies.get(bid)
-                if body is not None:
-                    body.source_shape = (Compound(solids[i].wrapped)
-                                         if i < len(solids) else None)
+            from cad.solid_ref import (assign_solids_to_children,
+                                       solid_refs_from_dicts)
+            refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
+            assign_solids_to_children(result, child_body_ids, refs,
+                                      history._workspace, history, entry_index)
         return shape
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
@@ -309,6 +308,7 @@ class FaceRevolveOp(Op):
                 viewport.history_changed.emit()
                 return
 
+            from cad.solid_ref import solid_refs_to_dicts
             solids = list(shape_after.solids())
             new_bodies = []
             for solid in solids:
@@ -317,6 +317,8 @@ class FaceRevolveOp(Op):
                     new_name, Compound(solid.wrapped))
                 new_bodies.append(new_body)
             op_params["child_body_ids"] = [b.id for b in new_bodies]
+            # Per-child geometric fingerprint, aligned with child_body_ids.
+            op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
 
             tag_body = new_bodies[0] if new_bodies else None
             tag_id   = tag_body.id if tag_body else body_id
@@ -474,10 +476,12 @@ class SketchRevolveOp(Op):
                 f"SketchRevolveOp: no sketch_entry at id '{self.from_sketch_id}'")
 
         if se.plane_source is not None:
-            from cad.history import _replay_sketch_entry
-            # Reproject at this op's position (not the sketch's) so the
-            # sketch follows intervening ops on its parent body.
-            ok, err = _replay_sketch_entry(se, history, before_index=entry_index)
+            from cad.history import reproject_consumed_sketch
+            # Reproject at this op's position (not the sketch's) so the sketch
+            # follows intervening ops on its parent body; fall back to the
+            # authored plane if the anchor face was destroyed.
+            ok, err = reproject_consumed_sketch(se, history, entry_index,
+                                                sketch_entry_rec)
             if not ok:
                 raise RuntimeError(
                     f"SketchRevolveOp: sketch reprojection failed: {err}")
@@ -521,12 +525,32 @@ class SketchRevolveOp(Op):
         for face in faces:
             result = revolve_face_direct(result, face, axis_pt, axis_dir, self.angle_deg)
 
+        entry = history._entries[entry_index]
+        child_body_ids = entry.params.get("child_body_ids", [])
+
+        # force_new_body split mirror — see SketchExtrudeOp.execute. Without it
+        # reload leaves non-primary children shapeless; SolidRef keeps the
+        # child→segment mapping stable across OCCT solid-ordering churn.
+        if self.force_new_body and child_body_ids:
+            from cad.solid_ref import assign_solids_to_children, solid_refs_from_dicts
+            if not list(result.solids()):
+                raise RuntimeError("SketchRevolveOp: result contains no solids")
+            refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
+            assigned = assign_solids_to_children(
+                result, child_body_ids, refs, history._workspace,
+                history, entry_index)
+            if assigned[0] is None:
+                raise RuntimeError(
+                    "SketchRevolveOp: could not assign a solid to the primary "
+                    "child body")
+            return assigned[0]
+
         solids = list(result.solids())
         solids.sort(key=lambda s: s.volume, reverse=True)
         if not solids:
             raise RuntimeError("SketchRevolveOp: result contains no solids")
 
-        this_id = history._entries[entry_index].entry_id
+        this_id = entry.entry_id
         for j in range(entry_index + 1, len(history._entries)):
             e = history._entries[j]
             if (e.operation == "import" and
@@ -643,9 +667,11 @@ class SketchRevolveOp(Op):
             if force_new:
                 from viewer.vp_extrude import _strip_split_suffix, _next_split_name
                 from cad.units import format_op_label as _lbl
+                from cad.solid_ref import solid_refs_to_dicts
                 root_name = _strip_split_suffix(viewport.workspace.bodies[body_id].name)
                 solids    = list(shape_after.solids())
                 op_params["child_body_ids"] = []
+                op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
                 new_bodies = []
                 for solid in solids:
                     new_name = _next_split_name(root_name, viewport.workspace)
@@ -791,10 +817,13 @@ class CrossBodyRevolveCutOp(Op):
                 f"CrossBodyRevolveCutOp: no sketch_entry at id '{self.source_sketch_id}'")
 
         # Reproject the sketch's plane at *this* op's history position so
-        # intervening edits on the parent face move the profile with it.
+        # intervening edits on the parent face move the profile with it; fall
+        # back to the sketch's authored plane if an intervening op destroyed the
+        # anchor face (see reproject_consumed_sketch).
         if se.plane_source is not None:
-            from cad.history import _replay_sketch_entry
-            ok, err = _replay_sketch_entry(se, history, before_index=entry_index)
+            from cad.history import reproject_consumed_sketch
+            ok, err = reproject_consumed_sketch(se, history, entry_index,
+                                                sketch_rec)
             if not ok:
                 raise RuntimeError(
                     f"CrossBodyRevolveCutOp: sketch reprojection failed: {err}")
@@ -884,9 +913,14 @@ class CrossBodyRevolveCutOp(Op):
         if not all_sketch:
             raise RuntimeError("[Revolve cut] Sketch has no faces.")
 
-        fidx = viewport._selected_sketch_face
-        if fidx is not None:
-            face_indices = [i for i in fidx if 0 <= i < len(all_sketch)]
+        # Prefer indices already baked into the op (fan-out / replay) over the
+        # mutable viewport selection, which the first finalize clears.
+        if self.face_indices is not None:
+            face_indices = [i for i in self.face_indices
+                            if 0 <= i < len(all_sketch)]
+        elif viewport._selected_sketch_face is not None:
+            face_indices = [i for i in viewport._selected_sketch_face
+                            if 0 <= i < len(all_sketch)]
         else:
             face_indices = list(range(len(all_sketch)))
         faces = [all_sketch[i][0] for i in face_indices]

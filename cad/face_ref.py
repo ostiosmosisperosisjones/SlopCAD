@@ -252,6 +252,54 @@ class FaceRef:
 
         return best_idx, best_face
 
+    def explain_no_match(self, shape,
+                         normal_tol: float = 0.001,
+                         perp_tol:   float = 0.1,
+                         area_frac:  float = 0.5) -> str:
+        """Human-readable reason find_in() returned nothing — what was sought
+        and the closest candidate, with the filter that rejected it.
+
+        Used to turn an opaque "could not relocate face" into an actionable
+        line.  Pure diagnostics: never raises, never affects matching.
+        """
+        ref_normal = np.array(self.normal)
+        ref_perp   = np.array(self.centroid_perp)
+        area_cap   = max(self.area * area_frac, 0.5)
+
+        want = (f"sought face normal={tuple(round(c, 3) for c in self.normal)} "
+                f"area={self.area:.3f} perp={tuple(round(c, 3) for c in self.centroid_perp)}")
+
+        # Rank candidates by how far each got through the filter chain (higher
+        # stage = more relevant), then by perp distance — so the reported face
+        # is the one that nearly matched, not just any perp-close side face.
+        best = None  # (stage, perp_dist, reason)
+        for idx, face in enumerate(shape.faces()):
+            n = _occ_face_normal(face.wrapped)
+            if n is None:
+                continue
+            dot = float(np.dot(n, ref_normal))
+            centroid, area = _occ_face_props(face.wrapped)
+            along = float(np.dot(centroid, n))
+            perp  = centroid - along * n
+            perp_dist = float(np.linalg.norm(perp - ref_perp))
+
+            if abs(abs(dot) - 1.0) > normal_tol:
+                stage, reason = 0, f"normal off by {abs(abs(dot) - 1.0):.4f} (tol {normal_tol})"
+            elif abs(area - self.area) > area_cap:
+                stage, reason = 1, (f"area {area:.3f} vs {self.area:.3f}, "
+                                    f"drift {abs(area - self.area):.3f} > cap {area_cap:.3f}")
+            elif perp_dist > perp_tol:
+                stage, reason = 2, f"perp-centroid off by {perp_dist:.3f}mm (tol {perp_tol})"
+            else:
+                stage, reason = 3, "passed all filters (unexpected)"
+            key = (stage, -perp_dist)  # prefer higher stage, then smaller perp
+            if best is None or key > (best[0], -best[1]):
+                best = (stage, perp_dist, f"face {idx}: {reason}")
+
+        if best is None:
+            return f"{want}; shape has no planar faces to match against"
+        return f"{want}; nearest candidate {best[2]}"
+
     # ----------------------------------------------------------------
     # Prediction helpers
     # ----------------------------------------------------------------

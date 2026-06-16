@@ -213,11 +213,11 @@ class FaceExtrudeOp(Op):
             entry = history._entries[entry_index]
             child_body_ids = entry.params.get("child_body_ids", [])
             if child_body_ids and history._workspace is not None:
-                solids = list(result.solids())
-                for i, bid in enumerate(child_body_ids):
-                    body = history._workspace.bodies.get(bid)
-                    if body is not None:
-                        body.source_shape = Compound(solids[i].wrapped) if i < len(solids) else None
+                from cad.solid_ref import (assign_solids_to_children,
+                                           solid_refs_from_dicts)
+                refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
+                assign_solids_to_children(result, child_body_ids, refs,
+                                          history._workspace, history, entry_index)
             return shape  # source body (shape) is unchanged
 
         current = shape
@@ -371,9 +371,13 @@ class FaceExtrudeOp(Op):
                 from viewer.vp_extrude import _strip_split_suffix, _next_split_name
                 from cad.units import format_op_label as _lbl
                 label     = _lbl(op_str, op_params)
+                from cad.solid_ref import solid_refs_to_dicts
                 root_name = _strip_split_suffix(viewport.workspace.bodies[body_id].name)
                 solids    = list(shape_after.solids())
                 op_params["child_body_ids"] = []
+                # Per-child geometric fingerprint so replay re-locates each
+                # segment by shape, not by OCCT solid-iteration index.
+                op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
                 new_bodies = []
                 for i, solid in enumerate(solids):
                     new_name = _next_split_name(root_name, viewport.workspace)
@@ -633,9 +637,9 @@ class CrossBodyCutOp(Op):
             # tool solid lands at the sketch's original plane, producing
             # garbage cuts (or wholesale deletion of the target).
             if sketch_entry.plane_source is not None:
-                from cad.history import _replay_sketch_entry
-                ok, err = _replay_sketch_entry(sketch_entry, history,
-                                               before_index=entry_index)
+                from cad.history import reproject_consumed_sketch
+                ok, err = reproject_consumed_sketch(sketch_entry, history,
+                                                    entry_index, sketch_rec)
                 if not ok:
                     raise RuntimeError(
                         f"CrossBodyCutOp: sketch reprojection failed: {err}")
@@ -978,16 +982,18 @@ class SketchExtrudeOp(Op):
                 f"SketchExtrudeOp: no sketch_entry at id '{self.from_sketch_id}'")
 
         if se.plane_source is not None:
-            from cad.history import _replay_sketch_entry
+            from cad.history import reproject_consumed_sketch
             # Reproject at *this* op's history position so the sketch's plane
             # follows any intervening operations on its parent body.  Using
             # sketch_idx would freeze the plane at the sketch's creation time
             # and produce wrong geometry when something moved the parent face
-            # between the sketch and this extrude.
-            ok, err = _replay_sketch_entry(se, history, before_index=entry_index)
+            # between the sketch and this extrude.  Falls back to the authored
+            # plane if an intervening op destroyed the anchor face.
+            ok, err = reproject_consumed_sketch(se, history, entry_index,
+                                                sketch_entry_rec)
             if not ok:
-                # Reprojection failed — the sketch's cached UV points and plane
-                # are stale.  Fail loudly instead of extruding against them.
+                # No trustworthy plane (sketch entry itself errored) — fail
+                # loudly instead of extruding against stale geometry.
                 raise RuntimeError(
                     f"SketchExtrudeOp: sketch reprojection failed: {err}")
 
@@ -1040,12 +1046,36 @@ class SketchExtrudeOp(Op):
                                          end_offset=self.end_offset,
                                          draft_angle=self.draft_angle)
 
+        entry = history._entries[entry_index]
+        child_body_ids = entry.params.get("child_body_ids", [])
+
+        # force_new_body split: each disjoint profile becomes its own child
+        # body. The commit path (finalize() in _split_commit) creates those
+        # bodies; this branch is its replay mirror — without it, reload leaves
+        # the non-primary children with no shape. Assign by SolidRef so each
+        # child gets *its* segment regardless of OCCT solid-iteration order
+        # (positional index is not reproducible across rebuilds). The parent
+        # entry is tagged to the primary child, so we return that child's solid.
+        if self.force_new_body and child_body_ids:
+            from cad.solid_ref import assign_solids_to_children, solid_refs_from_dicts
+            if not list(result.solids()):
+                raise RuntimeError("SketchExtrudeOp: result contains no solids")
+            refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
+            assigned = assign_solids_to_children(
+                result, child_body_ids, refs, history._workspace,
+                history, entry_index)
+            if assigned[0] is None:
+                raise RuntimeError(
+                    "SketchExtrudeOp: could not assign a solid to the primary "
+                    "child body")
+            return assigned[0]
+
         solids = list(result.solids())
         solids.sort(key=lambda s: s.volume, reverse=True)
         if not solids:
             raise RuntimeError("SketchExtrudeOp: result contains no solids")
 
-        this_id = history._entries[entry_index].entry_id
+        this_id = entry.entry_id
         for j in range(entry_index + 1, len(history._entries)):
             e = history._entries[j]
             if (e.operation == "import" and
@@ -1184,9 +1214,14 @@ class SketchExtrudeOp(Op):
             if force_new:
                 from viewer.vp_extrude import _strip_split_suffix, _next_split_name
                 from cad.units import format_op_label as _lbl
+                from cad.solid_ref import solid_refs_to_dicts
                 root_name  = _strip_split_suffix(viewport.workspace.bodies[body_id].name)
                 solids     = list(shape_after.solids())
                 op_params["child_body_ids"] = []
+                # Geometric fingerprint per child, aligned with child_body_ids,
+                # so replay re-locates each segment by shape instead of by
+                # OCCT's (non-reproducible) solid-iteration index.
+                op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
                 new_bodies = []
                 for i, solid in enumerate(solids):
                     new_name = _next_split_name(root_name, viewport.workspace)

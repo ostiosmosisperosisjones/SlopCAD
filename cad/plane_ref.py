@@ -59,8 +59,15 @@ class FacePlaneSource(SketchPlaneSource):
                 f"before history index {before_index}")
         face_idx, face = self.face_ref.find_in(shape)
         if face is None:
+            detail = ""
+            if self.face_ref is not None:
+                try:
+                    detail = " — " + self.face_ref.explain_no_match(shape)
+                except Exception:
+                    pass
             raise RuntimeError(
-                f"FacePlaneSource: could not relocate face in body '{self.body_id}'")
+                f"FacePlaneSource: could not relocate face in body "
+                f"'{self.body_id}'{detail}")
         return Plane(face)   # face is a build123d Face object
 
     def to_dict(self) -> dict:

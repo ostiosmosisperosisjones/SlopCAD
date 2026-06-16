@@ -390,9 +390,22 @@ class History:
                 entry.label         = _make_label(entry.operation, entry.params)
                 mutated_bodies.add(bid)
 
+                # Split ops produce extra child bodies whose geometry the op
+                # wrote onto body.source_shape (the parent entry is tagged only
+                # to the primary child). Seed those into the replay state at
+                # this position so downstream ops targeting a non-primary child
+                # find an input shape — without this they'd see None and error
+                # with "no input shape".
                 child_body_ids = entry.params.get("child_body_ids", [])
                 for cbid in child_body_ids:
                     mutated_bodies.add(cbid)
+                    if cbid == bid:
+                        continue  # primary child already seeded via new_shape
+                    body = (self._workspace.bodies.get(cbid)
+                            if self._workspace is not None else None)
+                    if body is not None and body.source_shape is not None:
+                        current_shapes[cbid] = body.source_shape
+                        shape_cache[cbid]    = (i, body.source_shape)
 
         finally:
             self._replay_shape_cache = None
@@ -528,6 +541,49 @@ def _replay_sketch_entry(se, history: History, before_index: int
 
     return True, ""
 
+
+def reproject_consumed_sketch(se, history: History, before_index: int,
+                              sketch_entry_rec) -> tuple[bool, str]:
+    """Reproject a sketch's plane for an op that *consumes* it (a cut/revolve
+    cut/extrude driven by from_sketch_id / source_sketch_id).
+
+    Reprojecting at the consuming op's position lets the profile follow a parent
+    face that intervening ops moved — the intended behavior.  But when an
+    intervening op *destroys* the anchor face (e.g. a self-cut splits the face
+    the sketch sat on), reprojection at that later position can no longer locate
+    it, even though the sketch's plane is perfectly well-defined at the position
+    where it was authored.
+
+    Rule:
+      1. Try reprojection at before_index (follow the moving face).
+      2. If that fails, retry at the sketch's *own* creation position.  Success
+         there means the plane is genuinely well-defined and only the later
+         anchor-face destruction broke step 1 — use that (now-baked) plane.
+      3. If even the sketch's own position can't resolve the plane, it's truly
+         unresolvable — fail.
+
+    Retrying at the sketch's own index is self-validating: it doesn't trust a
+    stale `error` flag (a never-replayed sketch reports error=False) but instead
+    re-derives the plane from scratch, so an unresolvable plane stays fatal.
+
+    Returns (ok, err).
+    """
+    ok, err = _replay_sketch_entry(se, history, before_index)
+    if ok:
+        return True, ""
+
+    sketch_idx = None
+    if sketch_entry_rec is not None:
+        sketch_idx = history.id_to_index(sketch_entry_rec.entry_id)
+    if sketch_idx is not None:
+        ok2, _ = _replay_sketch_entry(se, history, sketch_idx)
+        if ok2:
+            # Plane is valid at authoring time; the consumer-position failure
+            # was an intervening op destroying the anchor face. Use the plane
+            # just baked at the sketch's own position.
+            return True, ""
+
+    return False, err
 
 
 def _null_split_dependents(entries: list, parent_idx: int) -> None:
