@@ -13,12 +13,14 @@ from __future__ import annotations
 from PyQt6.QtCore import pyqtSlot, QMetaObject, Qt, Q_ARG
 
 
-def _fillet_cache_key(shape, face_indices, edge_occs, radius):
-    """Identity for a fillet computation: shape + faces + edges + radius.
+def _fillet_cache_key(shape, face_indices, edge_occs, radius, edge_radii=None):
+    """Identity for a fillet computation: shape + faces + edges + radius +
+    per-edge radii.
 
     Edges are keyed by their rounded midpoint (stable across the resolve done
     in preview vs commit, which may produce different TopoDS_Edge wrappers for
-    the same geometric edge)."""
+    the same geometric edge). Per-edge radii are folded in so a row-radius
+    change invalidates a cached solid even when the global radius is unchanged."""
     from OCP.BRepAdaptor import BRepAdaptor_Curve
     mids = []
     for e in edge_occs:
@@ -28,11 +30,20 @@ def _fillet_cache_key(shape, face_indices, edge_occs, radius):
             mids.append((round(p.X(), 3), round(p.Y(), 3), round(p.Z(), 3)))
         except Exception:
             mids.append(None)
+
+    def _norm(r):
+        if r is None:
+            return None
+        if isinstance(r, (list, tuple)):
+            return tuple(round(float(x), 6) for x in r)
+        return round(float(r), 6)
+
     return (
         hash(shape.wrapped) if hasattr(shape, "wrapped") else hash(shape),
         tuple(sorted(face_indices)),
         tuple(sorted(m for m in mids if m is not None)),
         round(float(radius), 6),
+        tuple(_norm(r) for r in (edge_radii or [])),
     )
 
 
@@ -117,6 +128,7 @@ class Fillet3DMixin:
         panel.confirmed.connect(self._on_fillet3d_ok)
         panel.cancelled.connect(self._close_fillet3d_panel)
         panel.preview_changed.connect(self._update_fillet3d_preview)
+        panel.fit_requested.connect(self._on_fillet3d_fit_largest)
         panel.face_entry_removed.connect(self._on_fillet3d_face_removed)
         panel.edge_entry_removed.connect(self._on_fillet3d_edge_removed)
         panel.picking_face_changed.connect(self._on_fillet3d_pick_face)
@@ -267,7 +279,7 @@ class Fillet3DMixin:
     # Preview
     # ------------------------------------------------------------------
 
-    def _update_fillet3d_preview(self, radius: float):
+    def _update_fillet3d_preview(self, radius: float, edge_radii: list = None):
         body_id      = getattr(self, '_fillet3d_body_id', None)
         face_indices = getattr(self, '_fillet3d_face_indices', [])
         edge_indices = getattr(self, '_fillet3d_edge_indices', [])
@@ -282,15 +294,19 @@ class Fillet3DMixin:
             self.update()
             return
 
-        # Resolve TopoDS_Edge objects for direct edge picks (main-thread safe)
-        edge_occs = []
+        # Resolve TopoDS_Edge objects for direct edge picks (main-thread safe).
+        # Keep the per-edge radius override aligned with the resolved edges.
+        edge_radii = edge_radii or []
+        edge_occs, occ_radii = [], []
         live_mesh = self._meshes.get(body_id)
         if live_mesh is not None:
-            for ei in edge_indices:
+            for pos, ei in enumerate(edge_indices):
                 if ei < len(live_mesh.topo_edges_occ):
                     edge_occs.append(live_mesh.topo_edges_occ[ei])
+                    occ_radii.append(edge_radii[pos]
+                                     if pos < len(edge_radii) else None)
 
-        params = (list(face_indices), edge_occs, radius)
+        params = (list(face_indices), edge_occs, radius, occ_radii)
 
         if getattr(self, '_fillet3d_computing', False):
             # A thread is already running — stash latest params, it will re-fire
@@ -299,29 +315,42 @@ class Fillet3DMixin:
 
         self._fillet3d_computing = True
         self._fillet3d_pending   = None
+        pc = getattr(self, 'progress', None)
+        if pc is not None:
+            pc.begin("Fillet", modal=False, cancelable=False)
+            pc.phase("previewing…")
         self._launch_fillet3d_thread(shape, params)
 
     def _launch_fillet3d_thread(self, shape, params):
         import threading
-        from cad.operations.fillet import fillet_preview
+        from cad.operations.fillet_proc import (fillet_edges_isolated,
+                                                FilletTimeout)
 
-        face_indices, edge_occs, radius = params
+        face_indices, edge_occs, radius, edge_radii = params
         token = object()
         self._fillet3d_preview_token = token
-        key = _fillet_cache_key(shape, face_indices, edge_occs, radius)
+        key = _fillet_cache_key(shape, face_indices, edge_occs, radius,
+                                edge_radii)
 
         def _compute():
             try:
-                result = fillet_preview(shape, face_indices, edge_occs, radius)
+                # ONE bounded, killable attempt at exactly the requested radius.
+                # Preview must stay light: it fires on every value change, so it
+                # cannot run the multi-attempt auto-fit search (that spawned a
+                # pile of child processes per keystroke and leaked semaphores /
+                # locked the app). Not buildable → blank preview, no search.
+                result = fillet_edges_isolated(
+                    shape, face_indices, edge_occs, radius,
+                    timeout_s=12.0, edge_radii=edge_radii)
                 from viewer.mesh import Mesh
                 preview_mesh = Mesh(result)
-            except Exception:
+            except (FilletTimeout, Exception):
                 result = None
                 preview_mesh = None
-            # Stash the commit-quality solid so commit can reuse it instead of
-            # recomputing — an edge fillet on a long BSpline edge costs ~75s in
-            # the kernel, and the preview already paid that exact cost.
-            self._fillet3d_result_cache = (key, result) if result is not None else None
+            # Stash the commit-quality solid so commit can reuse it — this is the
+            # exact requested radius, so it's always safe for commit to reuse.
+            self._fillet3d_result_cache = (
+                (key, result, True) if result is not None else None)
             QMetaObject.invokeMethod(
                 self, "_fillet3d_preview_done",
                 Qt.ConnectionType.QueuedConnection,
@@ -330,6 +359,89 @@ class Fillet3DMixin:
             )
 
         threading.Thread(target=_compute, daemon=True).start()
+
+    def _on_fillet3d_fit_largest(self):
+        """User clicked 'Fit largest': binary-search (off the UI thread) for the
+        largest buildable radius and set the spinbox to it.
+
+        The search range is anchored to the *geometry* (edge length), not the
+        current spinbox value, so repeated clicks converge to the same answer
+        instead of ratcheting downward. A re-entrancy guard drops clicks while a
+        search is already running so overlapping runs can't conflict."""
+        import threading
+        from cad.operations.fillet_proc import (fillet_edges_find_max,
+                                                FilletTimeout)
+        if getattr(self, '_fillet3d_fitting', False):
+            return   # a fit is already running — ignore the extra click
+        body_id      = getattr(self, '_fillet3d_body_id', None)
+        face_indices = getattr(self, '_fillet3d_face_indices', [])
+        edge_indices = getattr(self, '_fillet3d_edge_indices', [])
+        panel        = getattr(self, '_fillet3d_panel', None)
+        if body_id is None or panel is None:
+            return
+        shape = self.workspace.current_shape(body_id)
+        if shape is None:
+            return
+
+        edge_occs = []
+        live_mesh = self._meshes.get(body_id)
+        if live_mesh is not None:
+            for ei in edge_indices:
+                if ei < len(live_mesh.topo_edges_occ):
+                    edge_occs.append(live_mesh.topo_edges_occ[ei])
+
+        self._fillet3d_fitting = True
+        pc = getattr(self, 'progress', None)
+        if pc is not None:
+            pc.begin("Fit fillet", cancelable=True)
+        else:
+            self._async_set_busy(True, "Fit fillet")
+
+        # Format the probed radius in the user's active unit for the status line.
+        from cad.prefs import prefs
+        unit = getattr(getattr(panel, '_spinbox', None), '_unit', None) \
+            or prefs.default_unit
+
+        def _progress(text, i=None, n=None, value_mm=None):
+            if pc is None:
+                return
+            if value_mm is not None:
+                from cad.units import format_value
+                text = f"{text} {format_value(value_mm, unit)}"
+            pc.report(text, i, n)
+
+        def _work():
+            try:
+                # ceiling=None → geometry-derived, independent of the spinbox.
+                _result, applied = fillet_edges_find_max(
+                    shape, list(face_indices), edge_occs, ceiling=None,
+                    progress=(_progress if pc is not None else None),
+                    should_cancel=(pc.is_canceled if pc is not None else None))
+            except (FilletTimeout, Exception):
+                applied = None
+            QMetaObject.invokeMethod(
+                self, "_fillet3d_fit_done",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG(object, applied))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    @pyqtSlot(object)
+    def _fillet3d_fit_done(self, applied):
+        self._fillet3d_fitting = False
+        pc = getattr(self, 'progress', None)
+        if pc is not None:
+            pc.end()
+        else:
+            self._async_set_busy(False)
+        panel = getattr(self, '_fillet3d_panel', None)
+        if panel is None:
+            return
+        # Apply the largest buildable radius into the field (set_max_hint sets
+        # the spinbox + re-previews), so it's always recoverable by clicking Fit
+        # largest again. Borderline geometry can still fail on commit; commit
+        # surfaces that as a red entry rather than silently substituting.
+        panel.set_max_hint(float(applied) if applied and applied > 0 else None)
 
     @pyqtSlot(object, object)
     def _fillet3d_preview_done(self, token, preview_mesh):
@@ -343,6 +455,11 @@ class Fillet3DMixin:
             except Exception:
                 preview_mesh = None
         self._fillet3d_preview_mesh = preview_mesh
+        # Tell the panel whether this radius built, so it can show a
+        # "not buildable — try Fit largest" hint without running any search.
+        panel = getattr(self, '_fillet3d_panel', None)
+        if panel is not None:
+            panel.set_buildable(preview_mesh is not None)
         self._update_fillet3d_arrow()
         self.update()
 
@@ -354,6 +471,10 @@ class Fillet3DMixin:
             if shape is not None:
                 self._fillet3d_computing = True
                 self._launch_fillet3d_thread(shape, pending)
+                return
+        pc = getattr(self, 'progress', None)
+        if pc is not None:
+            pc.end()
 
     def _update_fillet3d_arrow(self):
         """Derive base + direction from selection; then position tip at current radius."""
@@ -433,12 +554,13 @@ class Fillet3DMixin:
     # Commit
     # ------------------------------------------------------------------
 
-    @pyqtSlot(float)
-    def _on_fillet3d_ok(self, radius: float):
+    @pyqtSlot(float, list)
+    def _on_fillet3d_ok(self, radius: float, edge_radii: list = None):
         body_id      = getattr(self, '_fillet3d_body_id', None)
         face_indices = getattr(self, '_fillet3d_face_indices', [])
         edge_indices = getattr(self, '_fillet3d_edge_indices', [])
         editing_idx  = getattr(self, '_editing_fillet3d_idx', None)
+        edge_radii   = list(edge_radii) if edge_radii else []
 
         if editing_idx is not None:
             self._editing_fillet3d_idx = None
@@ -450,12 +572,14 @@ class Fillet3DMixin:
         from cad.op_types import FaceFilletOp
         if editing_idx is not None:
             self._editing_fillet3d_idx = editing_idx
-            self._commit_fillet3d_edit(body_id, face_indices, edge_indices, radius)
+            self._commit_fillet3d_edit(body_id, face_indices, edge_indices,
+                                       radius, edge_radii)
             return
         FaceFilletOp(source_body_id=body_id,
                      face_indices=face_indices,
                      edge_indices=edge_indices,
-                     radius=radius).commit_async(self)
+                     radius=radius,
+                     edge_radii=edge_radii).commit_async(self)
 
     # ------------------------------------------------------------------
     # Edit / reopen
@@ -487,13 +611,20 @@ class Fillet3DMixin:
             self._fillet3d_edge_indices = list(op.edge_indices)
             body = self.workspace.bodies.get(op.source_body_id)
             name = body.name if body else "Body"
-            for ei in op.edge_indices:
+            edge_radii = getattr(op, "edge_radii", []) or []
+            for pos, ei in enumerate(op.edge_indices):
+                r = edge_radii[pos] if pos < len(edge_radii) else None
+                # Tapers ([r1,r2]) can't be shown in a single row spinbox; seed
+                # the row only when the override is a scalar.
+                seed = r if isinstance(r, (int, float)) else None
                 panel.add_edge_entry(op.source_body_id, ei,
-                                     f"{name}  ·  edge {ei}")
+                                     f"{name}  ·  edge {ei}", radius=seed)
 
     def _commit_fillet3d_edit(self, body_id: str, face_indices: list,
-                               edge_indices: list, radius: float):
+                               edge_indices: list, radius: float,
+                               edge_radii: list = None):
         from cad.op_types import FaceFilletOp
+        edge_radii = list(edge_radii) if edge_radii else []
 
         idx = getattr(self, '_editing_fillet3d_idx', None)
         if idx is None:
@@ -543,7 +674,8 @@ class Fillet3DMixin:
         FaceFilletOp(source_body_id=body_id,
                      face_indices=face_indices,
                      edge_indices=edge_indices,
-                     radius=radius).commit_async(self)
+                     radius=radius,
+                     edge_radii=edge_radii).commit_async(self)
 
     def _cancel_fillet3d_edit(self):
         idx = getattr(self, '_editing_fillet3d_idx', None)

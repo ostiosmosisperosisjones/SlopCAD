@@ -47,16 +47,51 @@ def _collect_edges(shape, face_indices, edge_occs):
     return unique
 
 
-def _run_fillet(source_occ, unique_edges, radius: float):
+def _add_edge(nf, e_occ, r):
+    """Add one edge to a MakeFillet builder at radius spec *r*.
+
+    r may be a scalar (constant) or an (r1, r2) pair (linear taper along the
+    edge, OCCT Add(R1, R2, E)).
+    """
+    if isinstance(r, (tuple, list)):
+        r1, r2 = float(r[0]), float(r[1])
+        if r1 <= 0 or r2 <= 0:
+            raise ValueError(f"Fillet: radii must be positive, got {r}")
+        nf.Add(r1, r2, e_occ)
+    else:
+        if r <= 0:
+            raise ValueError(f"Fillet: radius must be positive, got {r}")
+        nf.Add(float(r), e_occ)
+
+
+def _run_fillet(source_occ, unique_edges, radius):
+    """Build a fillet on `unique_edges`.
+
+    radius may be:
+      - a scalar              → constant radius on every edge
+      - an (r1, r2) tuple     → radius varies linearly from edge start to end
+                                (variable-radius fillet, OCCT Add(R1, R2, E))
+      - a list (one entry per edge, each a scalar or (r1, r2) tuple) → per-edge
+                                radii, aligned positionally with unique_edges
+
+    Contract to disambiguate: a *tuple* always means a taper pair; a *list*
+    always means per-edge values. So per-edge tapers are list-of-tuples.
+    """
     if not unique_edges:
         raise RuntimeError("Fillet: no edges selected")
-    if radius <= 0:
-        raise ValueError(f"Fillet: radius must be positive, got {radius}")
+
+    per_edge = isinstance(radius, list)
+    if per_edge and len(radius) != len(unique_edges):
+        raise ValueError(
+            f"Fillet: per-edge radius list has {len(radius)} entries for "
+            f"{len(unique_edges)} edges")
 
     nf = BRepFilletAPI_MakeFillet(source_occ, ChFi3d_FilletShape.ChFi3d_Rational)
-    for e_occ in unique_edges:
+    for i, e_occ in enumerate(unique_edges):
         try:
-            nf.Add(radius, e_occ)
+            _add_edge(nf, e_occ, radius[i] if per_edge else radius)
+        except ValueError:
+            raise
         except Exception:
             continue   # skip seam / degenerate edges
 
@@ -179,6 +214,46 @@ def _rematch_edges(healed_shape, wanted_occ_edges):
         except Exception:
             continue
     return matched
+
+
+def fillet_edges_subdivided(shape, face_indices: list, edge_occs: list,
+                            radius: float, segments: int = 4):
+    """Fillet attempt with each selected edge split into *segments* sub-edges.
+
+    The ChFi3d contour walker sometimes stalls or fails on a single long /
+    closed / high-curvature edge but converges when the same edge is filleted as
+    a chain of shorter arcs. We split each edge by parameter range into co-edges
+    of the original curve (same geometry, new TopoDS_Edge bounds), collect them
+    against the shape, and fillet the chain.
+
+    Raises like _run_fillet if even the subdivided chain can't build.
+    """
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+
+    source_occ = shape.wrapped if hasattr(shape, 'wrapped') else shape
+    base_edges = _collect_edges(shape, face_indices, edge_occs)
+    sub_edges = []
+    for e in base_edges:
+        try:
+            a = BRepAdaptor_Curve(e)
+            curve = a.Curve().Curve()          # underlying Geom_Curve handle
+            u0, u1 = a.FirstParameter(), a.LastParameter()
+            step = (u1 - u0) / segments
+            for k in range(segments):
+                lo = u0 + k * step
+                hi = u0 + (k + 1) * step
+                mk = BRepBuilderAPI_MakeEdge(curve, lo, hi)
+                if mk.IsDone():
+                    sub_edges.append(mk.Edge())
+                else:
+                    sub_edges.append(e)        # fall back to the whole edge
+                    break
+        except Exception:
+            sub_edges.append(e)
+    if not sub_edges:
+        raise RuntimeError("Fillet: subdivision produced no edges")
+    return _run_fillet(source_occ, sub_edges, radius)
 
 
 def fillet_preview(shape, face_indices: list, edge_occs: list, radius: float):

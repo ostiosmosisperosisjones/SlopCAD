@@ -80,9 +80,12 @@ def _adaptive_delay(value, panel) -> int:
 
 
 class Fillet3DPanel(QWidget):
-    confirmed            = pyqtSignal(float)
+    # confirmed/preview emit (default_radius, edge_radii) where edge_radii is a
+    # list aligned with the edge rows — each entry a float or None (use default).
+    confirmed            = pyqtSignal(float, list)
     cancelled            = pyqtSignal()
-    preview_changed      = pyqtSignal(float)
+    preview_changed      = pyqtSignal(float, list)
+    fit_requested        = pyqtSignal()        # user clicked "Fit largest"
     face_entry_removed   = pyqtSignal(int)
     edge_entry_removed   = pyqtSignal(int)
     picking_face_changed = pyqtSignal(bool)
@@ -160,18 +163,39 @@ class Fillet3DPanel(QWidget):
         edge_header.addWidget(self._pick_edge_btn)
         root.addLayout(edge_header)
 
-        self._edge_list = SelectionList(empty_text="No edges selected")
+        # Per-edge radius column: each edge row carries its own spinbox.
+        # A blank row falls back to the default radius below.
+        self._edge_list = SelectionList(empty_text="No edges selected",
+                                        per_row_value=True)
         self._edge_list.entry_removed.connect(self.edge_entry_removed)
+        self._edge_list.value_changed.connect(self._on_row_radius_changed)
         root.addWidget(self._edge_list)
 
         root.addWidget(self._separator())
 
-        # ── Radius ────────────────────────────────────────────────────
-        root.addWidget(self._section_label("Radius"))
+        # ── Default radius ─────────────────────────────────────────────
+        # Applies to faces and to any edge row left blank.
+        root.addWidget(self._section_label("Default Radius"))
         self._spinbox = ExprSpinBox(unit=prefs.default_unit)
         self._spinbox.set_mm(1.0)
         self._spinbox.value_changed.connect(self._on_radius_changed)
         root.addWidget(self._spinbox)
+
+        # "Fit largest" is always available: it binary-searches for the biggest
+        # buildable radius on demand. The note beside it only appears when the
+        # current radius can't be built. Auto-fit is too heavy for live preview,
+        # so it lives behind this explicit button.
+        note_row = QHBoxLayout()
+        note_row.setSpacing(6)
+        self._applied_note = QLabel("")
+        self._applied_note.setStyleSheet("color: #cc9a4a; font-size: 11px;")
+        self._applied_note.setWordWrap(True)
+        note_row.addWidget(self._applied_note, 1)
+        self._fit_btn = QPushButton("Fit largest")
+        self._fit_btn.clicked.connect(lambda: self.fit_requested.emit())
+        note_row.addWidget(self._fit_btn)
+        root.addLayout(note_row)
+        self._applied_note.setVisible(False)
 
         root.addWidget(self._separator())
 
@@ -217,8 +241,9 @@ class Fillet3DPanel(QWidget):
     def clear_face_entries(self):
         self._face_list.clear()
 
-    def add_edge_entry(self, body_id: str | None, edge_idx: int | None, label: str):
-        self._edge_list.add((body_id, edge_idx), label)
+    def add_edge_entry(self, body_id: str | None, edge_idx: int | None, label: str,
+                       radius: float | None = None):
+        self._edge_list.add((body_id, edge_idx), label, value=radius)
 
     def remove_edge_entry(self, index: int):
         self._edge_list.remove_at(index)
@@ -250,10 +275,15 @@ class Fillet3DPanel(QWidget):
     # Preview
     # ------------------------------------------------------------------
 
+    def _edge_radii(self) -> list:
+        """Per-edge radii aligned with the edge rows: each a float override or
+        None (use the default radius)."""
+        return list(self._edge_list.values)
+
     def _fire_preview(self):
         v = self._spinbox.mm_value()
         if v is not None and v > 0:
-            self.preview_changed.emit(v)
+            self.preview_changed.emit(v, self._edge_radii())
 
     def _emit_preview(self):
         self._preview_timer.start(_adaptive_delay(
@@ -265,6 +295,15 @@ class Fillet3DPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _on_radius_changed(self, _):
+        # Clear any stale "not buildable" hint the moment the user changes the
+        # value — it described the *previous* radius. The next preview result
+        # re-shows it only if the new radius also isn't buildable. ("Fit largest"
+        # stays available regardless.)
+        self._applied_note.setVisible(False)
+        self._emit_preview()
+
+    def _on_row_radius_changed(self, _index, _value):
+        self._applied_note.setVisible(False)
         self._emit_preview()
 
     def _on_pick_face_toggle(self, checked: bool):
@@ -294,7 +333,37 @@ class Fillet3DPanel(QWidget):
             return
         v = self._spinbox.mm_value()
         if v is not None and v > 0:
-            self.confirmed.emit(v)
+            self.confirmed.emit(v, self._edge_radii())
+
+    def set_buildable(self, buildable: bool):
+        """Called after each preview: show the 'not buildable' hint when the
+        current radius can't be built. ('Fit largest' is always available.)"""
+        self._applied_note.setText(
+            "" if buildable else "⚠ not buildable at this radius")
+        self._applied_note.setVisible(not buildable)
+
+    def set_max_hint(self, radius_mm: float | None):
+        """Apply the largest buildable radius: set the radius field to it (as if
+        the user typed it) and confirm in the active unit. radius_mm is mm, or
+        None when nothing in range builds reliably.
+
+        Writing it into the field (rather than only hinting) means the value is
+        always recoverable — clicking Fit largest again after changing your mind
+        re-applies it — and it re-runs the normal preview at that radius."""
+        from cad.units import format_value
+        unit = self._spinbox._unit
+        if radius_mm is None or radius_mm <= 0:
+            self._applied_note.setText("⚠ no buildable radius found for this edge")
+            self._applied_note.setVisible(True)
+            return
+        # set_mm displays in the active unit but does NOT emit value_changed
+        # (that's user-edit only), so fire the preview explicitly at the fitted
+        # radius. Set the note after, so it isn't cleared by _on_radius_changed.
+        self._spinbox.set_mm(radius_mm)
+        self._fire_preview()
+        self._applied_note.setText(
+            f"fit to largest buildable ≈ {format_value(radius_mm, unit)}")
+        self._applied_note.setVisible(True)
 
     # ------------------------------------------------------------------
     # Keyboard / window

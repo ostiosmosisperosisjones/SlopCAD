@@ -46,11 +46,17 @@ class AsyncOpMixin:
         """
         self._async_set_busy(True, name)
 
+        pc = getattr(self, 'progress', None)
+
         def _worker():
             import time
             t0 = time.time()
             try:
+                if pc is not None:
+                    pc.phase("computing…")
                 shape_after = compute()
+                if pc is not None:
+                    pc.phase("tessellating…")
                 mesh = _tessellate(shape_after)
                 err  = None
             except Exception as ex:
@@ -101,6 +107,18 @@ class AsyncOpMixin:
             self._async_set_busy(False)
 
     def _async_set_busy(self, busy: bool, label: str = ""):
+        # Prefer the program-wide progress controller (status bar + overlay +
+        # cancel). Fall back to the legacy local overlay if it isn't wired yet.
+        pc = getattr(self, 'progress', None)
+        if pc is not None:
+            if busy:
+                pc.begin(label or "Working", modal=True, cancelable=False)
+                self.setEnabled(False)
+            else:
+                pc.end()
+                self.setEnabled(True)
+            return
+
         overlay = getattr(self, '_async_overlay', None)
 
         if busy:

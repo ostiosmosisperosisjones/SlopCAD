@@ -51,14 +51,20 @@ class SelectionList(QWidget):
 
     entry_removed  = pyqtSignal(int)        # index that was removed
     order_changed  = pyqtSignal()           # fires after a successful move
+    value_changed  = pyqtSignal(int, float) # (index, mm value) — per_row_value mode
 
     def __init__(self, empty_text: str = "Nothing selected", parent=None,
-                 reorderable: bool = False):
+                 reorderable: bool = False, per_row_value: bool = False):
         super().__init__(parent)
 
-        # (key, label, valid, tooltip)
+        # (key, label, valid, tooltip[, value])
         self._entries: list[tuple] = []
         self._reorderable = reorderable
+        # When True each row carries a small numeric (mm) spinbox — used by the
+        # fillet panel for per-edge radii. Values live in a parallel list so
+        # they survive _rebuild().
+        self._per_row_value = per_row_value
+        self._values: list[float | None] = []
 
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -81,25 +87,44 @@ class SelectionList(QWidget):
     def keys(self) -> list:
         return [e[0] for e in self._entries]
 
+    @property
+    def values(self) -> list:
+        """Per-row mm values (per_row_value mode); None where unset."""
+        return list(self._values)
+
+    def set_value(self, index: int, value: float | None):
+        """Set a row's mm value without rebuilding the whole list."""
+        if 0 <= index < len(self._values):
+            self._values[index] = value
+            self._rebuild()
+
     def __len__(self) -> int:
         return len(self._entries)
 
-    def add(self, key, label: str, *, valid: bool = True, tooltip: str = "") -> bool:
-        """Add an entry. Returns False (no-op) if key already present."""
+    def add(self, key, label: str, *, valid: bool = True, tooltip: str = "",
+            value: float | None = None) -> bool:
+        """Add an entry. Returns False (no-op) if key already present.
+
+        value seeds the per-row spinbox (per_row_value mode); None leaves it
+        blank (the panel then treats the row as 'use the default radius')."""
         if any(e[0] == key for e in self._entries):
             return False
         self._entries.append((key, label, valid, tooltip))
+        self._values.append(value)
         self._rebuild()
         return True
 
     def remove_at(self, index: int):
         if 0 <= index < len(self._entries):
             self._entries.pop(index)
+            if index < len(self._values):
+                self._values.pop(index)
             self._rebuild()
             self.entry_removed.emit(index)
 
     def clear(self):
         self._entries.clear()
+        self._values.clear()
         self._rebuild()
 
     def set_error(self, index: int, message: str):
@@ -134,6 +159,8 @@ class SelectionList(QWidget):
             return
         item = self._entries.pop(src)
         self._entries.insert(dst, item)
+        if src < len(self._values):
+            self._values.insert(dst, self._values.pop(src))
         self._rebuild()
         self.order_changed.emit()
 
@@ -141,7 +168,18 @@ class SelectionList(QWidget):
     # Internal
     # ------------------------------------------------------------------
 
+    def _on_row_value(self, index: int):
+        """Read a row spinbox back into _values and notify listeners."""
+        sb = getattr(self, "_row_spinboxes", {}).get(index)
+        if sb is None or not (0 <= index < len(self._values)):
+            return
+        v = sb.mm_value()
+        self._values[index] = v
+        if v is not None:
+            self.value_changed.emit(index, v)
+
     def _rebuild(self):
+        self._row_spinboxes = {}
         while self._layout.count():
             item = self._layout.takeAt(0)
             w = item.widget()
@@ -168,6 +206,19 @@ class SelectionList(QWidget):
             if tooltip:
                 lbl.setToolTip(tooltip)
             row_layout.addWidget(lbl)
+
+            if self._per_row_value:
+                from gui.expr_spinbox import ExprSpinBox
+                sb = ExprSpinBox(unit=prefs.default_unit)
+                sb.setFixedWidth(prefs.scaled_px(78))
+                val = self._values[i] if i < len(self._values) else None
+                if val is not None:
+                    sb.set_mm(val)
+                sb.value_changed.connect(
+                    lambda _v, idx=i: self._on_row_value(idx))
+                self._row_spinboxes = getattr(self, "_row_spinboxes", {})
+                self._row_spinboxes[i] = sb
+                row_layout.addWidget(sb)
 
             if self._reorderable:
                 up = QPushButton("▲")

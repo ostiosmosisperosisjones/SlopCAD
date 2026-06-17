@@ -31,6 +31,11 @@ class FaceFilletOp(Op):
     edge_indices:   list  = field(default_factory=list)
     radius:         float = 1.0
     edge_refs:      list  = field(default_factory=list)
+    # Per-edge radius overrides, aligned with edge_indices/edge_refs. Each entry
+    # is a float (constant) or [r1, r2] (linear taper), or None to use the
+    # global radius. Empty list → every edge uses the global radius. The
+    # subprocess worker matches these to edges by midpoint (order-independent).
+    edge_radii:     list  = field(default_factory=list)
 
     def _resolve_edge_occs(self, viewport):
         """Look up TopoDS_Edge objects for stored edge_indices via the mesh."""
@@ -60,7 +65,7 @@ class FaceFilletOp(Op):
         return out
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
-        from cad.operations.fillet import fillet_edges
+        from cad.operations.fillet_proc import fillet_edges_isolated
         if shape is None:
             src = history._shape_for_body_at(self.source_body_id, entry_index)
             if src is None:
@@ -71,7 +76,13 @@ class FaceFilletOp(Op):
         # (geometry fingerprints) to relocate the same edges after upstream
         # edits perturb the topology.
         edge_occs = self._resolve_edge_refs(shape)
-        return fillet_edges(shape, self.face_indices, edge_occs, self.radius)
+        # Run in a killable child process: an OCCT fillet hang here would
+        # otherwise freeze replay (e.g. on file open). FilletTimeout surfaces as
+        # a normal per-entry error the replay loop already handles. edge_radii
+        # carries any per-edge overrides (aligned with edge_refs/edge_occs).
+        return fillet_edges_isolated(
+            shape, self.face_indices, edge_occs, self.radius,
+            edge_radii=self.edge_radii or None)
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         compute, finalize = self._split_commit(viewport, extra_params)
@@ -90,7 +101,6 @@ class FaceFilletOp(Op):
         return shape_after
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
-        from cad.operations.fillet import fillet_edges
         from cad.edge_ref import EdgeRef
 
         shape_before = viewport.workspace.current_shape(self.source_body_id)
@@ -121,20 +131,31 @@ class FaceFilletOp(Op):
         original_solid_count = len(list(shape_before.solids()))
         face_indices = list(self.face_indices)
         radius = self.radius
+        edge_radii = list(self.edge_radii) if self.edge_radii else None
 
         def compute():
             # The live preview already computed this exact fillet on a worker
             # thread (preview == commit quality). Reuse its solid if the cached
-            # inputs match — a fillet on a long BSpline edge costs ~75s in the
-            # kernel, so recomputing it on commit doubled the wall-clock wait.
+            # inputs match AND the preview was at the *exact* requested radius —
+            # an auto-fit-substituted preview must not be silently committed,
+            # because commit honors exactly what the user typed.
             cached = getattr(viewport, "_fillet3d_result_cache", None)
-            if cached is not None:
+            if cached is not None and len(cached) == 3:
                 from viewer.vp_fillet3d import _fillet_cache_key
-                key, solid = cached
-                if solid is not None and key == _fillet_cache_key(
-                        shape_before, face_indices, edge_occs, radius):
+                key, solid, exact = cached
+                if (solid is not None and exact
+                        and key == _fillet_cache_key(
+                            shape_before, face_indices, edge_occs, radius,
+                            edge_radii)):
                     return solid
-            return fillet_edges(shape_before, face_indices, edge_occs, radius)
+            # Commit at exactly the typed radius, in a killable process. If OCCT
+            # can't build it (or hangs), this raises — the op then pushes a clear
+            # red error entry rather than silently substituting a different
+            # radius. Auto-fit lives only in the live preview as guidance.
+            from cad.operations.fillet_proc import fillet_edges_isolated
+            return fillet_edges_isolated(
+                shape_before, face_indices, edge_occs, radius,
+                edge_radii=edge_radii)
 
         def finalize(shape_after):
             _push_result(viewport, "fillet", op_params, self.source_body_id,
@@ -160,6 +181,11 @@ class FaceFilletOp(Op):
                  "face_sigs": list(r.face_sigs)}
                 for r in self.edge_refs
             ]
+        if self.edge_radii and any(r is not None for r in self.edge_radii):
+            # Tapers are stored as [r1, r2] lists; constants as floats; None
+            # means "use the global radius".
+            p["edge_radii"] = [list(r) if isinstance(r, (list, tuple)) else r
+                               for r in self.edge_radii]
         return p
 
     @classmethod
@@ -182,4 +208,5 @@ class FaceFilletOp(Op):
             edge_indices   = list(params.get("edge_indices", [])),
             radius         = float(params.get("radius", 1.0)),
             edge_refs      = edge_refs,
+            edge_radii     = list(params.get("edge_radii", [])),
         )

@@ -681,3 +681,9 @@ class MainWindow(QMainWindow):
         self._sidebar  = sidebar
         self.setCentralWidget(splitter)
         self._toolbar.set_enabled(True)
+
+        # Program-wide progress indicator for heavy OCCT ops + checks. Handed to
+        # the viewport so any op can report phases / offer cancel through it.
+        from gui.progress import ProgressController
+        self.progress = ProgressController(self)
+        vp.progress = self.progress
