@@ -8,3 +8,7 @@ _tests/
 QWEN.md
 .qwen
 .claude/scheduled_tasks.lock
+# Internal planning notes — keep local, don't track
+*_PLAN.md
+FILLET_ROBUSTNESS_PLAN.md
+REPLAY_RELIABILITY_PLAN.md
