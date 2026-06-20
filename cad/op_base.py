@@ -196,7 +196,7 @@ def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
         extra_solids = solids[original_solid_count:]
         for i, solid in enumerate(extra_solids):
             ws   = viewport.workspace
-            name = ws.bodies[body_id].name + f"  [{i + 2}]"
+            name = ws.next_part_name()
             new_body = ws.add_body(name, Compound(solid.wrapped))
             new_body.created_at_entry_id = parent_entry.entry_id
             imp_params = {

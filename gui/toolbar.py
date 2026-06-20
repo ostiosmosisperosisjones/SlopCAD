@@ -249,58 +249,63 @@ class OpsToolbar(QToolBar):
         self.setStyleSheet(prefs.scale_stylesheet(_STYLE))
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
 
+        # Map op name → button, so tooltips can be rebuilt from op_meta when
+        # keybindings change.
+        self._op_buttons: dict[str, QToolButton] = {}
+
         # --- sketch (wired) ---
         self._btn_sketch = self._add_op_button(
-            "Sketch", _SVG_SKETCH, self.sketch_requested,
-            "Start a sketch on the selected face")
+            "sketch", "Sketch", _SVG_SKETCH, self.sketch_requested)
         self._btn_offset_plane = self._add_op_button(
-            "Plane", _SVG_OFFSET_PLANE, self.offset_plane_requested,
-            "Create an offset datum plane (parented to a world plane or face)")
+            "offset_plane", "Plane", _SVG_OFFSET_PLANE, self.offset_plane_requested)
 
         self._add_separator()
 
         # --- implemented ops ---
         self._btn_extrude = self._add_op_button(
-            "Extrude", _SVG_EXTRUDE, self.extrude_requested,
-            "Extrude or cut a selected face / sketch profile")
+            "extrude", "Extrude", _SVG_EXTRUDE, self.extrude_requested)
         self._btn_thicken = self._add_op_button(
-            "Thicken", _SVG_THICKEN, self.thicken_requested,
-            "Offset selected face(s) outward to add material")
+            "thicken", "Thicken", _SVG_THICKEN, self.thicken_requested)
 
         self._add_separator()
 
         # --- revolve (wired) ---
         self._btn_revolve = self._add_op_button(
-            "Revolve", _SVG_REVOLVE, self.revolve_requested,
-            "Revolve a sketch profile around an axis")
+            "revolve", "Revolve", _SVG_REVOLVE, self.revolve_requested)
         self._btn_loft = self._add_op_button(
-            "Loft", _SVG_LOFT, self.loft_requested,
-            "Loft between two or more sketch profiles")
+            "loft", "Loft", _SVG_LOFT, self.loft_requested)
 
-        self._btn_fillet   = self._add_op_button(
-            "Fillet", _SVG_FILLET, self.fillet_requested,
-            "Fillet selected edges  (F)")
+        self._btn_fillet = self._add_op_button(
+            "fillet", "Fillet", _SVG_FILLET, self.fillet_requested)
 
-        self._btn_chamfer  = self._add_op_button(
-            "Chamfer", _SVG_CHAMFER, self.chamfer_requested,
-            "Chamfer selected edges with distance + angle")
+        self._btn_chamfer = self._add_op_button(
+            "chamfer", "Chamfer", _SVG_CHAMFER, self.chamfer_requested)
 
         self._add_separator()
 
         self._btn_boolean = self._add_op_button(
-            "Boolean", _SVG_BOOLEAN, self.boolean_requested,
-            "Boolean union / subtract / intersect between two bodies")
+            "boolean", "Boolean", _SVG_BOOLEAN, self.boolean_requested)
 
         self.set_enabled(False)
 
-    def _add_op_button(self, label: str, svg: str, signal, tooltip: str) -> QToolButton:
+    def _add_op_button(self, op_name: str, label: str, svg: str,
+                       signal) -> QToolButton:
+        from gui.op_meta import tooltip_for
         btn = QToolButton(self)
         btn.setText(label)
         btn.setIcon(_svg_icon(svg))
-        btn.setToolTip(tooltip)
+        btn.setToolTip(tooltip_for(op_name))
         btn.clicked.connect(signal.emit)
         self.addWidget(btn)
+        self._op_buttons[op_name] = btn
         return btn
+
+    def refresh_tooltips(self):
+        """Rebuild op tooltips from op_meta — call after keybindings change so
+        the shown shortcut tracks the user's current binding."""
+        from gui.op_meta import tooltip_for
+        for op_name, btn in self._op_buttons.items():
+            btn.setToolTip(tooltip_for(op_name))
 
     def _add_stub(self, label: str, svg: str, tooltip: str) -> QToolButton:
         btn = QToolButton(self)

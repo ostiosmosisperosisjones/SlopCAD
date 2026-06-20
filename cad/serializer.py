@@ -383,6 +383,7 @@ def save(workspace, history, camera=None) -> bytes:
         "version":             2,
         "bodies":              bodies,
         "active_body_id":      workspace._active_body_id,
+        "part_counter":        workspace._part_counter,
         "world_plane_visible": workspace.world_plane_visible,
         "history_cursor":      history._cursor,
         "entries":             entries,
@@ -439,6 +440,21 @@ def load(data: bytes):
     workspace._active_body_id      = doc.get("active_body_id")
     workspace.world_plane_visible  = doc.get("world_plane_visible",
                                              {"XY": True, "XZ": False, "YZ": False})
+
+    # Restore the "Part N" counter. Older files predate it — derive a safe
+    # starting point from any existing 'Part N' names so new bodies never
+    # collide with loaded ones.
+    saved_counter = doc.get("part_counter")
+    if saved_counter is not None:
+        workspace._part_counter = int(saved_counter)
+    else:
+        import re as _re
+        highest = 0
+        for body in workspace.bodies.values():
+            m = _re.fullmatch(r"Part (\d+)", body.name or "")
+            if m:
+                highest = max(highest, int(m.group(1)))
+        workspace._part_counter = highest
 
     # Restore history entries (shapes left as None — replay fills them in)
     for ed in doc["entries"]:

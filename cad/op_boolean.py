@@ -184,8 +184,14 @@ class BooleanOp(Op):
         self.body_names = body_names
         op_params["body_names"] = body_names
 
-        input_names = [body_names.get(bid, bid) for bid in self.body_ids]
-        result_name = " + ".join(input_names) if operation == "union" else " ∩ ".join(input_names)
+        # Operand names are kept in op_params["body_names"] for reopen/labels;
+        # the result body itself just gets the next sequential "Part N" name so
+        # repeated merges don't compound into ever-growing concatenations.
+        # On the edit path the result body already exists — keep its name (and
+        # don't burn a counter number) rather than renaming it on re-commit.
+        existing = (viewport.workspace.bodies.get(self.result_body_id)
+                    if self.result_body_id else None)
+        result_name = existing.name if existing else viewport.workspace.next_part_name()
 
         # Reuse result_body_id if set (edit path preserves it so downstream ops
         # keep their reference), otherwise generate a new body.

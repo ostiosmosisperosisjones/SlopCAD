@@ -256,12 +256,26 @@ class MainWindow(QMainWindow):
             QStatusBar::item { border: none; }
         """))
         from PyQt6.QtWidgets import QLabel
+        from PyQt6.QtCore import Qt
+        # The sketch hint lives in a dedicated wrapping banner above the status
+        # bar (added to the central column in the workspace builder) — a
+        # word-wrapping QLabel directly in a QStatusBar triggers a
+        # heightForWidth resize loop, so keep it out of the status bar.
+        # Create it here (before any signal can target it); style/place later.
         self._sketch_label = QLabel("")
-        self._sketch_label.setStyleSheet(
-            "color: #4fc3f7; font-weight: bold; padding-left: 8px;")
-        self._sketch_label.setTextFormat(
-            __import__('PyQt6.QtCore', fromlist=['Qt']).Qt.TextFormat.RichText)
-        sb.addWidget(self._sketch_label)
+        self._sketch_label.setTextFormat(Qt.TextFormat.RichText)
+        self._sketch_label.setWordWrap(True)
+        self._sketch_label.setStyleSheet(prefs.scale_stylesheet("""
+            QLabel {
+                background: #161616;
+                color: #4fc3f7;
+                font-weight: bold;
+                font-size: 11px;
+                border-top: 1px solid #2a2a2a;
+                padding: 4px 8px;
+            }
+        """))
+        self._sketch_label.setVisible(False)
 
         self._meas_label = QLabel("")
         self._meas_label.setStyleSheet(
@@ -274,12 +288,17 @@ class MainWindow(QMainWindow):
 
     def _update_sketch_label(self, in_sketch: bool):
         if not in_sketch:
-            self._sketch_label.setText("")
+            self._sketch_label.clear()
+            self._sketch_label.setVisible(False)
             return
         sketch = self._viewport._sketch if self._viewport else None
         if sketch is None:
-            self._sketch_label.setText("")
+            self._sketch_label.clear()
+            self._sketch_label.setVisible(False)
             return
+        # In sketch mode with an active sketch: the banner is shown and its
+        # text is set by the branches below.
+        self._sketch_label.setVisible(True)
 
         from cad.sketch import SketchTool
         from cad.sketch_tools.line import LineTool
@@ -493,6 +512,8 @@ class MainWindow(QMainWindow):
             self._viewport.update()
             # Refresh history panel so unit labels update immediately
             self._sidebar.history_panel.refresh()
+            # Rebuild op tooltips so a changed keybinding shows right away
+            self._ops_toolbar.refresh_tooltips()
 
     def _toggle_projection(self):
         if self._viewport:
@@ -679,7 +700,16 @@ class MainWindow(QMainWindow):
 
         self._viewport = vp
         self._sidebar  = sidebar
-        self.setCentralWidget(splitter)
+
+        # Central column: splitter on top, wrapping sketch-hint banner below.
+        from PyQt6.QtWidgets import QWidget, QVBoxLayout
+        central = QWidget()
+        col = QVBoxLayout(central)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        col.addWidget(splitter, 1)
+        col.addWidget(self._sketch_label)
+        self.setCentralWidget(central)
         self._toolbar.set_enabled(True)
 
         # Program-wide progress indicator for heavy OCCT ops + checks. Handed to

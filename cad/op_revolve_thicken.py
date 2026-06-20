@@ -266,7 +266,6 @@ class FaceRevolveOp(Op):
         from cad.operations.revolve import revolve_face_direct
         from cad.face_ref import FaceRef
         from build123d import Compound
-        from viewer.vp_extrude import _strip_split_suffix, _next_split_name
         from cad.units import format_op_label as _lbl
 
         body_id     = self.source_body_id
@@ -291,8 +290,6 @@ class FaceRevolveOp(Op):
         if extra_params:
             op_params.update(extra_params)
 
-        root_name = _strip_split_suffix(viewport.workspace.bodies[body_id].name)
-
         def compute():
             return revolve_face_direct(None, face_obj, axis_pt, axis_dir, angle)
 
@@ -312,7 +309,7 @@ class FaceRevolveOp(Op):
             solids = list(shape_after.solids())
             new_bodies = []
             for solid in solids:
-                new_name = _next_split_name(root_name, viewport.workspace)
+                new_name = viewport.workspace.next_part_name()
                 new_body = viewport.workspace.add_body(
                     new_name, Compound(solid.wrapped))
                 new_bodies.append(new_body)
@@ -665,16 +662,14 @@ class SketchRevolveOp(Op):
 
         def finalize(shape_after):
             if force_new:
-                from viewer.vp_extrude import _strip_split_suffix, _next_split_name
                 from cad.units import format_op_label as _lbl
                 from cad.solid_ref import solid_refs_to_dicts
-                root_name = _strip_split_suffix(viewport.workspace.bodies[body_id].name)
                 solids    = list(shape_after.solids())
                 op_params["child_body_ids"] = []
                 op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
                 new_bodies = []
                 for solid in solids:
-                    new_name = _next_split_name(root_name, viewport.workspace)
+                    new_name = viewport.workspace.next_part_name()
                     new_body = viewport.workspace.add_body(new_name, Compound(solid.wrapped))
                     new_bodies.append(new_body)
                     op_params["child_body_ids"].append(new_body.id)

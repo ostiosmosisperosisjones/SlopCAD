@@ -44,6 +44,9 @@ class Workspace:
         self.history: "History | None" = None   # set after History is constructed
         # The active body — operations target this one
         self._active_body_id: str | None = None
+        # Monotonic counter for naming new bodies "Part N". Never reused, so a
+        # deleted Part's number is not handed out again within a session.
+        self._part_counter: int = 0
         # World-plane visibility — toggled from the parts panel
         self.world_plane_visible: dict[str, bool] = {
             "XY": True,
@@ -54,6 +57,17 @@ class Workspace:
     # ------------------------------------------------------------------
     # Body management
     # ------------------------------------------------------------------
+
+    def next_part_name(self) -> str:
+        """Return the next 'Part N' name, advancing the monotonic counter.
+
+        Every new body in the workspace — sketch body, split result, boolean
+        union/intersect result, loft, etc. — pulls its name from here so names
+        are uniform and never collide. The counter is persisted; on load it is
+        bumped past any existing 'Part N' so old files keep incrementing.
+        """
+        self._part_counter += 1
+        return f"Part {self._part_counter}"
 
     def add_body(self, name: str, source_shape, body_id: str | None = None) -> Body:
         """

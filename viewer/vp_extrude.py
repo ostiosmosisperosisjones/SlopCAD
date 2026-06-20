@@ -12,30 +12,8 @@ Expects self to have:
 """
 
 from __future__ import annotations
-import re as _re
 
 from cad.units import format_op_label as _make_label
-
-
-# ---------------------------------------------------------------------------
-# Module-level naming helpers
-# ---------------------------------------------------------------------------
-
-def _strip_split_suffix(name: str) -> str:
-    """Remove trailing '  [N]' split suffix to get the root body name."""
-    return _re.sub(r'\s*\[\d+\]\s*$', '', name).strip()
-
-
-def _next_split_name(root_name: str, workspace) -> str:
-    """Return the next available '  [N]' name for a split of *root_name*."""
-    existing = {body.name for body in workspace.bodies.values()}
-    n = 2
-    while True:
-        candidate = f"{root_name}  [{n}]"
-        if candidate not in existing:
-            return candidate
-        n += 1
-
 
 
 # ---------------------------------------------------------------------------

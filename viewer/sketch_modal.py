@@ -24,17 +24,6 @@ def _plane_from_sketch_entry(se):
     )
 
 
-def _next_body_name(workspace) -> str:
-    """Return 'Body N' where N is the lowest unused integer."""
-    existing = {body.name for body in workspace.bodies.values()}
-    n = 1
-    while True:
-        name = f"Body {n}"
-        if name not in existing:
-            return name
-        n += 1
-
-
 class SketchModalMixin:
 
     def _enter_sketch(self, body_id: str, face_idx: int):
@@ -231,7 +220,7 @@ class SketchModalMixin:
         body_id = sketch.body_id
         if body_id is None:
             body = self.workspace.add_body(
-                _next_body_name(self.workspace), None)
+                self.workspace.next_part_name(), None)
             body_id = body.id
             sketch.body_id = body_id
             new_se.body_id  = body_id

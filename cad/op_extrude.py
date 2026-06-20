@@ -368,11 +368,9 @@ class FaceExtrudeOp(Op):
                 return Compound(result_occ)
 
             def finalize(shape_after):
-                from viewer.vp_extrude import _strip_split_suffix, _next_split_name
                 from cad.units import format_op_label as _lbl
                 label     = _lbl(op_str, op_params)
                 from cad.solid_ref import solid_refs_to_dicts
-                root_name = _strip_split_suffix(viewport.workspace.bodies[body_id].name)
                 solids    = list(shape_after.solids())
                 op_params["child_body_ids"] = []
                 # Per-child geometric fingerprint so replay re-locates each
@@ -380,9 +378,14 @@ class FaceExtrudeOp(Op):
                 op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
                 new_bodies = []
                 for i, solid in enumerate(solids):
-                    new_name = _next_split_name(root_name, viewport.workspace)
                     preserved = (preserved_body_ids[i]
                                  if i < len(preserved_body_ids) else None)
+                    # force_new_body: each solid is a brand-new body → fresh
+                    # "Part N". On the edit/re-commit path a preserved id already
+                    # exists; keep its name so re-commits don't rename it or burn
+                    # counter numbers.
+                    existing = viewport.workspace.bodies.get(preserved) if preserved else None
+                    new_name = existing.name if existing else viewport.workspace.next_part_name()
                     new_body = viewport.workspace.add_body(
                         new_name, Compound(solid.wrapped), body_id=preserved)
                     new_bodies.append(new_body)
@@ -1212,10 +1215,8 @@ class SketchExtrudeOp(Op):
 
         def finalize(shape_after):
             if force_new:
-                from viewer.vp_extrude import _strip_split_suffix, _next_split_name
                 from cad.units import format_op_label as _lbl
                 from cad.solid_ref import solid_refs_to_dicts
-                root_name  = _strip_split_suffix(viewport.workspace.bodies[body_id].name)
                 solids     = list(shape_after.solids())
                 op_params["child_body_ids"] = []
                 # Geometric fingerprint per child, aligned with child_body_ids,
@@ -1224,12 +1225,15 @@ class SketchExtrudeOp(Op):
                 op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
                 new_bodies = []
                 for i, solid in enumerate(solids):
-                    new_name = _next_split_name(root_name, viewport.workspace)
                     # Reuse the original body_id if the edit path supplied one
                     # for this solid index — keeps downstream ops pointing at
                     # the same body across parametric edits.
                     preserved = (preserved_body_ids[i]
                                  if i < len(preserved_body_ids) else None)
+                    # Fresh "Part N" for a genuinely new body; keep the existing
+                    # name (and counter) when re-committing an edit.
+                    existing = viewport.workspace.bodies.get(preserved) if preserved else None
+                    new_name = existing.name if existing else viewport.workspace.next_part_name()
                     new_body = viewport.workspace.add_body(
                         new_name, Compound(solid.wrapped), body_id=preserved)
                     new_bodies.append(new_body)

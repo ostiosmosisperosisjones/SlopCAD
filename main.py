@@ -1,4 +1,16 @@
+import os
 import sys
+
+# On X11 WMs with no compositor (e.g. awesomewm), Qt6's GLX path swaps buffers
+# via Mesa DRI3 (loader_dri3_swap_buffers_msc -> xcb_wait_for_special_event),
+# which can block the GUI thread forever during the expose/flush that follows a
+# window resize — the whole app freezes on its last frame on every resize.
+# Disabling the DRI3 vblank wait removes that blocking swap. Keep the default
+# (GLX) GL integration so PyOpenGL's GLX-based context detection still works
+# (switching Qt to EGL breaks glVertexPointer's getContext()).  Must be set
+# before Qt is imported. (Allow external override so other envs can opt out.)
+os.environ.setdefault("vblank_mode", "0")
+
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QPalette, QColor
 from PyQt6.QtCore import Qt

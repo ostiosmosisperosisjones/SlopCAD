@@ -335,16 +335,8 @@ class SketchLoftOp(Op):
             op_params.pop("_preserved_body_ids", None)
 
         def finalize(shape_after):
-            from viewer.vp_extrude import _next_split_name
             from cad.units import format_op_label as _lbl
             ws = viewport.workspace
-            # Name the new body after the first profile sketch's body, if any.
-            first_idx = viewport.history.id_to_index(first_sketch_id)
-            base_name = "Loft"
-            if first_idx is not None:
-                se = viewport.history.entries[first_idx].params.get("sketch_entry")
-                if se is not None and se.body_id and se.body_id in ws.bodies:
-                    base_name = ws.bodies[se.body_id].name
             from cad.solid_ref import solid_refs_to_dicts
             solids = list(shape_after.solids())
             if not solids:
@@ -353,8 +345,10 @@ class SketchLoftOp(Op):
             op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
             new_bodies = []
             for i, solid in enumerate(solids):
-                new_name = _next_split_name(base_name, ws)
                 preserved = preserved_body_ids[i] if i < len(preserved_body_ids) else None
+                # Fresh "Part N" for a new body; keep existing name on re-commit.
+                existing = ws.bodies.get(preserved) if preserved else None
+                new_name = existing.name if existing else ws.next_part_name()
                 new_body = ws.add_body(new_name, Compound(solid.wrapped), body_id=preserved)
                 new_bodies.append(new_body)
                 op_params["child_body_ids"].append(new_body.id)
