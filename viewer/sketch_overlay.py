@@ -38,6 +38,71 @@ def _choose_spacing(camera_distance: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Adaptive curve tessellation — "ENHANCE" zoom detail
+# ---------------------------------------------------------------------------
+#
+# A polyline approximation of a curve deviates from the true curve by up to the
+# chord *sagitta*. For a circular arc of radius r split into n equal segments,
+# each segment subtends φ = span/n and its sagitta is r·(1 − cos(φ/2)).
+# We pick the smallest n that keeps that sagitta under a target *screen-space*
+# error (in pixels), so a curve gets exactly as much detail as the current zoom
+# can resolve — coarse when zoomed out, hundreds of segments when zoomed onto a
+# sub-millimetre feature.
+#
+# px_per_mm is the on-screen pixels per world-mm at the sketch plane. When it is
+# unknown (0 / None) we fall back to the fixed prefs count so nothing regresses.
+
+# Target chord error on screen. Sub-pixel with MSAA on; the curve reads as
+# perfectly smooth below ~0.3 px.
+_ADAPTIVE_ERR_PX = 0.25
+# Clamp so we never emit a degenerate or pathological polyline.
+_ADAPTIVE_MIN_SEG = 8
+_ADAPTIVE_MAX_SEG = 2048
+
+
+def _adaptive_arc_segments(radius: float, span: float, px_per_mm: float) -> int:
+    """Segment count for an arc so its screen-space sagitta ≤ _ADAPTIVE_ERR_PX."""
+    r = abs(float(radius))
+    span = abs(float(span))
+    if r <= 1e-9 or span <= 1e-9 or px_per_mm <= 0.0:
+        return prefs.sketch_curve_segments
+    # error_px(n) = px_per_mm · r · (1 − cos(span/2n)). Small-angle inversion
+    # (1 − cos x ≈ x²/2) gives a direct estimate, then we nudge up if needed.
+    tol_mm = _ADAPTIVE_ERR_PX / px_per_mm
+    if tol_mm >= r:            # curve smaller than one pixel of error budget
+        return _ADAPTIVE_MIN_SEG
+    # n ≈ span / (2 · sqrt(2 · tol_mm / r))
+    import math as _m
+    n = span / (2.0 * _m.sqrt(max(1e-12, 2.0 * tol_mm / r)))
+    n = int(_m.ceil(n))
+    return max(_ADAPTIVE_MIN_SEG, min(_ADAPTIVE_MAX_SEG, n))
+
+
+def _adaptive_tessellate(ent, px_per_mm):
+    """Tessellate an ArcEntity/SplineEntity with zoom-adaptive detail.
+
+    Falls back to the fixed prefs.sketch_curve_segments when px_per_mm is
+    unavailable (e.g. perspective mode we can't cheaply characterise).
+    """
+    if px_per_mm and px_per_mm > 0.0:
+        if isinstance(ent, ArcEntity):
+            span = abs(ent.end_angle - ent.start_angle)
+            n = _adaptive_arc_segments(ent.radius, span, px_per_mm)
+            return ent.tessellate(n)
+        if isinstance(ent, SplineEntity):
+            # Splines have no single radius; scale detail by on-screen length of
+            # the fit-point polyline so long/zoomed curves densify too.
+            pts = ent.points
+            length = 0.0
+            for a, b in zip(pts[:-1], pts[1:]):
+                length += float(np.linalg.norm(np.asarray(b) - np.asarray(a)))
+            n = int(length * px_per_mm / 6.0)   # ~1 vertex per 6 screen-px
+            n = max(_ADAPTIVE_MIN_SEG, min(_ADAPTIVE_MAX_SEG, n))
+            return ent.tessellate(n)
+    return ent.tessellate(prefs.sketch_curve_segments)
+
+
+# ---------------------------------------------------------------------------
 # SketchOverlay
 # ---------------------------------------------------------------------------
 
@@ -45,8 +110,14 @@ class SketchOverlay:
     """Stateless helper — call draw() every paintGL when in sketch mode."""
 
     def draw(self, sketch: SketchMode, camera_distance: float,
-             hovered_edge=None, selection=None) -> list[dict]:
-        """Returns list of label descriptors for QPainter text pass."""
+             hovered_edge=None, selection=None,
+             px_per_mm: float = 0.0) -> list[dict]:
+        """Returns list of label descriptors for QPainter text pass.
+
+        px_per_mm: on-screen pixels per world-mm; drives zoom-adaptive curve
+        tessellation. 0 → fall back to the fixed prefs segment count.
+        """
+        self._px_per_mm = px_per_mm
         glPushAttrib(GL_ALL_ATTRIB_BITS)
         glDisable(GL_LIGHTING)
         glDisable(GL_DEPTH_TEST)
@@ -80,7 +151,8 @@ class SketchOverlay:
 
     def draw_committed(self, entry, camera_distance: float,
                        hovered_edge=None, history_idx=None,
-                       selection=None, dim_dimensions: bool = False) -> list[dict]:
+                       selection=None, dim_dimensions: bool = False,
+                       px_per_mm: float = 0.0) -> list[dict]:
         """
         Draw a committed SketchEntry as a persistent overlay.
         No grid, no axes, no cursor — just the entities, slightly dimmed.
@@ -89,6 +161,7 @@ class SketchOverlay:
         from cad.sketch import SketchEntry
         if not isinstance(entry, SketchEntry) or not entry.visible:
             return []
+        self._px_per_mm = px_per_mm
 
         glPushAttrib(GL_ALL_ATTRIB_BITS)
         glDisable(GL_LIGHTING)
@@ -277,7 +350,7 @@ class SketchOverlay:
                 glVertex3f(*self._pt(sketch.plane, ent.p1[0], ent.p1[1]))
                 glEnd()
             elif isinstance(ent, (ArcEntity, SplineEntity)):
-                pts = ent.tessellate(64)
+                pts = _adaptive_tessellate(ent, getattr(self, '_px_per_mm', 0.0))
                 glBegin(GL_LINE_STRIP)
                 for p in pts:
                     glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
@@ -1087,7 +1160,7 @@ class SketchOverlay:
                 glVertex3f(*self._pt_from_entry(entry, ent.p1[0], ent.p1[1]))
                 glEnd()
             elif isinstance(ent, (ArcEntity, SplineEntity)):
-                pts = ent.tessellate(64)
+                pts = _adaptive_tessellate(ent, getattr(self, '_px_per_mm', 0.0))
                 glBegin(GL_LINE_STRIP)
                 for p in pts:
                     glVertex3f(*self._pt_from_entry(entry, p[0], p[1]))

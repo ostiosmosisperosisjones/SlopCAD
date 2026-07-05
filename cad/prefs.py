@@ -185,6 +185,28 @@ class Prefs:
     op_preview_opacity:     float  = 0.45
 
     # ------------------------------------------------------------------
+    # Visual fidelity  — tunable quality knobs (live-adjustable via the
+    # Fidelity dialog / F8 HUD). These affect COMMITTED display geometry only;
+    # operation previews stay at their own coarse tolerances for speed.
+    # ------------------------------------------------------------------
+    # Multisample antialiasing sample count on the GL context. 0 disables MSAA.
+    # Applied at startup (context creation) — changing it needs a restart.
+    msaa_samples:           int   = 4
+    # Enable GL_LINE_SMOOTH for crisper wireframe/silhouette edges.
+    line_smoothing:         bool  = True
+    # Committed body mesh: max angle (radians) between adjacent facet normals on
+    # curved surfaces. Lower = smoother shading (fewer visible facets), more
+    # triangles. 0.3 ≈ 17°, 0.15 ≈ 8.6°.
+    mesh_angular_tol:       float = 0.15
+    # Chordal deviation as a fraction of the part's bbox diagonal, with an
+    # absolute floor in mm. Lower = curves hug the true surface more tightly.
+    mesh_deviation_scale:   float = 0.0005
+    mesh_deviation_floor:   float = 0.02
+    # Sketch curve display tessellation — segments per arc/spline for rendering.
+    # Higher = smoother big circles/arcs on screen.
+    sketch_curve_segments:  int   = 96
+
+    # ------------------------------------------------------------------
     # Camera
     # ------------------------------------------------------------------
     camera_rotate_speed:    float  = 1.0

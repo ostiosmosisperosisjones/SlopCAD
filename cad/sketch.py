@@ -1019,18 +1019,27 @@ class SketchEntry:
             # circles away from their snap-connected line endpoints.
             # The coincident(point, circle) constraints still let endpoints
             # slide freely along the circle surface.
+            # Concentric circles share one canonical center point (deduped by
+            # canon_map); pinning it once per circle drags the SAME point twice,
+            # which makes SolveSpace return result=1. Dedupe the drags.
+            dragged_cks: set = set()
             for i, ent in enumerate(self.entities):
                 if not isinstance(ent, ArcEntity):
                     continue
                 center_ck = canon_map.get((i, 'center'))
-                if center_ck and center_ck in slvs_pts:
+                if center_ck and center_ck in slvs_pts and center_ck not in dragged_cks:
                     slvs.dragged(slvs_pts[center_ck], wp)
+                    dragged_cks.add(center_ck)
         else:
+            dragged_cks = set()
             for con in self.constraints:
                 if con.type == 'distance':
                     i = con.indices[0]
                     if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
-                        slvs.dragged(slvs_pts[canon_map[(i, 'p0')]], wp)
+                        ck = canon_map[(i, 'p0')]
+                        if ck not in dragged_cks:
+                            slvs.dragged(slvs_pts[ck], wp)
+                            dragged_cks.add(ck)
 
         self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
                                           slvs_lines, slvs_arcs,
@@ -1046,12 +1055,14 @@ class SketchEntry:
                 implicit_lengths=False)
             if slvs2 is not None:
                 wp2, canon_map2, slvs_pts2, slvs_lines2, slvs_arcs2, arc_dist_ents2 = extras2
+                dragged_cks2: set = set()
                 for i, ent in enumerate(self.entities):
                     if not isinstance(ent, ArcEntity):
                         continue
                     center_ck = canon_map2.get((i, 'center'))
-                    if center_ck and center_ck in slvs_pts2:
+                    if center_ck and center_ck in slvs_pts2 and center_ck not in dragged_cks2:
                         slvs2.dragged(slvs_pts2[center_ck], wp2)
+                        dragged_cks2.add(center_ck)
                 self._apply_constraints_to_solver(slvs2, wp2, canon_map2, slvs_pts2,
                                                   slvs_lines2, slvs_arcs2,
                                                   arc_dist_ents2, self.constraints)

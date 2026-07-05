@@ -52,6 +52,16 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
     def __init__(self, workspace: Workspace, history: History):
         super().__init__()
+        # Request MSAA on this widget's own surface format. Setting only the
+        # app-wide default format is unreliable on some GLX/Mesa drivers, so we
+        # set it here too. Must happen before the GL context is created (i.e.
+        # before first show), which the constructor guarantees.
+        from cad.prefs import prefs as _prefs
+        if _prefs.msaa_samples and _prefs.msaa_samples > 0:
+            from PyQt6.QtGui import QSurfaceFormat
+            fmt = self.format()
+            fmt.setSamples(int(_prefs.msaa_samples))
+            self.setFormat(fmt)
         self.workspace = workspace
         self.history   = history
         self.camera    = Camera()
@@ -385,9 +395,45 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         glLightfv(GL_LIGHT0, GL_AMBIENT,  [0.2, 0.2, 0.2, 1])
         glEnable(GL_COLOR_MATERIAL)
         glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+
+        # Antialiasing. MSAA (if the context granted samples) smooths polygon
+        # silhouettes; line smoothing crisps up wireframe/sketch edges. Both are
+        # cheap on modern GPUs and driven by prefs.
+        if prefs.msaa_samples and prefs.msaa_samples > 0:
+            glEnable(GL_MULTISAMPLE)
+        if prefs.line_smoothing:
+            glEnable(GL_LINE_SMOOTH)
+            glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
         for mesh in self._meshes.values():
             if mesh.vbo_verts is None:
                 mesh.upload()
+
+    def _px_per_mm(self) -> float:
+        """On-screen device pixels per world-mm at the sketch/view plane.
+
+        Drives zoom-adaptive sketch curve tessellation. In ortho the view's
+        vertical extent is 2·ortho_scale world-mm mapped to the framebuffer
+        height (device px). In perspective we approximate at the camera target
+        depth using the 45° vertical FOV. Returns 0 if it can't be computed, so
+        callers fall back to the fixed segment count.
+        """
+        try:
+            h_px = max(1, self.height()) * self.devicePixelRatio()
+            if self.camera.ortho:
+                view_h_mm = 2.0 * self.camera.ortho_scale
+            else:
+                # Vertical world extent visible at the target plane:
+                # 2·distance·tan(fovy/2), fovy = 45°.
+                import math
+                view_h_mm = 2.0 * self.camera.distance * math.tan(math.radians(45) / 2.0)
+            if view_h_mm <= 1e-9:
+                return 0.0
+            return float(h_px / view_h_mm)
+        except Exception:
+            return 0.0
 
     def _set_projection(self, w, h):
         glMatrixMode(GL_PROJECTION)
@@ -486,7 +532,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                           camera_distance=self.camera.distance,
                           history=self.history,
                           editing_sketch_idx=self._editing_sketch_history_idx,
-                          in_sketch=self._sketch is not None) or []
+                          in_sketch=self._sketch is not None,
+                          px_per_mm=self._px_per_mm()) or []
 
             self._draw_sketch_vertex_overlays()
 
@@ -565,7 +612,12 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         painter.setFont(font)
         fm = QFontMetrics(font)
 
+        # Phase 1: project every label to its screen rect. Stash the resolved
+        # rect on the label dict so hit-testing (_hit_dim_label) uses the exact
+        # same position the pill is drawn at, even after de-collision below.
+        drawable = []
         for lbl in self._dim_labels:
+            lbl['screen_rect'] = None   # reset; may be re-set below
             wx, wy, wz = lbl['world']
             try:
                 sx, sy, _ = gluProject(wx, wy, wz,
@@ -578,10 +630,42 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             sx = int(sx / dpr)
             sy = int((self._viewport[3] - sy) / dpr)
 
-            text  = lbl['text']
-            tw    = fm.horizontalAdvance(text) + 10
-            th    = fm.height() + 6
-            rect  = QRect(sx - tw // 2, sy - th // 2, tw, th)
+            text = lbl['text']
+            tw   = fm.horizontalAdvance(text) + 10
+            th   = fm.height() + 6
+            drawable.append({'lbl': lbl, 'cx': sx, 'cy': sy, 'tw': tw, 'th': th})
+
+        # Phase 2: de-collide overlapping pills. Constraint markers (the little
+        # ||, ⊥, =, — glyphs) frequently share a line's midpoint, so several
+        # land on the same pixel and stack into an unreadable blob. Nudge any
+        # pill that overlaps an already-placed one straight down until it clears.
+        # Dimension pills (with leader lines) are placed first and never moved,
+        # so their glyphs stay anchored to their dimension line; free-floating
+        # constraint glyphs then nudge around them.
+        placed = []  # list of (x0, y0, x1, y1) already-committed rects
+        drawable.sort(key=lambda d: bool(d['lbl'].get('parallel')))
+        for d in drawable:
+            x0 = d['cx'] - d['tw'] // 2
+            y0 = d['cy'] - d['th'] // 2
+            if d['lbl'].get('parallel'):
+                # Push down in whole-row steps until this glyph clears every
+                # already-placed pill.
+                for _ in range(len(placed) + 1):
+                    r = (x0, y0, x0 + d['tw'], y0 + d['th'])
+                    hit = next((p for p in placed
+                                if r[0] < p[2] and r[2] > p[0]
+                                and r[1] < p[3] and r[3] > p[1]), None)
+                    if hit is None:
+                        break
+                    y0 = hit[3] + 2   # drop just below the pill we collided with
+            placed.append((x0, y0, x0 + d['tw'], y0 + d['th']))
+            d['x0'], d['y0'] = x0, y0
+
+        # Phase 3: draw.
+        for d in drawable:
+            lbl = d['lbl']
+            rect = QRect(d['x0'], d['y0'], d['tw'], d['th'])
+            lbl['screen_rect'] = (d['x0'], d['y0'], d['tw'], d['th'])
 
             dimmed = lbl.get('dimmed', False)
             bg_alpha  = 60  if dimmed else 200
@@ -594,7 +678,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
             # Text
             painter.setPen(QPen(QColor(140, 200, 255, txt_alpha)))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, lbl['text'])
 
         painter.end()
         self._draw_profiler_hud()
@@ -1551,6 +1635,14 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         font.setBold(True)
         fm = QFontMetrics(font)
         for lbl in self._dim_labels:
+            # Prefer the exact rect the pill was last drawn at (post de-collision
+            # nudge), so clicks land where the user sees the pill.
+            sr = lbl.get('screen_rect')
+            if sr is not None:
+                x0, y0, tw, th = sr
+                if x0 <= mx <= x0 + tw and y0 <= my <= y0 + th:
+                    return lbl
+                continue
             wx, wy, wz = lbl['world']
             try:
                 sx, sy, _ = gluProject(wx, wy, wz,

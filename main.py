@@ -103,11 +103,18 @@ def apply_dark_palette(app: QApplication):
 
 def main():
     from PyQt6.QtGui import QSurfaceFormat
+    from cad.prefs import prefs as _prefs
+    _prefs.load()
     fmt = QSurfaceFormat()
     fmt.setDepthBufferSize(24)
     fmt.setRedBufferSize(8)
     fmt.setGreenBufferSize(8)
     fmt.setBlueBufferSize(8)
+    # Multisample antialiasing — the single biggest win for crisp silhouettes
+    # and sketch lines. Sample count is a pref (0 disables). Set at context
+    # creation, so a change takes effect on the next launch.
+    if _prefs.msaa_samples and _prefs.msaa_samples > 0:
+        fmt.setSamples(int(_prefs.msaa_samples))
     QSurfaceFormat.setDefaultFormat(fmt)
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(

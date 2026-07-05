@@ -27,15 +27,23 @@ class Mesh:
         # diagonal so quality is roughly constant regardless of size, with an
         # absolute floor so small parts stay crisp and an angular tolerance
         # that keeps curves smooth either way.
+        from cad.prefs import prefs
         diag = _bbox_diagonal(shape)
-        base = max(0.05, diag * 0.001)   # 0.1% of size, ≥0.05 mm
+        # Fidelity knobs (live-tunable via prefs). Deviation scales with part
+        # size so quality is roughly size-independent, with an absolute floor so
+        # small parts stay crisp. Angular tolerance drives normal smoothness on
+        # curves — the dominant "faceted" factor for shading.
+        dev_scale = max(1e-5, float(prefs.mesh_deviation_scale))
+        dev_floor = max(1e-4, float(prefs.mesh_deviation_floor))
+        ang_tol   = max(0.02, float(prefs.mesh_angular_tol))
+        base = max(dev_floor, diag * dev_scale)
         # Retry with progressively looser tolerances if the tessellator returns
         # a face count that doesn't match shape.faces() (ocp_tessellate bug).
         # A caller-supplied deviation skips to that quality tier immediately.
         _attempts = [
-            dict(deviation=base,       quality=base,       angular_tolerance=0.3),
-            dict(deviation=base * 3,   quality=base * 3,   angular_tolerance=0.5),
-            dict(deviation=base * 8,   quality=base * 8,   angular_tolerance=0.8),
+            dict(deviation=base,       quality=base,       angular_tolerance=ang_tol),
+            dict(deviation=base * 3,   quality=base * 3,   angular_tolerance=ang_tol * 1.7),
+            dict(deviation=base * 8,   quality=base * 8,   angular_tolerance=ang_tol * 2.7),
         ]
         if deviation is not None:
             _attempts = [dict(deviation=deviation, quality=deviation,
@@ -76,9 +84,11 @@ class Mesh:
         # True topological edges — each is a (N,3) polyline in world mm.
         # topo_edges_occ is the parallel list of raw TopoDS_Edge objects,
         # used when projecting reference geometry to preserve true curve type.
+        # Discretise at the SAME tolerances the mesh used so a highlighted edge
+        # traces the wireframe/part edge 1:1 instead of looking coarser.
         with profiler.section("mesh.topo_edges"):
             self.topo_edges, self.topo_edges_occ, self.topo_edge_face_normals = \
-                _extract_topo_edges(shape)
+                _extract_topo_edges(shape, angular_tol=ang_tol, chordal_tol=base)
 
         # Legacy compatibility
         self.center = np.array([0.0, 0.0, 0.0])
@@ -184,12 +194,16 @@ def _extract_topo_verts(shape) -> np.ndarray:
     return np.array(pts, dtype=np.float32)
 
 
-def _extract_topo_edges(shape) -> tuple[list[np.ndarray], list, list]:
+def _extract_topo_edges(shape, angular_tol: float = 0.2,
+                        chordal_tol: float = 0.05) -> tuple[list[np.ndarray], list, list]:
     """
     Extract topological edges from a build123d shape via OCCT.
 
     Uses curvature-adaptive sampling (GCPnts_TangentialDeflection) so straight
     lines get 2 points and curves get only as many as needed to look smooth.
+
+    angular_tol / chordal_tol default to a coarse setting but callers pass the
+    mesh's own tolerances so highlighted edges match the wireframe 1:1.
 
     Returns
     -------
@@ -261,8 +275,11 @@ def _extract_topo_edges(shape) -> tuple[list[np.ndarray], list, list]:
             first   = adaptor.FirstParameter()
             last    = adaptor.LastParameter()
 
-            # Adaptive: angular deflection 0.2 rad (~11°), chordal 0.05 mm
-            discretiser = GCPnts_TangentialDeflection(adaptor, 0.2, 0.05)
+            # Curvature-adaptive discretisation at the mesh's own tolerances so
+            # a highlighted edge traces the part edge 1:1. GCPnts wants strictly
+            # positive tolerances; clamp to sane floors.
+            discretiser = GCPnts_TangentialDeflection(
+                adaptor, max(1e-3, float(angular_tol)), max(1e-4, float(chordal_tol)))
 
             pts = []
             n = discretiser.NbPoints()

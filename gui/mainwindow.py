@@ -478,6 +478,10 @@ class MainWindow(QMainWindow):
         prefs_act.triggered.connect(self._open_prefs)
         view_menu.addAction(prefs_act)
 
+        fidelity_act = QAction("Visual Fidelity…", self)
+        fidelity_act.triggered.connect(self._open_fidelity)
+        view_menu.addAction(fidelity_act)
+
         ops_menu = menubar.addMenu("Operations")
 
         extrude_act = QAction(
@@ -514,6 +518,19 @@ class MainWindow(QMainWindow):
             self._sidebar.history_panel.refresh()
             # Rebuild op tooltips so a changed keybinding shows right away
             self._ops_toolbar.refresh_tooltips()
+
+    def _open_fidelity(self):
+        if not self._viewport:
+            return
+        # Non-modal, single-instance: reuse if already open.
+        dlg = getattr(self, "_fidelity_dlg", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        from gui.fidelity_dialog import FidelityDialog
+        self._fidelity_dlg = FidelityDialog(self._viewport, self)
+        self._fidelity_dlg.show()
 
     def _toggle_projection(self):
         if self._viewport:

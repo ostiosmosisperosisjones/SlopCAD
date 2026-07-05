@@ -238,8 +238,10 @@ class HoverState:
                     pts3d = np.array([_uv_to_world(ent.p0),
                                       _uv_to_world(ent.p1)], dtype=np.float32)
                 elif isinstance(ent, (ArcEntity, SplineEntity)):
+                    from cad.prefs import prefs
                     pts3d = np.array([_uv_to_world(p)
-                                      for p in ent.tessellate(64)], dtype=np.float32)
+                                      for p in ent.tessellate(prefs.sketch_curve_segments)],
+                                     dtype=np.float32)
                 else:
                     continue
                 key = _sketch_key(i, j)
@@ -274,8 +276,10 @@ class HoverState:
                 p1_world = sketch.plane.to_3d(float(ent.p1[0]), float(ent.p1[1]))
                 pts3d = np.array([p0_world, p1_world], dtype=np.float32)
             elif isinstance(ent, (ArcEntity, SplineEntity)):
+                from cad.prefs import prefs
                 pts3d = np.array([sketch.plane.to_3d(float(p[0]), float(p[1]))
-                                  for p in ent.tessellate(64)], dtype=np.float32)
+                                  for p in ent.tessellate(prefs.sketch_curve_segments)],
+                                 dtype=np.float32)
             else:
                 continue
             key = _sketch_key(-1, j)
