@@ -604,6 +604,11 @@ class CrossBodyCutOp(Op):
     start_offset:      float = 0.0
     end_offset:        float = 0.0
     draft_angle:       float = 0.0   # taper angle in degrees (signed)
+    # Baked selection of sketch-face indices the tool is built from (sketch-
+    # driven cuts only). None → use every closed loop the sketch produces.
+    # Baked at commit so replay reproduces the user's selection instead of
+    # reading mutable UI state (see op pick/selection pitfalls).
+    face_indices:      list[int] | None = None
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         import numpy as np
@@ -649,7 +654,16 @@ class CrossBodyCutOp(Op):
             all_faces, _ = sketch_entry.build_faces()
             if not all_faces:
                 raise RuntimeError("CrossBodyCutOp: sketch has no closed loops")
-            faces = all_faces
+            if self.face_indices is not None:
+                # Rebuild the tool from exactly the faces the user selected at
+                # commit. Guard against out-of-range indices from a sketch that
+                # changed shape on replay; fall back to all faces if the baked
+                # selection resolves to nothing.
+                sel = [all_faces[i] for i in self.face_indices
+                       if 0 <= i < len(all_faces)]
+                faces = sel if sel else all_faces
+            else:
+                faces = all_faces
         else:
             src_shape = history._shape_for_body_at(self.source_body_id, entry_index)
             if src_shape is None:
@@ -895,10 +909,13 @@ class CrossBodyCutOp(Op):
             p["end_offset"] = self.end_offset
         if self.draft_angle:
             p["draft_angle"] = self.draft_angle
+        if self.face_indices is not None:
+            p["face_indices"] = list(self.face_indices)
         return p
 
     @classmethod
     def _from_params(cls, params: dict, sign: int = 1) -> "CrossBodyCutOp":
+        fi = params.get("face_indices")
         return cls(
             cut_body_id      = params.get("cut_body_id", ""),
             source_body_id   = params.get("source_body_id", ""),
@@ -910,6 +927,7 @@ class CrossBodyCutOp(Op):
             start_offset     = float(params.get("start_offset", 0.0)),
             end_offset       = float(params.get("end_offset", 0.0)),
             draft_angle      = float(params.get("draft_angle", 0.0)),
+            face_indices     = list(fi) if fi is not None else None,
         )
 
 
