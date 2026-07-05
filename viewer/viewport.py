@@ -443,9 +443,19 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             s = self.camera.ortho_scale
             glOrtho(-s * aspect, s * aspect, -s, s, -50000, 50000)
         else:
-            near = max(0.1, self.camera.distance * 0.001)
-            gluPerspective(45, aspect, near,
-                           max(50000, self.camera.distance * 100))
+            # Fit near/far tightly around the actual scene depth. The eye sits
+            # `distance` from the target and the scene spans ~`_scene_extent`
+            # around it, so useful depth lives in
+            # [distance − extent, distance + extent]. A fixed far floor (was
+            # 50000 mm) blows the near/far ratio to ~10⁵ and wrecks 24-bit depth
+            # precision — which shows up as z-fighting "frizzle" on thin curved
+            # features like small-radius fillets. Keep the ratio bounded.
+            dist   = self.camera.distance
+            extent = max(dist * 0.05, getattr(self.camera, "_scene_extent", dist))
+            far  = dist + extent * 1.5
+            near = max(dist - extent * 1.5, far / 5000.0)  # cap far/near ≤ 5000
+            near = max(near, 1e-3)
+            gluPerspective(45, aspect, near, far)
         glMatrixMode(GL_MODELVIEW)
 
     def resizeGL(self, w, h):
