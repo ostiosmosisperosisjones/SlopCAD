@@ -19,7 +19,7 @@ takes effect on the next launch — the row is labelled accordingly.
 from __future__ import annotations
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QSlider,
-    QCheckBox, QComboBox, QPushButton, QFrame, QSizePolicy,
+    QComboBox, QPushButton, QFrame, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
@@ -106,12 +106,9 @@ class FidelityDialog(QDialog):
                   to_val=lambda i: 16 + i,
                   from_val=lambda v: int(round(v)) - 16))
 
-        # ---- Line smoothing (bool) --------------------------------------
-        self._line_smooth = QCheckBox("Line smoothing (crisp edges)")
-        self._line_smooth.setChecked(bool(prefs.line_smoothing))
-        self._line_smooth.toggled.connect(self._on_line_smooth)
-        grid.addWidget(self._line_smooth, r, 0, 1, 3)
-        r += 1
+        # (Line smoothing removed — GL_LINE_SMOOTH's coverage-AA fringes z-fight
+        # against depth-tested wireframe and cause speckle "frizzle". MSAA
+        # antialiases lines cleanly instead.)
 
         # ---- MSAA (restart-scoped) --------------------------------------
         msaa_row = QHBoxLayout()
@@ -195,20 +192,6 @@ class FidelityDialog(QDialog):
         else:
             self._rebuild_meshes()
 
-    def _on_line_smooth(self, checked):
-        prefs.line_smoothing = bool(checked)
-        vp = self._vp
-        vp.makeCurrent()
-        from OpenGL.GL import (glEnable, glDisable, glHint, GL_LINE_SMOOTH,
-                               GL_LINE_SMOOTH_HINT, GL_NICEST)
-        if checked:
-            glEnable(GL_LINE_SMOOTH)
-            glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
-        else:
-            glDisable(GL_LINE_SMOOTH)
-        vp.doneCurrent()
-        vp.update()
-
     def _on_msaa(self, _idx):
         prefs.msaa_samples = int(self._msaa.currentData())
 
@@ -234,7 +217,7 @@ class FidelityDialog(QDialog):
         d = type(prefs)()
         for attr in ("mesh_angular_tol", "mesh_deviation_scale",
                      "mesh_deviation_floor", "sketch_curve_segments",
-                     "line_smoothing", "msaa_samples"):
+                     "msaa_samples"):
             setattr(prefs, attr, getattr(d, attr))
         # Refresh widgets from the restored values.
         for knob, s, vlabel in self._rows:
@@ -243,11 +226,9 @@ class FidelityDialog(QDialog):
             s.setValue(max(0, min(knob.steps, knob.from_val(cur))))
             s.blockSignals(False)
             vlabel.setText(knob.fmt(cur))
-        self._line_smooth.setChecked(bool(prefs.line_smoothing))
         cur = int(prefs.msaa_samples or 0)
         self._msaa.setCurrentIndex(self._msaa_values.index(cur)
                                    if cur in self._msaa_values else 2)
-        self._on_line_smooth(prefs.line_smoothing)
         self._rebuild_meshes()
 
     # ------------------------------------------------------------------

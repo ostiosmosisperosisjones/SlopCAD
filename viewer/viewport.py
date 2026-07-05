@@ -396,16 +396,15 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         glEnable(GL_COLOR_MATERIAL)
         glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
 
-        # Antialiasing. MSAA (if the context granted samples) smooths polygon
-        # silhouettes; line smoothing crisps up wireframe/sketch edges. Both are
-        # cheap on modern GPUs and driven by prefs.
+        # Antialiasing. MSAA (multisample rasterisation) antialiases BOTH
+        # polygon silhouettes and lines cleanly, with no blending required. We
+        # deliberately do NOT use GL_LINE_SMOOTH: coverage-AA lines need alpha
+        # blending, and when the wireframe is depth-tested against a surface the
+        # partial-coverage fringe fragments z-fight and deposit dark speckles
+        # along the edge — the "frizzle" that got worse zoomed out (denser
+        # edges) and cleared up zoomed in. MSAA handles line AA without that.
         if prefs.msaa_samples and prefs.msaa_samples > 0:
             glEnable(GL_MULTISAMPLE)
-        if prefs.line_smoothing:
-            glEnable(GL_LINE_SMOOTH)
-            glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         for mesh in self._meshes.values():
             if mesh.vbo_verts is None:
