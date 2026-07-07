@@ -409,6 +409,21 @@ _SVG_INCLUDE = """
             stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>"""
 
+# Image trace: a photo frame with a traced vector line emerging
+_SVG_IMPORT_IMAGE = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <rect x="6" y="8" width="18" height="14" rx="1.5" fill="none"
+        stroke="#90a4ae" stroke-width="1.8"/>
+  <circle cx="11" cy="13" r="1.8" fill="#90a4ae"/>
+  <path d="M8,20 L13,15 L17,18 L22,12" fill="none" stroke="#90a4ae"
+        stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+        opacity="0.7"/>
+  <path d="M20,26 L26,20 L30,24 L34,18" fill="none" stroke="#4fc3f7"
+        stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="20" cy="26" r="2" fill="#4fc3f7"/>
+  <circle cx="34" cy="18" r="2" fill="#4fc3f7"/>
+</svg>"""
+
 # Spline: a smooth curve through node dots
 _SVG_SPLINE = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
@@ -631,6 +646,7 @@ class SketchToolbar(QToolBar):
     tool_mirror_requested        = pyqtSignal()
     tool_pattern_requested       = pyqtSignal(str)   # emits "linear" | "circular"
     tool_construction_requested  = pyqtSignal()
+    tool_import_image_requested  = pyqtSignal()
     tool_constraint_requested  = pyqtSignal(str)   # emits constraint mode
     commit_requested           = pyqtSignal()
 
@@ -678,6 +694,9 @@ class SketchToolbar(QToolBar):
         self._btn_include = self._add_btn(
             "Include  I", _SVG_INCLUDE, self.tool_include_requested,
             "Include geometry  (I)")
+        self._btn_import_image = self._add_btn(
+            "Image", _SVG_IMPORT_IMAGE, self.tool_import_image_requested,
+            "Trace an image into sketch geometry")
         self._btn_mirror = self._add_btn(
             "Mirror  M", _SVG_MIRROR, self.tool_mirror_requested,
             "Mirror selected geometry across a line  (M)")

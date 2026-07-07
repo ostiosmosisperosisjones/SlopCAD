@@ -82,6 +82,8 @@ class MainWindow(QMainWindow):
             self._sketch_pattern)
         self._sketch_toolbar.tool_construction_requested.connect(
             self._sketch_construction)
+        self._sketch_toolbar.tool_import_image_requested.connect(
+            self._sketch_import_image)
         self._sketch_toolbar.tool_constraint_requested.connect(
             self._sketch_set_constraint)
         self._sketch_toolbar.commit_requested.connect(
@@ -166,6 +168,21 @@ class MainWindow(QMainWindow):
         n = IncludeTool.apply_with_history(
             vp._sketch, vp.selection, vp._meshes, vp.history)
         if not n:
+            vp._sketch._entity_snapshots.pop()
+        vp.update()
+
+    def _sketch_import_image(self):
+        """Toolbar Image — open the trace modal, append fitted geometry."""
+        if not self._viewport or not self._viewport._sketch:
+            return
+        from cad.sketch_tools.image_import import ImageImportTool
+        vp = self._viewport
+        vp._sketch.push_undo_snapshot()
+        n = ImageImportTool.apply(vp._sketch, vp)
+        if n:
+            print(f"[Sketch] Traced {n} line "
+                  f"{'segment' if n == 1 else 'segments'} from image")
+        else:
             vp._sketch._entity_snapshots.pop()
         vp.update()
 

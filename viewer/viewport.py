@@ -1372,6 +1372,17 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     print("[Sketch] Nothing selected to include — "
                           "select edges, vertices, or sketch lines first.")
                 return
+            elif prefs.matches("sketch_import_image", e):
+                from cad.sketch_tools.image_import import ImageImportTool
+                self._sketch.push_undo_snapshot()
+                n = ImageImportTool.apply(self._sketch, self)
+                if n:
+                    print(f"[Sketch] Traced {n} line "
+                          f"{'segment' if n == 1 else 'segments'} from image")
+                    self.update()
+                else:
+                    self._sketch._entity_snapshots.pop()
+                return
             elif prefs.matches("sketch_construction", e):
                 self._toggle_construction()
                 return

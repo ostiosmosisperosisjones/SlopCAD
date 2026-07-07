@@ -63,6 +63,7 @@ KEYBIND_DEFAULTS: dict[str, str] = {
     "sketch_spline":     "B",
     "sketch_construction": "G",
     "sketch_mirror":     "M",
+    "sketch_import_image": "",
     "sketch_commit":     "Return",
     # Sketch mode — snap declarations (take priority over tool switches when tool active)
     "snap_endpoint":     "E",
@@ -89,6 +90,7 @@ KEYBINDS_SKETCH: frozenset[str] = frozenset({
     "sketch_divide", "sketch_point", "sketch_offset", "sketch_fillet",
     "sketch_include", "sketch_dimension", "sketch_geometric", "sketch_square",
     "sketch_spline", "sketch_construction", "sketch_mirror",
+    "sketch_import_image",
     "sketch_commit", "snap_endpoint", "snap_midpoint", "snap_center",
     "snap_nearest", "snap_tangent", "snap_intersection",
     "sketch_hline", "sketch_vline", "sketch_projection_toggle",
@@ -117,6 +119,7 @@ KEYBIND_LABELS: dict[str, tuple[str, str]] = {
     "sketch_square":            ("Sketch",     "Square tool (2-point)"),
     "sketch_spline":            ("Sketch",     "Spline tool (fit through points)"),
     "sketch_construction":      ("Sketch",     "Toggle selected geometry construction/normal"),
+    "sketch_import_image":      ("Sketch",     "Trace an image into sketch geometry"),
     "sketch_mirror":            ("Sketch",     "Mirror selected geometry across a clicked line"),
     "snap_endpoint":            ("Sketch",     "Force snap: endpoint"),
     "snap_midpoint":            ("Sketch",     "Force snap: midpoint"),

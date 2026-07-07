@@ -44,6 +44,7 @@ class SketchTool(Enum):
     PATTERN_LINEAR   = auto()
     PATTERN_CIRCULAR = auto()
     SPLINE    = auto()
+    IMPORT_IMAGE = auto()   # one-shot: trace a raster into LineEntity chains
 
 
 # ---------------------------------------------------------------------------
