@@ -58,5 +58,7 @@ PyQt6 and PyOpenGL (interface and viewport), NumPy / SciPy / scikit-image
 
 ## License
 
-GPLv3. See [LICENSE](LICENSE). 
+Copyright (C) 2026 ostiosmosisperosisjones
+
+GPLv3. See [LICENSE](LICENSE).
 
