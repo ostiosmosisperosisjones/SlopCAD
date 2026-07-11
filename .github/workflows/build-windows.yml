@@ -50,10 +50,10 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --noconfirm --clean cadapp.spec
+          pyinstaller --noconfirm --clean slopcad.spec
 
       - name: Zip output
-        run: Compress-Archive -Path dist/cadapp/* -DestinationPath dist/cadapp-windows.zip
+        run: Compress-Archive -Path dist/slopcad/* -DestinationPath dist/slopcad-windows.zip
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
@@ -61,7 +61,7 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TAG }}
           prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
-          files: dist/cadapp-windows.zip
+          files: dist/slopcad-windows.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -91,7 +91,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --noconfirm --clean cadapp.spec
+          pyinstaller --noconfirm --clean slopcad.spec
 
       - name: Download appimagetool
         run: |
@@ -100,20 +100,20 @@ jobs:
 
       - name: Strip bundled GL/XCB libs so system Mesa is used instead
         run: |
-          cd dist/cadapp/_internal
+          cd dist/slopcad/_internal
           rm -f libGL.so* libGL-*.so* libEGL.so* libEGL-*.so*
           rm -f libxcb-glx.so*
 
       - name: Assemble AppDir
         run: |
           mkdir -p AppDir/usr/bin
-          cp -r dist/cadapp/* AppDir/usr/bin/
+          cp -r dist/slopcad/* AppDir/usr/bin/
 
-          cat > AppDir/cadapp.desktop << 'EOF'
+          cat > AppDir/slopcad.desktop << 'EOF'
           [Desktop Entry]
-          Name=cadapp
-          Exec=cadapp
-          Icon=cadapp
+          Name=SlopCAD
+          Exec=slopcad
+          Icon=slopcad
           Type=Application
           Categories=Graphics;
           EOF
@@ -122,20 +122,20 @@ jobs:
           python3 -c "
           import base64, pathlib
           png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg==')
-          pathlib.Path('AppDir/cadapp.png').write_bytes(png)
+          pathlib.Path('AppDir/slopcad.png').write_bytes(png)
           "
 
           cat > AppDir/AppRun << 'EOF'
           #!/bin/bash
           HERE="$(dirname "$(readlink -f "$0")")"
           export LD_LIBRARY_PATH="/usr/lib:/usr/lib/x86_64-linux-gnu:$HERE/usr/bin:$HERE/usr/bin/_internal"
-          exec "$HERE/usr/bin/cadapp" "$@"
+          exec "$HERE/usr/bin/slopcad" "$@"
           EOF
           chmod +x AppDir/AppRun
 
       - name: Build AppImage
         run: |
-          ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir cadapp-linux.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir slopcad-linux.AppImage
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
@@ -143,6 +143,6 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TAG }}
           prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
-          files: cadapp-linux.AppImage
+          files: slopcad-linux.AppImage
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

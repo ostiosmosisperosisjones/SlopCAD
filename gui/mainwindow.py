@@ -23,7 +23,7 @@ from gui.sidebar import Sidebar
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("cadapp")
+        self.setWindowTitle("SlopCAD")
         self.resize(1280, 768)
         self._viewport: Viewport | None = None
         self._sidebar:  Sidebar  | None = None

@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
-# PyInstaller spec for cadapp.
+# PyInstaller spec for SlopCAD.
 #
 # build123d / OCP load a lot of modules dynamically, so we list the key
 # hidden imports explicitly.  The collect_* helpers grab all the data files
@@ -53,7 +53,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="cadapp",
+    name="slopcad",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -68,5 +68,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="cadapp",
+    name="slopcad",
 )
