@@ -24,7 +24,7 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QSlider,
     QCheckBox, QPushButton, QFrame, QFileDialog, QWidget, QComboBox,
-    QScrollArea,
+    QScrollArea, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QRect
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
@@ -194,22 +194,24 @@ class ImageTraceModal(QDialog):
         self._result: list | None = None            # accepted entities
         self._params = TraceParams()
 
+        # Initial size; the real fit-to-screen happens in showEvent() once the
+        # dialog is mapped and we know which monitor it actually landed on
+        # (self.screen() is unreliable before the window is shown).  The dial
+        # list is long, so the scroll area shrinks and scrolls internally while
+        # the fixed footer stays reachable.
         self.resize(1000, 720)
+
         root = QHBoxLayout(self)
         self._preview = _PreviewPane()
         root.addWidget(self._preview, stretch=1)
 
-        # Controls live in a scroll area — there are many live dials and they
-        # must not push the dialog taller than the screen.
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(320)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        panel_host = QWidget()
-        scroll.setWidget(panel_host)
-        panel = QVBoxLayout(panel_host)
-        root.addWidget(scroll)
+        # Right-hand controls column: a scrolling dial list + a FIXED footer
+        # (count + Reset + Cancel/Add) that never scrolls off.
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        root.addLayout(col)
 
+        # Load / reset-view live above the scroll so they're always visible.
         row0 = QHBoxLayout()
         load_btn = QPushButton("Load Image…")
         load_btn.clicked.connect(self._on_load)
@@ -217,14 +219,41 @@ class ImageTraceModal(QDialog):
         view_btn = QPushButton("Reset view")
         view_btn.clicked.connect(lambda: self._preview.reset_view())
         row0.addWidget(view_btn)
-        panel.addLayout(row0)
+        col.addLayout(row0)
         hint = QLabel("Scroll to zoom · drag to pan")
         hint.setStyleSheet("color:#777; font-size:10px;")
-        panel.addWidget(hint)
+        col.addWidget(hint)
+
+        # The dials scroll — there are many and they must not push the dialog
+        # past the screen height.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(360)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # A small minimum lets the scroll area SHRINK below its content's natural
+        # height; without this it reports the full dial-stack height as its
+        # minimum and pushes the footer (and dialog) past the screen.  stretch=1
+        # then makes it absorb all spare vertical space.
+        scroll.setMinimumHeight(120)
+        scroll.setSizePolicy(QSizePolicy.Policy.Fixed,
+                             QSizePolicy.Policy.Ignored)
+        panel_host = QWidget()
+        scroll.setWidget(panel_host)
+        panel = QVBoxLayout(panel_host)
+        col.addWidget(scroll, stretch=1)
 
         from cad.trace.fit import FitParams
         fp = FitParams()
         grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        # Only the slider column (1) may grow; the label (0) and value (2)
+        # columns are fixed-ish, so long labels can't force the grid wider than
+        # the panel and clip the value readouts off the right edge.
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 0)
         panel.addLayout(grid)
         r = 0
 
@@ -244,6 +273,32 @@ class ImageTraceModal(QDialog):
             nonlocal r
             self._add_fslider(grid, r, key, label, lo, hi, val, scale, suffix)
             r += 1
+
+        # --- Trace mode: which front end turns the mask into ordered points ---
+        # Fill = boundary follow (silhouettes/filled shapes); Stroke = skeleton
+        # centerline (line art / CAD sketches / hand traces).  Both feed the same
+        # fitter.  Stroke exposes a spur-prune length.
+        group("Trace mode")
+        grid.addWidget(QLabel("Mode"), r, 0)
+        self._mode = QComboBox()
+        self._mode.addItems(["Fill (silhouette)", "Stroke (centerline)"])
+        self._mode.currentIndexChanged.connect(self._on_mode_changed)
+        grid.addWidget(self._mode, r, 1, 1, 2); r += 1
+        slider("prune", "Spur prune", 0, 30, self._params.prune_len, suffix="px")
+        self._auto_side = QCheckBox("Auto-pick stroke side")
+        self._auto_side.setChecked(self._params.auto_stroke_side)
+        self._auto_side.setToolTip(
+            "Stroke mode traces the thin ink, not the background it sits on.\n"
+            "When on, the tracer flips to the minority region automatically so\n"
+            "dark-on-light art works regardless of the Invert toggle.")
+        self._auto_side.toggled.connect(self._retrace)
+        grid.addWidget(self._auto_side, r, 0, 1, 3); r += 1
+        mode_hint = QLabel("Stroke traces ink centerlines; white in the preview "
+                           "is what's traced.")
+        mode_hint.setWordWrap(True)
+        mode_hint.setMaximumWidth(330)   # force wrap; don't widen the grid
+        mode_hint.setStyleSheet("color:#777; font-size:10px;")
+        grid.addWidget(mode_hint, r, 0, 1, 3); r += 1
 
         # --- Colour / tone / noise preprocessing (the OMAX "colour levers") ---
         # Applied BEFORE thresholding; the preview backdrop shows the resulting
@@ -307,22 +362,48 @@ class ImageTraceModal(QDialog):
         self._scale.value_changed.connect(lambda _mm: self._retrace())
         grid.addWidget(self._scale, r, 1, 1, 2); r += 1
 
+        panel.addStretch(1)
+
+        # --- fixed footer (outside the scroll): count + reset + actions ---
         self._count_lbl = QLabel("—")
         self._count_lbl.setStyleSheet("color: #888;")
-        panel.addWidget(self._count_lbl)
+        col.addWidget(self._count_lbl)
 
         reset = QPushButton("Reset dials")
         reset.clicked.connect(self._reset_dials)
-        panel.addWidget(reset)
-
-        panel.addStretch(1)
+        col.addWidget(reset)
 
         btn_row = QHBoxLayout()
         cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
         accept = QPushButton("Add to Sketch"); accept.clicked.connect(self._on_accept)
         accept.setDefault(True)
         btn_row.addWidget(cancel); btn_row.addWidget(accept)
-        panel.addLayout(btn_row)
+        col.addLayout(btn_row)
+
+    def showEvent(self, event):
+        """Fit the dialog to the monitor it actually opened on, once mapped.
+
+        Done here (not in __init__) because self.screen() is only reliable after
+        the window exists on a real screen.  We cap the height to the available
+        screen area minus WM chrome headroom, then nudge the window fully
+        on-screen — otherwise a tall dialog centred by the WM can hang off the
+        bottom, clipping the scroll box and footer."""
+        super().showEvent(event)
+        screen = self.screen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        wm_margin = 90                    # title bar / taskbar headroom
+        max_h = max(360, avail.height() - wm_margin)
+        if self.height() > max_h:
+            self.resize(self.width(), max_h)
+        # Pull the window back on-screen if the WM placed it hanging off an edge.
+        g = self.frameGeometry()
+        if g.bottom() > avail.bottom():
+            g.moveBottom(avail.bottom() - 8)
+        if g.top() < avail.top():
+            g.moveTop(avail.top() + 8)
+        self.move(g.topLeft())
 
     # ------------------------------------------------------------------
     # Widget helpers
@@ -362,6 +443,8 @@ class ImageTraceModal(QDialog):
         fp = FitParams()
         pp = PreprocParams()
         defaults = {
+            # mode
+            "prune": self._params.prune_len,
             # preprocessing
             "black_pt": pp.black_point, "white_pt": pp.white_point,
             "gamma": pp.gamma / 0.01, "median": pp.median,
@@ -385,6 +468,13 @@ class ImageTraceModal(QDialog):
     # Pipeline
     # ------------------------------------------------------------------
 
+    def _on_mode_changed(self, _idx):
+        """Fill/Stroke switch: re-trace with the newly selected front end."""
+        self._retrace()
+
+    def _trace_mode(self) -> str:
+        return "stroke" if self._mode.currentIndex() == 1 else "fill"
+
     def _read_params(self) -> TraceParams:
         scale = self._scale.mm_value()
         return TraceParams(
@@ -394,6 +484,9 @@ class ImageTraceModal(QDialog):
             invert      = self._invert.isChecked(),
             use_canny   = False,
             scale_mm    = scale if scale is not None else 100.0,
+            trace_mode  = self._trace_mode(),
+            prune_len   = int(self._sval("prune")),
+            auto_stroke_side = self._auto_side.isChecked(),
         )
 
     def _read_fit_params(self):
@@ -443,10 +536,22 @@ class ImageTraceModal(QDialog):
             self._count_lbl.setText(f"trace error: {ex}")
             return
         self._segments = segs
-        # Backdrop shows the PROCESSED gray — exactly what the tracer saw — so
-        # colour/tone/noise levers are tunable by eye.  Preserve zoom/pan.
-        h, w = gray.shape
-        self._preview.set_image(self._gray_to_qimage(gray), (w, h),
+        # Backdrop shows exactly what the tracer saw so it's tunable by eye.
+        # Fill mode: the processed gray.  Stroke mode: the actual mask being
+        # skeletonized (after auto side-pick) — white = the stroke we trace, so
+        # a wrong-side selection is immediately obvious (the whole field lights
+        # up instead of just the ink).
+        if params.trace_mode == "stroke":
+            try:
+                from cad.image_trace import stroke_mask
+                m = stroke_mask(self._image, params, preproc)
+                backdrop = (m.astype(np.uint8) * 255)
+            except Exception:
+                backdrop = gray
+        else:
+            backdrop = gray
+        h, w = backdrop.shape
+        self._preview.set_image(self._gray_to_qimage(backdrop), (w, h),
                                 reset_view=False)
         self._preview.set_segments(segs)
         from cad.trace.fit import LineSeg, ArcSeg, PolySeg

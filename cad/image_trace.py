@@ -46,6 +46,17 @@ class TraceParams:
     # --- placement (UV offset of the image's top-left, in mm) ---
     origin_u:    float = 0.0
     origin_v:    float = 0.0
+    # --- front-end selection (V3) ---
+    #   "fill"   : boundary-follow (cad.trace.contours) — silhouettes/filled
+    #   "stroke" : skeleton centerline (cad.trace.skeleton+walk) — line art
+    trace_mode:  str   = "fill"
+    prune_len:   int   = 8        # stroke mode: skeleton spur prune length (px)
+    # Stroke mode must skeletonize the *stroke* (thin, minority region), not the
+    # background it sits on.  When the thresholded foreground fills most of the
+    # image it is almost certainly the background, so auto-flip which side we
+    # skeletonize.  This makes stroke mode "just work" for dark-on-light art
+    # regardless of the invert toggle.  Turn off to force the literal mask.
+    auto_stroke_side: bool = True
 
 
 def _to_gray(image: np.ndarray) -> np.ndarray:
@@ -153,11 +164,13 @@ def trace_segments_with_gray(image: np.ndarray, params: TraceParams,
     """Like trace_segments but also returns the processed gray the mask was
     formed from, so the preview can show exactly what the tracer saw.
 
+    The front end is selected by params.trace_mode:
+      "fill"   → boundary follow (contours.py) — the V2 default.
+      "stroke" → skeleton centerline (skeleton.py + walk.py) — V3, for line art.
+    Both feed the SAME fit.py back end, so segments_to_entities is unchanged.
+
     Returns (segments, processed_gray_uint8)."""
-    from cad.trace.mask import (build_mask, threshold_mask, preprocess_gray,
-                                to_gray)
-    from cad.trace.contours import trace_contours
-    from cad.trace.fit import fit_contours
+    from cad.trace.mask import threshold_mask, preprocess_gray
 
     if preproc is not None:
         gray = preprocess_gray(image, preproc)
@@ -168,8 +181,70 @@ def trace_segments_with_gray(image: np.ndarray, params: TraceParams,
         gray = gaussian_blur(gray, params.blur)
         mask = threshold_mask(gray, params.threshold, params.invert)
 
+    if params.trace_mode == "stroke":
+        mask = _stroke_side(mask, params)
+        return _fit_stroke(mask, params, fit_params), gray
+
+    from cad.trace.contours import trace_contours
+    from cad.trace.fit import fit_contours
     contours = trace_contours(mask, min_area=params.min_area_px)
     return fit_contours(contours, fit_params), gray
+
+
+def _stroke_side(mask, params: TraceParams):
+    """Pick the mask side to skeletonize in stroke mode.
+
+    The stroke is the thin, minority region; if the current foreground fills
+    most of the image it's the background, so flip.  Returns the (possibly
+    inverted) mask.  A no-op when auto_stroke_side is off."""
+    if not params.auto_stroke_side:
+        return mask
+    frac = float(mask.mean())            # fraction of pixels that are foreground
+    return ~mask if frac > 0.5 else mask
+
+
+def stroke_mask(image: np.ndarray, params: TraceParams, preproc=None):
+    """The boolean mask stroke mode actually skeletonizes (after auto side-pick).
+
+    Exposed so the modal preview can show exactly what the tracer saw, matching
+    the fill-mode convention where the backdrop reflects the tracer's input."""
+    from cad.trace.mask import threshold_mask, preprocess_gray
+    if preproc is not None:
+        gray = preprocess_gray(image, preproc)
+    else:
+        gray = _to_gray(image)
+        from cad.trace.mask import gaussian_blur
+        gray = gaussian_blur(gray, params.blur)
+    mask = threshold_mask(gray, params.threshold, params.invert)
+    return _stroke_side(mask, params)
+
+
+def _fit_stroke(mask, params: TraceParams, fit_params=None) -> list:
+    """V3 stroke front end: mask → skeleton → prune → walk → fit each branch.
+
+    Reuses fit.py exactly like the fill path: closed branches go through
+    fit_loop, open branches through _fit_run.  Emits the CENTERLINE primitives
+    (offset-to-boundary is a separate step; see cad.trace.offset).  `mask` is
+    assumed already side-picked (see _stroke_side)."""
+    from cad.trace.skeleton import skeletonize_mask, prune_spurs
+    from cad.trace.walk import walk_skeleton
+    from cad.trace.fit import fit_loop, _fit_run, FitParams
+
+    skel, _dist = skeletonize_mask(mask)
+    skel = prune_spurs(skel, params.prune_len)
+    polys = walk_skeleton(skel)
+
+    P = fit_params or FitParams()
+    segs: list = []
+    for pl in polys:
+        pts = pl.points
+        if len(pts) < 2:
+            continue
+        if pl.closed and len(pts) >= 8:
+            segs.extend(fit_loop(pts, P))
+        else:
+            segs.extend(_fit_run(np.asarray(pts, dtype=np.float64), P))
+    return segs
 
 
 def segments_to_entities(segments: list, image_w: int, image_h: int,
