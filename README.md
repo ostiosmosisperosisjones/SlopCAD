@@ -10,7 +10,7 @@ It's more capable than the name suggests and rougher than a finished product.
 
 - **Sketching.** The sketch workflow is keyboard-driven: you call tools and snap
   points from the keyboard rather than dragging, in the style of OMAX Layout.
-  A SolveSpace constraint solver runs underneath so sketches are parametric
+  A SolveSpace constraint solver is available so sketches can be made parametric
   (coincidence, tangency, dimensions).
 - **Feature history.** Extrude, revolve, loft, boolean union/subtract/intersect,
   fillet, chamfer, thicken/shell, offset datum planes. Editing an earlier
@@ -58,5 +58,5 @@ PyQt6 and PyOpenGL (interface and viewport), NumPy / SciPy / scikit-image
 
 ## License
 
-GPLv3. See [LICENSE](LICENSE). This is required by SlopCAD's dependencies
-(PyQt6 and SolveSpace are both GPL) and is the intended license regardless.
+GPLv3. See [LICENSE](LICENSE). 
+
