@@ -162,14 +162,7 @@ class MainWindow(QMainWindow):
     def _sketch_include(self):
         if not self._viewport or not self._viewport._sketch:
             return
-        from cad.sketch_tools.include import IncludeTool
-        vp = self._viewport
-        vp._sketch.push_undo_snapshot()
-        n = IncludeTool.apply_with_history(
-            vp._sketch, vp.selection, vp._meshes, vp.history)
-        if not n:
-            vp._sketch._entity_snapshots.pop()
-        vp.update()
+        self._viewport._activate_include()
 
     def _sketch_import_image(self):
         """Toolbar Image — open the trace modal, append fitted geometry."""

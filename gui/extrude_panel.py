@@ -690,8 +690,21 @@ class ExtrudePanel(QWidget):
                 "color: #888; font-size: 11px; font-family: monospace;"))
             self._end_pick_body()
 
+    def _end_other_picks(self, keep: str):
+        """Only one pick mode may be active at a time — ending the others here
+        keeps the viewport's routing flags in sync via the emitted signals."""
+        if keep != 'edge' and self._picking_edge:
+            self._end_pick_edge()
+        if keep != 'vertex' and self._picking_vertex:
+            self._end_pick_vertex()
+        if keep != 'body' and self._picking_body:
+            self._end_pick_body()
+        if keep != 'face' and self._picking_face:
+            self._end_pick_face()
+
     def _on_pick_edge_toggle(self, checked: bool):
         if checked:
+            self._end_other_picks('edge')
             self._picking_edge = True
             self._pick_btn.setProperty("active", True)
             self._pick_btn.style().unpolish(self._pick_btn)
@@ -710,6 +723,7 @@ class ExtrudePanel(QWidget):
 
     def _on_pick_vertex_toggle(self, checked: bool):
         if checked:
+            self._end_other_picks('vertex')
             self._picking_vertex = True
             self._pick_vtx_btn.setProperty("active", True)
             self._pick_vtx_btn.style().unpolish(self._pick_vtx_btn)
@@ -728,6 +742,7 @@ class ExtrudePanel(QWidget):
 
     def _on_pick_body_toggle(self, checked: bool):
         if checked:
+            self._end_other_picks('body')
             self._picking_body = True
             btn = (self._pick_cut_body_btn
                    if self._mode_group.checkedId() == 1
@@ -750,6 +765,7 @@ class ExtrudePanel(QWidget):
 
     def _on_pick_face_toggle(self, checked: bool):
         if checked:
+            self._end_other_picks('face')
             self._picking_face = True
             self._pick_face_btn.setProperty("active", True)
             self._pick_face_btn.style().unpolish(self._pick_face_btn)

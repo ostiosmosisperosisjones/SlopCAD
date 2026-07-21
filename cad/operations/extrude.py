@@ -105,6 +105,12 @@ def _do_extrude_solid(face: Face, distance: float,
         d = d * sign
 
     effective_dist = abs(distance) - end_offset
+    if effective_dist <= 1e-9:
+        # A zero-length dir vector otherwise surfaces as build123d's cryptic
+        # "Expected gp_Pln, Face, Location, or VectorLike" TypeError.
+        raise ValueError(
+            f"Nothing to extrude: distance {abs(distance):g}mm minus "
+            f"end offset {end_offset:g}mm leaves no length")
 
     if start_offset != 0.0:
         # Translate face along d by start_offset

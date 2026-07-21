@@ -92,6 +92,10 @@ class BooleanOp(Op):
         bool_op.SetArguments(lst_a)
         bool_op.SetTools(lst_b)
         bool_op.SetRunParallel(True)
+        # Fuzzy tolerance absorbs near-coincident faces (e.g. subtracting a
+        # body whose faces lie exactly on the target's) that otherwise make
+        # the boolean fail or silently no-op.
+        bool_op.SetFuzzyValue(1e-5)
         bool_op.Build()
 
         if not bool_op.IsDone():

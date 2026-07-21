@@ -104,6 +104,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._selected_sketch_entry: int | None = None  # history_idx
         self._selected_sketch_face: list[int] | None = None   # face indices within entry
         self._editing_sketch_history_idx: int | None = None  # set during re-entry
+        self._include_armed = False                     # click-to-include mode
 
         self.camera_projection_changed = None
         self.request_extrude_distance  = None
@@ -253,7 +254,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             if gl_ready:
                 mesh.upload()
             self._meshes[body_id] = mesh
-            self._body_visible.setdefault(body_id, True)
+            body = self.workspace.bodies.get(body_id)
+            self._body_visible.setdefault(
+                body_id, body.visible if body is not None else True)
         self.doneCurrent()
 
     def set_body_visible(self, body_id: str, visible: bool):
@@ -310,20 +313,25 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         return meshes
 
     def fit_camera_to_scene(self):
-        if not self._meshes:
+        # Fit what the user can see; fall back to all meshes if everything
+        # is hidden (visibility is cosmetic — meshes exist for every body).
+        meshes = self._visible_meshes() or self._meshes
+        if not meshes:
             # Empty scene — set a default scale suitable for mm-unit CAD work
             self.camera.fit_scene([-100, -100, -100], [100, 100, 100])
             return
         all_min = np.array([ np.inf,  np.inf,  np.inf])
         all_max = np.array([-np.inf, -np.inf, -np.inf])
-        for mesh in self._meshes.values():
+        for mesh in meshes.values():
             all_min = np.minimum(all_min, mesh.bbox_min)
             all_max = np.maximum(all_max, mesh.bbox_max)
         self.camera.fit_scene(all_min, all_max)
 
     def _rebuild_body_mesh(self, body_id: str):
         shape = self.workspace.current_shape(body_id)
-        self._body_visible.setdefault(body_id, True)
+        _body = self.workspace.bodies.get(body_id)
+        self._body_visible.setdefault(
+            body_id, _body.visible if _body is not None else True)
         if shape is not None:
             try:
                 mesh = Mesh(shape)   # tessellate off-GL (pure CPU)
@@ -1225,6 +1233,61 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             return True
         return super().event(e)
 
+    # ------------------------------------------------------------------
+    # Include (project references into the active sketch)
+    # ------------------------------------------------------------------
+
+    def _activate_include(self):
+        """Include the current selection into the active sketch.  With nothing
+        usable selected, arm click-to-include mode instead: each subsequent
+        click on a body edge, sketch line, or vertex includes it immediately.
+        Esc disarms."""
+        from cad.sketch import SketchTool
+        if self._sketch is None:
+            return
+        if self._apply_include_selection():
+            return
+        only_active_sketch_lines = (
+            bool(self.selection.sketch_edges)
+            and not self.selection.edges and not self.selection.vertices
+            and all(se.history_idx == -1 for se in self.selection.sketch_edges))
+        if only_active_sketch_lines:
+            print("[Sketch] Selected line is already part of this sketch — "
+                  "pick edges from bodies or other sketches.")
+            return
+        # Nothing usable selected — arm click-to-include.
+        if self._sketch.tool != SketchTool.NONE:
+            self._sketch.cancel_tool()
+            self.sketch_mode_changed.emit(True)
+        self._include_armed = True
+        print("[Sketch] Include armed — click body edges, sketch lines, or "
+              "vertices to include them (Esc to finish).")
+        self.update()
+
+    def _apply_include_selection(self) -> bool:
+        """Project the current selection into the active sketch.
+        Returns True if anything was included."""
+        from cad.sketch_tools.include import IncludeTool
+        self._sketch.push_undo_snapshot()
+        n = IncludeTool.apply_with_history(
+            self._sketch, self.selection, self._meshes, self.history)
+        if not n:
+            self._sketch._entity_snapshots.pop()
+            return False
+        print(f"[Sketch] Included {n} reference "
+              f"{'entity' if n == 1 else 'entities'}")
+        self.selection.clear()
+        self.selection_changed.emit()
+        self.update()
+        return True
+
+    def _apply_armed_include(self):
+        """Armed click-to-include: include whatever the click just selected."""
+        if self._sketch is None:
+            self._include_armed = False
+            return
+        self._apply_include_selection()
+
     def keyPressEvent(self, e):
         from cad.prefs import prefs
         from cad.sketch import SketchTool
@@ -1245,6 +1308,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
         if e.key() == Qt.Key.Key_Escape:
             if self._sketch is not None:
+                if getattr(self, '_include_armed', False):
+                    self._include_armed = False
+                    print("[Sketch] Include mode ended.")
+                    self.update()
+                    return
                 if getattr(self, '_pattern_panel', None) is not None:
                     # Pattern is mid-parameter — close panel (also cancels tool).
                     self._close_pattern_panel()
@@ -1357,20 +1425,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 else:
                     return
             elif prefs.matches("sketch_include", e):
-                from cad.sketch_tools.include import IncludeTool
-                self._sketch.push_undo_snapshot()
-                n = IncludeTool.apply_with_history(
-                    self._sketch, self.selection, self._meshes, self.history)
-                if n:
-                    print(f"[Sketch] Included {n} reference "
-                          f"{'entity' if n == 1 else 'entities'}")
-                    self.selection.clear()
-                    self.selection_changed.emit()
-                    self.update()
-                else:
-                    self._sketch._entity_snapshots.pop()
-                    print("[Sketch] Nothing selected to include — "
-                          "select edges, vertices, or sketch lines first.")
+                self._activate_include()
                 return
             elif prefs.matches("sketch_import_image", e):
                 from cad.sketch_tools.image_import import ImageImportTool
@@ -1944,6 +1999,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         self._selected_sketch_face  = None
                         self.selection.clear()
                         self.body_selected.emit(None)
+
+            # Armed click-to-include: consume whatever this click selected.
+            if getattr(self, '_include_armed', False):
+                self._apply_armed_include()
 
             self.selection_changed.emit()
             self.update()

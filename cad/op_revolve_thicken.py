@@ -595,7 +595,10 @@ class SketchRevolveOp(Op):
         if not all_faces:
             raise RuntimeError("[Revolve] Sketch has no closed loops.")
 
-        fidx = viewport._selected_sketch_face
+        # Prefer indices baked into the op (edit path) over the mutable
+        # viewport selection (see op pick/selection pitfalls).
+        fidx = (self.face_indices if self.face_indices is not None
+                else viewport._selected_sketch_face)
         if fidx is not None:
             face_indices = [i for i in fidx if 0 <= i < len(all_faces)]
         else:

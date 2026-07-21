@@ -760,7 +760,12 @@ class CrossBodyCutOp(Op):
             all_faces = viewport._sketch_faces.get(sketch_idx, [])
             if not all_faces:
                 raise RuntimeError("[Cut] Sketch has no faces.")
-            fidx = viewport._selected_sketch_face
+            # Prefer indices baked into the op over the mutable viewport
+            # selection — a fan-out commits this op once per body, and the
+            # first finalize clears the selection, which made body 2..N cut
+            # with EVERY loop (see op pick/selection pitfalls).
+            fidx = (self.face_indices if self.face_indices is not None
+                    else viewport._selected_sketch_face)
             if fidx is not None:
                 faces = [all_faces[i][0] for i in fidx if 0 <= i < len(all_faces)]
             else:
@@ -847,9 +852,10 @@ class CrossBodyCutOp(Op):
             vp._rebuild_body_mesh(rebuild_id)
         vp.history_changed.emit()
 
+        face_indices = self.face_indices
         if sketch_idx is not None:
             vp._selected_sketch_entry = sketch_idx
-            vp._selected_sketch_face  = None
+            vp._selected_sketch_face  = list(face_indices) if face_indices else None
 
         vp._show_extrude_panel(
             sketch_idx    = sketch_idx,
@@ -860,6 +866,12 @@ class CrossBodyCutOp(Op):
         panel = vp._extrude_panel
         if panel is None:
             return
+
+        # Replace generic "Sketch N" entry with one row per stored face index.
+        if sketch_idx is not None and face_indices:
+            panel.clear_face_entries()
+            for i in face_indices:
+                panel.add_face_entry(None, None, f"Sketch {sketch_idx}  ·  face {i}")
 
         panel._radio_cut.setChecked(True)
         panel._on_mode_changed(1)
@@ -1146,7 +1158,10 @@ class SketchExtrudeOp(Op):
         if not all_faces:
             raise RuntimeError("[Extrude] Sketch has no closed loops.")
 
-        fidx = viewport._selected_sketch_face
+        # Prefer indices baked into the op (edit path) over the mutable
+        # viewport selection (see op pick/selection pitfalls).
+        fidx = (self.face_indices if self.face_indices is not None
+                else viewport._selected_sketch_face)
         if fidx is not None:
             face_indices = [i for i in fidx if 0 <= i < len(all_faces)]
         else:

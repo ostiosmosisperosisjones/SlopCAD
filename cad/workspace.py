@@ -171,11 +171,16 @@ class Workspace:
         return body.source_shape
 
     def all_current_shapes(self) -> list[tuple[str, Any]]:
-        """Return [(body_id, current_shape)] for all visible bodies."""
+        """Return [(body_id, current_shape)] for ALL bodies.
+
+        Visibility is deliberately NOT consulted here — hiding a body is
+        cosmetic. Filtering happens at render/pick time (viewport
+        _visible_meshes / _pick_at); geometry resolution, mesh caches, and
+        ops must always see every body, or face/edge indices resolve against
+        the wrong objects.
+        """
         result = []
         for body_id, body in self.bodies.items():
-            if not body.visible:
-                continue
             shape = self.current_shape(body_id)
             if shape is not None:
                 result.append((body_id, shape))

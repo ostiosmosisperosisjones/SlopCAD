@@ -16,6 +16,25 @@ from __future__ import annotations
 _TOUCH_TOL = 1e-6  # mm — shapes within this distance are considered touching
 
 
+def _shape_contains(outer, inner) -> bool:
+    """True if a vertex of inner lies strictly inside a solid of outer."""
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_VERTEX, TopAbs_State
+    from OCP.TopoDS import TopoDS
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+
+    exp = TopExp_Explorer(inner.wrapped, TopAbs_VERTEX)
+    if not exp.More():
+        return False
+    pnt = BRep_Tool.Pnt_s(TopoDS.Vertex_s(exp.Current()))
+    for solid in outer.solids():
+        cls = BRepClass3d_SolidClassifier(solid.wrapped, pnt, _TOUCH_TOL)
+        if cls.State() == TopAbs_State.TopAbs_IN:
+            return True
+    return False
+
+
 def _shapes_share_geometry(a, b) -> bool:
     """True if shapes a and b overlap OR touch (within _TOUCH_TOL mm).
 
@@ -24,6 +43,10 @@ def _shapes_share_geometry(a, b) -> bool:
     face-to-face contact and edge-to-face contact). This handles the
     "butt-to-butt on the same plane" case that BRepAlgoAPI_Common can't —
     coplanar abutting parts have zero common volume but zero distance.
+
+    DistShapeShape measures boundary-to-boundary distance, so a shape fully
+    inside the other reports a positive distance — the containment check
+    covers that case.
     """
     try:
         from OCP.BRepExtrema import BRepExtrema_DistShapeShape
@@ -32,7 +55,38 @@ def _shapes_share_geometry(a, b) -> bool:
         ext.Perform()
         if not ext.IsDone():
             return True   # OCC couldn't decide — don't flag the user
-        return ext.Value() <= _TOUCH_TOL
+        if ext.Value() <= _TOUCH_TOL:
+            return True
+        return _shape_contains(a, b) or _shape_contains(b, a)
+    except Exception:
+        return True
+
+
+def _shapes_share_volume(a, b) -> bool:
+    """True if a and b overlap with nonzero common volume (including one
+    fully containing the other).  Merely abutting faces do NOT count —
+    a subtract or intersect of parts that only touch is a no-op, which is
+    exactly what this check exists to warn about.
+    """
+    try:
+        if _shape_contains(a, b) or _shape_contains(b, a):
+            return True
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
+        from OCP.TopTools import TopTools_ListOfShape
+        from build123d import Compound
+
+        lst_a = TopTools_ListOfShape(); lst_a.Append(a.wrapped)
+        lst_b = TopTools_ListOfShape(); lst_b.Append(b.wrapped)
+        op = BRepAlgoAPI_Common()
+        op.SetArguments(lst_a)
+        op.SetTools(lst_b)
+        op.SetRunParallel(True)
+        op.SetFuzzyValue(1e-5)
+        op.Build()
+        if not op.IsDone():
+            return True   # OCC couldn't decide — don't flag the user
+        common = Compound(op.Shape())
+        return any(s.volume > 1e-6 for s in common.solids())
     except Exception:
         return True
 
@@ -269,6 +323,7 @@ class BooleanMixin:
             bool_op.SetArguments(lst_a)
             bool_op.SetTools(lst_b)
             bool_op.SetRunParallel(True)
+            bool_op.SetFuzzyValue(1e-5)   # match BooleanOp._run_bool
             bool_op.Build()
 
             if not bool_op.IsDone():
@@ -297,9 +352,13 @@ class BooleanMixin:
           1. Bbox-overlap (cheap, definitive when boxes are disjoint).
           2. BRepAlgoAPI_Common (exact, only run when bboxes overlap).
 
-        A pair is "touching" when the common volume has at least one solid
-        OR at least one face/edge in shared boundary (so coplanar abutting
-        parts also count). Inputs with no touching neighbor get flagged.
+        What counts as "intersecting" depends on the op:
+          - union: touching is enough (abutting parts fuse into one solid),
+            so the cheap distance-based check applies.
+          - subtract / intersect: the pair must share actual volume —
+            abutting parts produce a no-op cut / empty intersection, which
+            is exactly what the user needs to be warned about.
+        Inputs with no intersecting neighbor get flagged.
         """
         from cad.cut_all import bboxes_overlap
 
@@ -311,6 +370,8 @@ class BooleanMixin:
                 bboxes.append(None)
 
         n = len(shapes)
+        pair_check = (_shapes_share_geometry if op == "union"
+                      else _shapes_share_volume)
         # Memoize pair results so each common-volume check runs at most once.
         cache: dict[tuple[int, int], bool] = {}
 
@@ -324,8 +385,8 @@ class BooleanMixin:
             if not bboxes_overlap(bboxes[i], bboxes[j]):
                 cache[key] = False
                 return False
-            # Bboxes overlap; confirm with exact common.
-            result = _shapes_share_geometry(shapes[i], shapes[j])
+            # Bboxes overlap; confirm with the exact per-op check.
+            result = pair_check(shapes[i], shapes[j])
             cache[key] = result
             return result
 

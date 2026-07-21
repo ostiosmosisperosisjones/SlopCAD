@@ -719,6 +719,12 @@ class RevolveMixin:
                 self._do_revolve_cut_all_intersecting(
                     angle, axis_pt, axis_d, sketch_id, src_body_id)
                 return
+            fidx_sel = self._selected_sketch_face
+            cut_face_indices = None
+            if fidx_sel is not None:
+                all_sketch = self._sketch_faces.get(sketch_idx, [])
+                cut_face_indices = [i for i in fidx_sel
+                                    if 0 <= i < len(all_sketch)] or None
             op = CrossBodyRevolveCutOp(
                 cut_body_id      = merge_body_id,
                 source_body_id   = src_body_id,
@@ -726,6 +732,7 @@ class RevolveMixin:
                 angle_deg        = angle,
                 axis_point       = axis_pt,
                 axis_dir         = axis_d,
+                face_indices     = cut_face_indices,
             )
             op.commit(self)
             return
@@ -871,6 +878,12 @@ class RevolveMixin:
             sketch_id = entries[sketch_idx].entry_id
             se = entries[sketch_idx].params.get("sketch_entry")
             src_body_id = se.body_id if se else None
+            fidx_sel = self._selected_sketch_face
+            cut_face_indices = None
+            if fidx_sel is not None:
+                all_sketch = self._sketch_faces.get(sketch_idx, [])
+                cut_face_indices = [i for i in fidx_sel
+                                    if 0 <= i < len(all_sketch)] or None
             new_op = CrossBodyRevolveCutOp(
                 cut_body_id      = merge_body_id,
                 source_body_id   = src_body_id,
@@ -878,6 +891,7 @@ class RevolveMixin:
                 angle_deg        = angle,
                 axis_point       = axis_pt,
                 axis_dir         = axis_d,
+                face_indices     = cut_face_indices,
             )
             self._commit_revolve_edit(editing_idx, new_op)
             return

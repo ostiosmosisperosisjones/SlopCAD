@@ -398,8 +398,19 @@ class RevolvePanel(QWidget):
                 "color: #888; font-size: 11px; font-family: monospace;"))
             self._end_pick_body()
 
+    def _end_other_picks(self, keep: str):
+        """Only one pick mode may be active at a time — ending the others here
+        keeps the viewport's routing flags in sync via the emitted signals."""
+        if keep != 'axis' and self._picking_axis:
+            self._end_pick_axis()
+        if keep != 'face' and self._picking_face:
+            self._end_pick_face()
+        if keep != 'body' and self._picking_body:
+            self._end_pick_body()
+
     def _on_pick_axis_toggle(self, checked: bool):
         if checked:
+            self._end_other_picks('axis')
             self._picking_axis = True
             self._pick_axis_btn.setProperty("active", True)
             self._pick_axis_btn.style().unpolish(self._pick_axis_btn)
@@ -418,6 +429,7 @@ class RevolvePanel(QWidget):
 
     def _on_pick_face_toggle(self, checked: bool):
         if checked:
+            self._end_other_picks('face')
             self._picking_face = True
             self._pick_face_btn.setProperty("active", True)
             self._pick_face_btn.style().unpolish(self._pick_face_btn)
@@ -436,6 +448,7 @@ class RevolvePanel(QWidget):
 
     def _on_pick_body_toggle(self, checked: bool):
         if checked:
+            self._end_other_picks('body')
             self._picking_body = True
             self._pick_body_btn.setProperty("active", True)
             self._pick_body_btn.style().unpolish(self._pick_body_btn)

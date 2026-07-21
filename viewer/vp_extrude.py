@@ -180,6 +180,13 @@ class ExtrudeMixin:
         start_offset = (panel._start_offset.mm_value() or 0.0) if panel else 0.0
         end_offset   = (panel._end_offset.mm_value()   or 0.0) if panel else 0.0
         draft_angle  = panel.draft_angle_deg() if panel else 0.0
+        # Nothing to preview yet (empty spinbox during panel init, or the end
+        # offset swallows the whole distance) — bail silently instead of
+        # letting the zero-length extrude throw.
+        if abs(dist) - end_offset <= 1e-9:
+            self._extrude_preview_mesh = None
+            self.update()
+            return
         try:
             if sketch_idx is not None:
                 all_sketch = self._sketch_faces.get(sketch_idx, [])
@@ -703,6 +710,8 @@ class ExtrudeMixin:
         if is_cut and merge_body_id not in (None, "__new_body__"):
             src_body_for_cut = (original_op.source_body_id
                                 if hasattr(original_op, 'source_body_id') else body_id)
+            live_faces = (self._selected_sketch_face
+                          if sketch_idx is not None else None)
             new_op = CrossBodyCutOp(
                 cut_body_id      = merge_body_id,
                 source_body_id   = src_body_for_cut,
@@ -714,6 +723,7 @@ class ExtrudeMixin:
                 start_offset     = float((extra or {}).get('start_offset', 0.0)),
                 end_offset       = float((extra or {}).get('end_offset', 0.0)),
                 draft_angle      = float((extra or {}).get('draft_angle', 0.0)),
+                face_indices     = list(live_faces) if live_faces else None,
             )
         elif sketch_idx is not None:
             live_faces = self._selected_sketch_face
@@ -855,11 +865,17 @@ class ExtrudeMixin:
         import numpy as np
         from cad.op_types import CrossBodyCutOp
 
+        cut_face_indices = None
         if sketch_idx is not None:
             entries = self.history.entries
             se = (entries[sketch_idx].params.get("sketch_entry")
                   if sketch_idx < len(entries) else None)
             src_body_id = se.body_id if se else body_id
+            fidx_sel = self._selected_sketch_face
+            if fidx_sel is not None:
+                all_sketch = self._sketch_faces.get(sketch_idx, [])
+                cut_face_indices = [i for i in fidx_sel
+                                    if 0 <= i < len(all_sketch)] or None
         else:
             src_body_id = body_id
 
@@ -877,6 +893,7 @@ class ExtrudeMixin:
             start_offset     = float((extra or {}).get('start_offset', 0.0)),
             end_offset       = float((extra or {}).get('end_offset', 0.0)),
             draft_angle      = float((extra or {}).get('draft_angle', 0.0)),
+            face_indices     = cut_face_indices,
         )
         op.commit_async(self, extra)
 

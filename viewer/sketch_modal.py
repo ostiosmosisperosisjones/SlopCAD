@@ -179,6 +179,7 @@ class SketchModalMixin:
     def _complete_sketch(self):
         if self._sketch is None:
             return
+        self._include_armed = False
         sketch = self._sketch
         from cad.sketch import LineEntity, ArcEntity, ReferenceEntity, SketchEntry
         lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
