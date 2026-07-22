@@ -81,14 +81,15 @@ def _adaptive_arc_segments(radius: float, span: float, px_per_mm: float) -> int:
 def _adaptive_tessellate(ent, px_per_mm):
     """Tessellate an ArcEntity/SplineEntity with zoom-adaptive detail.
 
-    Falls back to the fixed prefs.sketch_curve_segments when px_per_mm is
-    unavailable (e.g. perspective mode we can't cheaply characterise).
+    Returns an (n+1, 2) uv array.  Falls back to the fixed
+    prefs.sketch_curve_segments when px_per_mm is unavailable (e.g.
+    perspective mode we can't cheaply characterise).
     """
     if px_per_mm and px_per_mm > 0.0:
         if isinstance(ent, ArcEntity):
             span = abs(ent.end_angle - ent.start_angle)
             n = _adaptive_arc_segments(ent.radius, span, px_per_mm)
-            return ent.tessellate(n)
+            return ent.tessellate_np(n)
         if isinstance(ent, SplineEntity):
             # Splines have no single radius; scale detail by on-screen length of
             # the fit-point polyline so long/zoomed curves densify too.
@@ -98,8 +99,77 @@ def _adaptive_tessellate(ent, px_per_mm):
                 length += float(np.linalg.norm(np.asarray(b) - np.asarray(a)))
             n = int(length * px_per_mm / 6.0)   # ~1 vertex per 6 screen-px
             n = max(_ADAPTIVE_MIN_SEG, min(_ADAPTIVE_MAX_SEG, n))
-            return ent.tessellate(n)
-    return ent.tessellate(prefs.sketch_curve_segments)
+            return ent.tessellate_np(n)
+    return ent.tessellate_np(prefs.sketch_curve_segments)
+
+
+# Buckets for batched arc tessellation: each arc's adaptive segment count is
+# rounded up to the nearest bucket so arcs sharing a bucket tessellate in one
+# vectorized trig evaluation instead of one Python call per arc.
+_ARC_SEG_BUCKETS = (8, 16, 32, 64, 128, 256, 512, 1024, 2048)
+
+
+def _batch_lines_world(entities, indices, origin, x_axis, y_axis,
+                       px_per_mm) -> np.ndarray | None:
+    """Build one float32 (M, 3) GL_LINES vertex array (world space) for the
+    given entity indices.  Lines contribute their two endpoints; arcs and
+    splines are tessellated and unrolled into segment pairs."""
+    uv_chunks = []
+    line_p0, line_p1 = [], []
+    arc_buckets: dict[int, list] = {}
+    for j in indices:
+        ent = entities[j]
+        if isinstance(ent, LineEntity):
+            line_p0.append(ent.p0)
+            line_p1.append(ent.p1)
+        elif isinstance(ent, ArcEntity):
+            span = abs(ent.end_angle - ent.start_angle)
+            n = (_adaptive_arc_segments(ent.radius, span, px_per_mm)
+                 if px_per_mm and px_per_mm > 0.0
+                 else prefs.sketch_curve_segments)
+            for b in _ARC_SEG_BUCKETS:
+                if b >= n:
+                    n = b
+                    break
+            else:
+                n = _ARC_SEG_BUCKETS[-1]
+            arc_buckets.setdefault(n, []).append(
+                (ent.center[0], ent.center[1], ent.radius,
+                 ent.start_angle, ent.end_angle))
+        elif isinstance(ent, SplineEntity):
+            poly = np.asarray(_adaptive_tessellate(ent, px_per_mm))
+            if len(poly) >= 2:
+                # polyline → GL_LINES pairs: a b b c c d …
+                uv_chunks.append(np.repeat(poly, 2, axis=0)[1:-1])
+    for n, params in arc_buckets.items():
+        P   = np.array(params, dtype=np.float64)
+        t   = np.linspace(0.0, 1.0, n + 1)
+        ang = P[:, 3:4] + (P[:, 4:5] - P[:, 3:4]) * t          # (A, n+1)
+        r   = P[:, 2:3]
+        polys = np.stack([P[:, 0:1] + r * np.cos(ang),
+                          P[:, 1:2] + r * np.sin(ang)], axis=2)  # (A, n+1, 2)
+        pairs = np.repeat(polys, 2, axis=1)[:, 1:-1, :]          # (A, 2n, 2)
+        uv_chunks.append(pairs.reshape(-1, 2))
+    if line_p0:
+        lp = np.empty((2 * len(line_p0), 2), dtype=np.float64)
+        lp[0::2] = line_p0
+        lp[1::2] = line_p1
+        uv_chunks.append(lp)
+    if not uv_chunks:
+        return None
+    uv = np.concatenate(uv_chunks)
+    world = origin + uv[:, 0:1] * x_axis + uv[:, 1:2] * y_axis
+    return np.ascontiguousarray(world, dtype=np.float32)
+
+
+def _draw_lines_batch(arr: np.ndarray | None):
+    """Draw a (M, 3) float32 vertex array as GL_LINES via one client-array call."""
+    if arr is None or len(arr) == 0:
+        return
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glVertexPointer(3, GL_FLOAT, 0, arr)
+    glDrawArrays(GL_LINES, 0, len(arr))
+    glDisableClientState(GL_VERTEX_ARRAY)
 
 
 # ---------------------------------------------------------------------------
@@ -327,36 +397,48 @@ class SketchOverlay:
                 glPointSize(1.0)
 
         glLineWidth(prefs.sketch_line_width)
+        px_per_mm = getattr(self, '_px_per_mm', 0.0)
+        plane = sketch.plane
+        drawable = (LineEntity, ArcEntity, SplineEntity)
+
+        # Partition entities so the bulk (normal + construction) renders as
+        # two batched vertex-array draws — one Python GL call per group
+        # instead of one per vertex.
+        normal_idx, constr_idx, special_idx = [], [], []
         for j, ent in enumerate(sketch.entities):
-            is_construction = getattr(ent, "construction", False)
+            if not isinstance(ent, drawable):
+                continue
+            if j in sel or j == hov_entity_idx:
+                special_idx.append(j)
+            elif getattr(ent, "construction", False):
+                constr_idx.append(j)
+            else:
+                normal_idx.append(j)
+
+        glColor3f(*prefs.sketch_line_color)
+        _draw_lines_batch(_batch_lines_world(
+            sketch.entities, normal_idx,
+            plane.origin, plane.x_axis, plane.y_axis, px_per_mm))
+
+        if constr_idx:
+            # Dimmed + dashed so construction geometry reads as reference-only.
+            r, g, b = prefs.sketch_line_color
+            glColor3f(r * 0.6, g * 0.6, b * 0.6)
+            glEnable(GL_LINE_STIPPLE)
+            glLineStipple(2, 0x00FF)
+            _draw_lines_batch(_batch_lines_world(
+                sketch.entities, constr_idx,
+                plane.origin, plane.x_axis, plane.y_axis, px_per_mm))
+            glDisable(GL_LINE_STIPPLE)
+
+        for j in special_idx:
             if j in sel:
                 glColor3f(*prefs.edge_selected_color)
-            elif j == hov_entity_idx:
-                glColor3f(*prefs.edge_hovered_color)
-            elif is_construction:
-                # Dimmed so construction geometry reads as reference-only.
-                r, g, b = prefs.sketch_line_color
-                glColor3f(r * 0.6, g * 0.6, b * 0.6)
             else:
-                glColor3f(*prefs.sketch_line_color)
-            # Dashed line style for construction geometry (unless highlighted).
-            stipple = is_construction and j not in sel and j != hov_entity_idx
-            if stipple:
-                glEnable(GL_LINE_STIPPLE)
-                glLineStipple(2, 0x00FF)
-            if isinstance(ent, LineEntity):
-                glBegin(GL_LINES)
-                glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))
-                glVertex3f(*self._pt(sketch.plane, ent.p1[0], ent.p1[1]))
-                glEnd()
-            elif isinstance(ent, (ArcEntity, SplineEntity)):
-                pts = _adaptive_tessellate(ent, getattr(self, '_px_per_mm', 0.0))
-                glBegin(GL_LINE_STRIP)
-                for p in pts:
-                    glVertex3f(*self._pt(sketch.plane, p[0], p[1]))
-                glEnd()
-            if stipple:
-                glDisable(GL_LINE_STIPPLE)
+                glColor3f(*prefs.edge_hovered_color)
+            _draw_lines_batch(_batch_lines_world(
+                sketch.entities, [j],
+                plane.origin, plane.x_axis, plane.y_axis, px_per_mm))
         glLineWidth(1.0)
 
     def _draw_preview(self, sketch: SketchMode):
@@ -1140,33 +1222,45 @@ class SketchOverlay:
         sel = selected_indices or set()
         r, g, b = prefs.sketch_line_color
         glLineWidth(prefs.sketch_line_width)
+        px_per_mm = getattr(self, '_px_per_mm', 0.0)
+        drawable = (LineEntity, ArcEntity, SplineEntity)
+
+        normal_idx, constr_idx, special_idx = [], [], []
         for j, ent in enumerate(entry.entities):
-            is_construction = getattr(ent, "construction", False)
+            if not isinstance(ent, drawable):
+                continue
+            if j in sel or j == hov_entity_idx:
+                special_idx.append(j)
+            elif getattr(ent, "construction", False):
+                constr_idx.append(j)
+            else:
+                normal_idx.append(j)
+
+        glColor4f(r, g, b, 0.55)
+        _draw_lines_batch(_batch_lines_world(
+            entry.entities, normal_idx,
+            entry.plane_origin, entry.plane_x_axis, entry.plane_y_axis,
+            px_per_mm))
+
+        if constr_idx:
+            glColor4f(r, g, b, 0.30)
+            glEnable(GL_LINE_STIPPLE)
+            glLineStipple(2, 0x00FF)
+            _draw_lines_batch(_batch_lines_world(
+                entry.entities, constr_idx,
+                entry.plane_origin, entry.plane_x_axis, entry.plane_y_axis,
+                px_per_mm))
+            glDisable(GL_LINE_STIPPLE)
+
+        for j in special_idx:
             if j in sel:
                 glColor4f(*prefs.edge_selected_color, 1.0)
-            elif j == hov_entity_idx:
-                glColor4f(*prefs.edge_hovered_color, 1.0)
-            elif is_construction:
-                glColor4f(r, g, b, 0.30)
             else:
-                glColor4f(r, g, b, 0.55)
-            stipple = is_construction and j not in sel and j != hov_entity_idx
-            if stipple:
-                glEnable(GL_LINE_STIPPLE)
-                glLineStipple(2, 0x00FF)
-            if isinstance(ent, LineEntity):
-                glBegin(GL_LINES)
-                glVertex3f(*self._pt_from_entry(entry, ent.p0[0], ent.p0[1]))
-                glVertex3f(*self._pt_from_entry(entry, ent.p1[0], ent.p1[1]))
-                glEnd()
-            elif isinstance(ent, (ArcEntity, SplineEntity)):
-                pts = _adaptive_tessellate(ent, getattr(self, '_px_per_mm', 0.0))
-                glBegin(GL_LINE_STRIP)
-                for p in pts:
-                    glVertex3f(*self._pt_from_entry(entry, p[0], p[1]))
-                glEnd()
-            if stipple:
-                glDisable(GL_LINE_STIPPLE)
+                glColor4f(*prefs.edge_hovered_color, 1.0)
+            _draw_lines_batch(_batch_lines_world(
+                entry.entities, [j],
+                entry.plane_origin, entry.plane_x_axis, entry.plane_y_axis,
+                px_per_mm))
         glLineWidth(1.0)
 
     def _draw_committed_references(self, entry):

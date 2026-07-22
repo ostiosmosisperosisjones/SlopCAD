@@ -18,8 +18,14 @@ Tool logic lives in cad/sketch_tools/.
 from __future__ import annotations
 import copy
 import numpy as np
+from collections import OrderedDict
 from enum import Enum, auto
 from build123d import Plane
+
+# Memoized SketchEntry.build_faces() results, keyed by (geometry fingerprint,
+# tol).  Entries hold OCCT faces; keep the cache small.
+_FACE_BUILD_CACHE: OrderedDict = OrderedDict()
+_FACE_BUILD_CACHE_MAX = 8
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +125,15 @@ class ArcEntity:
         mid = (self.start_angle + self.end_angle) * 0.5
         return self.center + self.radius * np.array([np.cos(mid), np.sin(mid)])
 
+    def tessellate_np(self, n: int = 64) -> np.ndarray:
+        """Return an (n+1, 2) array of points evenly distributed along the arc."""
+        angles = np.linspace(self.start_angle, self.end_angle, n + 1)
+        return self.center + self.radius * np.stack(
+            [np.cos(angles), np.sin(angles)], axis=1)
+
     def tessellate(self, n: int = 64) -> list[np.ndarray]:
         """Return n+1 points evenly distributed along the arc."""
-        angles = np.linspace(self.start_angle, self.end_angle, n + 1)
-        return [self.center + self.radius * np.array([np.cos(a), np.sin(a)])
-                for a in angles]
+        return list(self.tessellate_np(n))
 
 
 class SplineEntity:
@@ -187,6 +197,10 @@ class SplineEntity:
             p = curve.Value(float(t))
             out.append(np.array([p.X(), p.Y()], dtype=np.float64))
         return out
+
+    def tessellate_np(self, n: int = 64) -> np.ndarray:
+        """tessellate() as an (m, 2) array."""
+        return np.asarray(self.tessellate(n), dtype=np.float64)
 
 
 class ReferenceEntity:
@@ -1502,7 +1516,59 @@ class SketchEntry:
             raise ValueError("Could not build any wires.")
         return wires[0] if len(wires) == 1 else Compound(children=wires)
 
+    def _profile_fingerprint(self) -> bytes:
+        """Hash of everything _build_faces_impl() reads: the plane and all
+        non-construction profile geometry.  ReferenceEntity occ_edges are
+        represented by their baked `points` cache — the same replay that
+        changes the edges re-bakes the points."""
+        import hashlib
+        h = hashlib.blake2b(digest_size=16)
+        for arr in (self.plane_origin, self.plane_x_axis,
+                    self.plane_y_axis, self.plane_normal):
+            h.update(np.asarray(arr, dtype=np.float64).tobytes())
+        for ent in self.entities:
+            if getattr(ent, "construction", False):
+                continue
+            if isinstance(ent, LineEntity):
+                h.update(b'L')
+                h.update(ent.p0.tobytes())
+                h.update(ent.p1.tobytes())
+            elif isinstance(ent, ArcEntity):
+                h.update(b'A')
+                h.update(np.array([ent.center[0], ent.center[1], ent.radius,
+                                   ent.start_angle, ent.end_angle]).tobytes())
+            elif isinstance(ent, SplineEntity):
+                h.update(b'Sc' if ent.closed else b'So')
+                for p in ent.points:
+                    h.update(np.asarray(p, dtype=np.float64).tobytes())
+            elif isinstance(ent, ReferenceEntity):
+                h.update(b'R')
+                h.update(len(ent.occ_edges or []).to_bytes(4, 'little'))
+                for p in ent.points:
+                    h.update(np.asarray(p, dtype=np.float64).tobytes())
+        return h.digest()
+
     def build_faces(self, tol: float = 1e-3) -> list:
+        """
+        Cached front-end for _build_faces_impl().
+
+        The splitter run costs ~0.5 s on a traced sketch and the result is
+        requested repeatedly with identical geometry (face overlay rebuild on
+        every history mutation, plus each extrude/revolve/loft replay), so
+        results are memoized module-wide keyed by geometry fingerprint.
+        """
+        key = (self._profile_fingerprint(), float(tol))
+        hit = _FACE_BUILD_CACHE.get(key)
+        if hit is not None:
+            _FACE_BUILD_CACHE.move_to_end(key)
+            return list(hit[0]), list(hit[1])
+        faces, regions = self._build_faces_impl(tol)
+        _FACE_BUILD_CACHE[key] = (faces, regions)
+        while len(_FACE_BUILD_CACHE) > _FACE_BUILD_CACHE_MAX:
+            _FACE_BUILD_CACHE.popitem(last=False)
+        return list(faces), list(regions)
+
+    def _build_faces_impl(self, tol: float = 1e-3) -> list:
         """
         Build one planar Face per enclosed region in the sketch.
 

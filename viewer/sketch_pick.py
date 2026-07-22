@@ -31,6 +31,9 @@ class SketchPickMixin:
         up to the current history cursor.  Called after any history mutation.
         """
         self._sketch_faces.clear()
+        # Cached render buffers keyed by (history_idx, face_idx) — must be
+        # dropped whenever the face list changes, since keys are positional.
+        self._sketch_face_bufs = {}
         cursor = self.history.cursor
         for i, entry in enumerate(self.history.entries):
             if i > cursor:
@@ -41,11 +44,10 @@ class SketchPickMixin:
             if se is None or entry.error:
                 continue
             try:
-                segs             = se.line_segments()
-                loops            = se.closed_loops()
+                # NB: don't call se.closed_loops() here just for logging —
+                # Python loop-chaining costs seconds on traced sketches.
                 faces, regions   = se.build_faces()
-                print(f"[Sketch] Entry {i}: {len(segs)} segments, "
-                      f"{len(loops)} closed loops, {len(faces)} faces built")
+                print(f"[Sketch] Entry {i}: {len(faces)} faces built")
                 if faces:
                     # Store as list of (face, outer_uvs, hole_uvs_list)
                     self._sketch_faces[i] = [
@@ -190,6 +192,85 @@ class SketchPickMixin:
     # Draw
     # ------------------------------------------------------------------
 
+    def _sketch_face_buffers(self, hidx: int, fidx: int, face):
+        """
+        Return cached (tri_verts, edge_verts, uv_area) render buffers for a
+        sketch face — float32 arrays for GL_TRIANGLES / GL_LINES.
+
+        Tessellating the OCCT face and discretizing its boundary edges every
+        frame was the dominant lag once a traced sketch (hundreds of loops)
+        had its faces built: >250 ms/frame. The geometry only changes when
+        _rebuild_sketch_faces() runs, which clears this cache.
+        """
+        key = (hidx, fidx)
+        cached = self._sketch_face_bufs.get(key)
+        if cached is not None:
+            return cached
+
+        from OCP.BRep import BRep_Tool
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_EDGE
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GCPnts import GCPnts_UniformAbscissa
+
+        tri_verts  = None
+        edge_verts = None
+        try:
+            BRepMesh_IncrementalMesh(face.wrapped, 0.1)
+            location = face.wrapped.Location()
+            facing   = BRep_Tool.Triangulation_s(face.wrapped, location)
+            if facing is not None:
+                nodes = np.array(
+                    [[facing.Node(ni).X(), facing.Node(ni).Y(),
+                      facing.Node(ni).Z()]
+                     for ni in range(1, facing.NbNodes() + 1)],
+                    dtype=np.float32)
+                tris = np.array(
+                    [facing.Triangle(ti).Get()
+                     for ti in range(1, facing.NbTriangles() + 1)],
+                    dtype=np.intp)
+                if len(tris):
+                    tri_verts = np.ascontiguousarray(
+                        nodes[(tris - 1).ravel()])
+
+            chunks = []
+            exp = TopExp_Explorer(face.wrapped, TopAbs_EDGE)
+            while exp.More():
+                edge = exp.Current()
+                try:
+                    adaptor = BRepAdaptor_Curve(edge)
+                    disc    = GCPnts_UniformAbscissa()
+                    disc.Initialize(adaptor, 32)
+                    if disc.IsDone() and disc.NbPoints() >= 2:
+                        pts = np.array(
+                            [[p.X(), p.Y(), p.Z()] for p in
+                             (adaptor.Value(disc.Parameter(pi))
+                              for pi in range(1, disc.NbPoints() + 1))],
+                            dtype=np.float32)
+                        # polyline → GL_LINES pairs
+                        chunks.append(np.repeat(pts, 2, axis=0)[1:-1])
+                except Exception:
+                    pass
+                exp.Next()
+            if chunks:
+                edge_verts = np.ascontiguousarray(np.concatenate(chunks))
+        except Exception as ex:
+            print(f"[Sketch] face buffer build error: {ex}")
+
+        result = (tri_verts, edge_verts)
+        self._sketch_face_bufs[key] = result
+        return result
+
+    @staticmethod
+    def _draw_face_array(arr, mode):
+        if arr is None or len(arr) == 0:
+            return
+        glEnableClientState(GL_VERTEX_ARRAY)
+        glVertexPointer(3, GL_FLOAT, 0, arr)
+        glDrawArrays(mode, 0, len(arr))
+        glDisableClientState(GL_VERTEX_ARRAY)
+
     def _draw_sketch_faces(self):
         """
         Draw committed sketch faces as semi-transparent filled polygons
@@ -204,13 +285,8 @@ class SketchPickMixin:
         """
         if not self._sketch_faces:
             return
-
-        from OCP.BRep import BRep_Tool
-        from OCP.BRepMesh import BRepMesh_IncrementalMesh
-        from OCP.TopExp import TopExp_Explorer
-        from OCP.TopAbs import TopAbs_EDGE
-        from OCP.BRepAdaptor import BRepAdaptor_Curve
-        from OCP.GCPnts import GCPnts_UniformAbscissa
+        if not hasattr(self, '_sketch_face_bufs'):
+            self._sketch_face_bufs = {}
 
         glDisable(GL_LIGHTING)
         glEnable(GL_DEPTH_TEST)
@@ -226,50 +302,25 @@ class SketchPickMixin:
         glPolygonOffset(-1.0, -1.0)
 
         def _uv_area(uvs):
-            a = 0.0
-            for k in range(len(uvs)):
-                x0, y0 = uvs[k]; x1, y1 = uvs[(k+1) % len(uvs)]
-                a += x0 * y1 - x1 * y0
-            return abs(a) * 0.5
+            p = np.asarray(uvs, dtype=np.float64)
+            if len(p) < 3:
+                return 0.0
+            q = np.roll(p, -1, axis=0)
+            return abs(float(np.sum(p[:, 0] * q[:, 1] - q[:, 0] * p[:, 1]))) * 0.5
 
+        area_cache = self._sketch_face_bufs.setdefault('__areas__', {})
         draw_list = []
         for hidx, face_list in self._sketch_faces.items():
             se = self.history.entries[hidx].params.get("sketch_entry")
             if se is not None and not se.visible:
                 continue
             for fidx, (face, outer_uvs, hole_uvs) in enumerate(face_list):
-                draw_list.append((hidx, fidx, face, _uv_area(outer_uvs)))
+                area = area_cache.get((hidx, fidx))
+                if area is None:
+                    area = _uv_area(outer_uvs)
+                    area_cache[(hidx, fidx)] = area
+                draw_list.append((hidx, fidx, face, area))
         draw_list.sort(key=lambda x: x[3], reverse=True)
-
-        def _draw_tris(facing, alpha):
-            glBegin(GL_TRIANGLES)
-            for tri_idx in range(1, facing.NbTriangles() + 1):
-                tri = facing.Triangle(tri_idx)
-                n1, n2, n3 = tri.Get()
-                for ni in (n1, n2, n3):
-                    node = facing.Node(ni)
-                    glVertex3f(node.X(), node.Y(), node.Z())
-            glEnd()
-
-        def _draw_edges(face_wrapped, line_alpha, line_width):
-            glLineWidth(line_width)
-            exp = TopExp_Explorer(face_wrapped, TopAbs_EDGE)
-            while exp.More():
-                edge = exp.Current()
-                try:
-                    adaptor = BRepAdaptor_Curve(edge)
-                    disc    = GCPnts_UniformAbscissa()
-                    disc.Initialize(adaptor, 32)
-                    if disc.IsDone() and disc.NbPoints() >= 2:
-                        glBegin(GL_LINE_STRIP)
-                        for pi in range(1, disc.NbPoints() + 1):
-                            p = adaptor.Value(disc.Parameter(pi))
-                            glVertex3f(p.X(), p.Y(), p.Z())
-                        glEnd()
-                except Exception:
-                    pass
-                exp.Next()
-            glLineWidth(1.0)
 
         for hidx, fidx, face, _ in draw_list:
             entry_selected = (hidx == self._selected_sketch_entry)
@@ -278,44 +329,39 @@ class SketchPickMixin:
                 sel_faces is None or
                 fidx in sel_faces
             )
-            try:
-                BRepMesh_IncrementalMesh(face.wrapped, 0.1)
-                location = face.wrapped.Location()
-                facing   = BRep_Tool.Triangulation_s(face.wrapped, location)
-                if facing is None:
-                    continue
+            tri_verts, edge_verts = self._sketch_face_buffers(hidx, fidx, face)
 
-                fill_alpha  = 0.45 if is_selected else 0.20
-                edge_alpha  = 0.90 if is_selected else 0.50
-                line_width  = 1.8  if is_selected else 1.2
-                occ_scale   = 0.18  # occluded regions are much dimmer
+            fill_alpha  = 0.45 if is_selected else 0.20
+            edge_alpha  = 0.90 if is_selected else 0.50
+            line_width  = 1.8  if is_selected else 1.2
+            occ_scale   = 0.18  # occluded regions are much dimmer
 
-                # --- Pass 1: visible (in front of or at geometry depth) ------
-                glDepthFunc(GL_LEQUAL)
-                glColor4f(0.29, 0.43, 0.54, fill_alpha)
-                _draw_tris(facing, fill_alpha)
+            # --- Pass 1: visible (in front of or at geometry depth) ------
+            glDepthFunc(GL_LEQUAL)
+            glColor4f(0.29, 0.43, 0.54, fill_alpha)
+            self._draw_face_array(tri_verts, GL_TRIANGLES)
 
-                if is_selected:
-                    glColor4f(0.48, 0.70, 0.84, edge_alpha)
-                else:
-                    glColor4f(0.29, 0.43, 0.54, edge_alpha)
-                _draw_edges(face.wrapped, edge_alpha, line_width)
+            if is_selected:
+                glColor4f(0.48, 0.70, 0.84, edge_alpha)
+            else:
+                glColor4f(0.29, 0.43, 0.54, edge_alpha)
+            glLineWidth(line_width)
+            self._draw_face_array(edge_verts, GL_LINES)
 
-                # --- Pass 2: occluded (behind geometry) ----------------------
-                glDepthFunc(GL_GREATER)
-                glColor4f(0.29, 0.43, 0.54, fill_alpha * occ_scale)
-                _draw_tris(facing, fill_alpha * occ_scale)
+            # --- Pass 2: occluded (behind geometry) ----------------------
+            glDepthFunc(GL_GREATER)
+            glColor4f(0.29, 0.43, 0.54, fill_alpha * occ_scale)
+            self._draw_face_array(tri_verts, GL_TRIANGLES)
 
-                occ_edge_alpha = edge_alpha * occ_scale
-                if is_selected:
-                    glColor4f(0.48, 0.70, 0.84, occ_edge_alpha)
-                else:
-                    glColor4f(0.29, 0.43, 0.54, occ_edge_alpha)
-                _draw_edges(face.wrapped, occ_edge_alpha, max(line_width - 0.4, 0.8))
+            occ_edge_alpha = edge_alpha * occ_scale
+            if is_selected:
+                glColor4f(0.48, 0.70, 0.84, occ_edge_alpha)
+            else:
+                glColor4f(0.29, 0.43, 0.54, occ_edge_alpha)
+            glLineWidth(max(line_width - 0.4, 0.8))
+            self._draw_face_array(edge_verts, GL_LINES)
 
-            except Exception as ex:
-                print(f"[Sketch] draw_sketch_faces error: {ex}")
-
+        glLineWidth(1.0)
         glDepthFunc(GL_LESS)
         glDepthMask(GL_TRUE)
         glDisable(GL_POLYGON_OFFSET_FILL)

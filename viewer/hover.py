@@ -23,6 +23,12 @@ from OpenGL.GL import *
 VERTEX_HOVER_RADIUS = 12   # screen pixels
 EDGE_HOVER_RADIUS   = 6    # screen pixels
 
+# Arc/spline tessellation for hover picking only. Deliberately decoupled from
+# prefs.sketch_curve_segments (a *display* fidelity setting that can be 256+):
+# a 32-segment chord approximation is well inside EDGE_HOVER_RADIUS, and the
+# hover cache is rebuilt every frame so point count directly costs FPS.
+HOVER_CURVE_SEGMENTS = 32
+
 # Prefix used for synthetic sketch-edge keys in the hover cache
 _SKETCH_KEY_PREFIX = "__sketch__"
 
@@ -117,6 +123,15 @@ class HoverState:
         self._meshes    = None
         self._workspace = None
         self._ready     = False
+        # Flat batch of all sketch-entity segments, so edge_at() can answer
+        # with one vectorized query instead of a per-entity Python loop.
+        self._sk_stage: list[tuple[str, np.ndarray]] = []
+        self._skb_keys: list[str] = []
+        self._skb_a2 = np.zeros((0, 2))
+        self._skb_b2 = np.zeros((0, 2))
+        self._skb_a3 = np.zeros((0, 3), dtype=np.float32)
+        self._skb_b3 = np.zeros((0, 3), dtype=np.float32)
+        self._skb_seg_ent = np.zeros(0, dtype=np.intp)
 
     # ------------------------------------------------------------------
     # Build
@@ -203,6 +218,7 @@ class HoverState:
         # Each LineEntity becomes a 2-point edge in the hover cache,
         # keyed by the synthetic sketch key so the viewport can identify it.
         # ------------------------------------------------------------------
+        self._sk_stage = []
         if history is not None:
             self._add_sketch_edges(history, _project,
                                    skip_idx=editing_sketch_idx)
@@ -210,11 +226,96 @@ class HoverState:
         if active_sketch is not None:
             self._add_active_sketch_edges(active_sketch, _project)
 
+        self._finalize_sketch_batch(_project)
+
         self._ready = True
 
+    @staticmethod
+    def _entity_uv_polys(entities):
+        """Return [(entity_idx, (P,2) uv polyline)] for hoverable entities.
+
+        All arcs are tessellated in one batched trig evaluation — with traced
+        sketches (hundreds of arcs) per-arc tessellation dominates rebuild().
+        """
+        from cad.sketch import LineEntity, ArcEntity, SplineEntity
+        n_seg = HOVER_CURVE_SEGMENTS
+        out = []
+        arc_js, arc_params = [], []
+        for j, ent in enumerate(entities):
+            if isinstance(ent, LineEntity):
+                out.append((j, np.array([ent.p0, ent.p1], dtype=np.float64)))
+            elif isinstance(ent, ArcEntity):
+                arc_js.append(j)
+                arc_params.append((ent.center[0], ent.center[1], ent.radius,
+                                   ent.start_angle, ent.end_angle))
+            elif isinstance(ent, SplineEntity):
+                out.append((j, ent.tessellate_np(n_seg)))
+        if arc_js:
+            P  = np.array(arc_params, dtype=np.float64)
+            t  = np.linspace(0.0, 1.0, n_seg + 1)
+            ang = P[:, 3:4] + (P[:, 4:5] - P[:, 3:4]) * t     # (A, n+1)
+            r   = P[:, 2:3]
+            polys = np.stack([P[:, 0:1] + r * np.cos(ang),
+                              P[:, 1:2] + r * np.sin(ang)], axis=2)
+            out.extend(zip(arc_js, polys))
+        return out
+
+    def _stage_entry_edges(self, history_idx, entities,
+                           origin, x_axis, y_axis):
+        """Convert one sketch's entities to world polylines and stage them
+        for the batched projection pass.  Returns per-line/arc endpoint world
+        points (for the sketch-vertex cache)."""
+        from cad.sketch import LineEntity, ArcEntity
+        polys = list(self._entity_uv_polys(entities))
+        if not polys:
+            return []
+        counts  = [len(p) for _, p in polys]
+        all_uv  = np.concatenate([p for _, p in polys])
+        world   = (origin
+                   + all_uv[:, 0:1] * x_axis
+                   + all_uv[:, 1:2] * y_axis).astype(np.float32)
+        offsets = np.concatenate([[0], np.cumsum(counts)])
+        endpoints = []
+        for k, (j, _) in enumerate(polys):
+            pts3d = world[offsets[k]:offsets[k + 1]]
+            self._sk_stage.append((_sketch_key(history_idx, j), pts3d))
+            if isinstance(entities[j], (LineEntity, ArcEntity)):
+                endpoints.append(pts3d[0])
+                endpoints.append(pts3d[-1])
+        return endpoints
+
+    def _finalize_sketch_batch(self, project_fn):
+        """Project every staged sketch polyline in one batch and build the
+        flat segment arrays edge_at() queries."""
+        stage = self._sk_stage
+        self._skb_keys = []
+        if not stage:
+            self._skb_a2 = np.zeros((0, 2))
+            self._skb_b2 = np.zeros((0, 2))
+            self._skb_a3 = np.zeros((0, 3), dtype=np.float32)
+            self._skb_b3 = np.zeros((0, 3), dtype=np.float32)
+            self._skb_seg_ent = np.zeros(0, dtype=np.intp)
+            return
+        counts  = np.array([len(p) for _, p in stage])
+        pts3d   = np.concatenate([p for _, p in stage])
+        pts2d   = project_fn(pts3d)
+        offsets = np.concatenate([[0], np.cumsum(counts)])
+        ent_id  = np.repeat(np.arange(len(stage)), counts)
+        for k, (key, _) in enumerate(stage):
+            s, e = offsets[k], offsets[k + 1]
+            self._se[key]   = [pts2d[s:e]]
+            self._se3d[key] = [pts3d[s:e]]
+            self._skb_keys.append(key)
+        # Segments between consecutive points of the same entity.
+        valid = ent_id[:-1] == ent_id[1:]
+        self._skb_a2 = pts2d[:-1][valid]
+        self._skb_b2 = pts2d[1:][valid]
+        self._skb_a3 = pts3d[:-1][valid]
+        self._skb_b3 = pts3d[1:][valid]
+        self._skb_seg_ent = ent_id[:-1][valid]
+
     def _add_sketch_edges(self, history, project_fn, skip_idx=None):
-        """Project committed sketch LineEntity/ArcEntity objects into the hover cache."""
-        from cad.sketch import LineEntity, ArcEntity, SketchEntry, SplineEntity
+        """Stage committed sketch LineEntity/ArcEntity objects for the hover cache."""
         cursor = history.cursor
         for i, entry in enumerate(history.entries):
             if i > cursor:
@@ -228,34 +329,9 @@ class HoverState:
             se = entry.params.get("sketch_entry")
             if se is None or not se.visible:
                 continue
-            endpoints = []
-            for j, ent in enumerate(se.entities):
-                def _uv_to_world(uv):
-                    return (se.plane_origin
-                            + float(uv[0]) * se.plane_x_axis
-                            + float(uv[1]) * se.plane_y_axis)
-                if isinstance(ent, LineEntity):
-                    pts3d = np.array([_uv_to_world(ent.p0),
-                                      _uv_to_world(ent.p1)], dtype=np.float32)
-                elif isinstance(ent, (ArcEntity, SplineEntity)):
-                    from cad.prefs import prefs
-                    pts3d = np.array([_uv_to_world(p)
-                                      for p in ent.tessellate(prefs.sketch_curve_segments)],
-                                     dtype=np.float32)
-                else:
-                    continue
-                key = _sketch_key(i, j)
-                self._se[key]   = [project_fn(pts3d)]
-                self._se3d[key] = [pts3d]
-
-                if isinstance(ent, LineEntity):
-                    endpoints.append(_uv_to_world(ent.p0))
-                    endpoints.append(_uv_to_world(ent.p1))
-                elif isinstance(ent, ArcEntity):
-                    tess = ent.tessellate(2)
-                    endpoints.append(_uv_to_world(tess[0]))
-                    endpoints.append(_uv_to_world(tess[-1]))
-
+            endpoints = self._stage_entry_edges(
+                i, se.entities,
+                se.plane_origin, se.plane_x_axis, se.plane_y_axis)
             if endpoints:
                 vtx_3d = np.array(endpoints, dtype=np.float32)
                 vtx_2d = project_fn(vtx_3d)
@@ -264,27 +340,14 @@ class HoverState:
 
     def _add_active_sketch_edges(self, sketch, project_fn):
         """
-        Project LineEntity/ArcEntity objects from the active (uncommitted) sketch
-        into the hover cache.  Uses history_idx = -1 as a sentinel so
+        Stage LineEntity/ArcEntity objects from the active (uncommitted) sketch
+        for the hover cache.  Uses history_idx = -1 as a sentinel so
         parse_sketch_key returns (-1, entity_idx) and the viewport can
         distinguish active vs committed sketch edges.
         """
-        from cad.sketch import LineEntity, ArcEntity, SplineEntity
-        for j, ent in enumerate(sketch.entities):
-            if isinstance(ent, LineEntity):
-                p0_world = sketch.plane.to_3d(float(ent.p0[0]), float(ent.p0[1]))
-                p1_world = sketch.plane.to_3d(float(ent.p1[0]), float(ent.p1[1]))
-                pts3d = np.array([p0_world, p1_world], dtype=np.float32)
-            elif isinstance(ent, (ArcEntity, SplineEntity)):
-                from cad.prefs import prefs
-                pts3d = np.array([sketch.plane.to_3d(float(p[0]), float(p[1]))
-                                  for p in ent.tessellate(prefs.sketch_curve_segments)],
-                                 dtype=np.float32)
-            else:
-                continue
-            key = _sketch_key(-1, j)
-            self._se[key]   = [project_fn(pts3d)]
-            self._se3d[key] = [pts3d]
+        plane = sketch.plane
+        self._stage_entry_edges(-1, sketch.entities,
+                                plane.origin, plane.x_axis, plane.y_axis)
 
     # ------------------------------------------------------------------
     # Occlusion
@@ -362,7 +425,30 @@ class HoverState:
 
         candidates: list[tuple[float, str, int, np.ndarray]] = []
 
+        # Sketch entities: one vectorized query over the flat segment batch.
+        if len(self._skb_a2):
+            a  = self._skb_a2
+            ab = self._skb_b2 - a
+            len_sq = (ab * ab).sum(axis=1)
+            t = ((np.array([x, y]) - a) * ab).sum(axis=1) / \
+                np.where(len_sq > 1e-9, len_sq, 1e-9)
+            t = np.clip(t, 0.0, 1.0)
+            closest = a + t[:, np.newaxis] * ab
+            dists = np.hypot(closest[:, 0] - x, closest[:, 1] - y)
+            hit_ents: dict[int, tuple[float, int]] = {}
+            for si in np.where(dists < EDGE_HOVER_RADIUS)[0]:
+                eid = int(self._skb_seg_ent[si])
+                if eid not in hit_ents or dists[si] < hit_ents[eid][0]:
+                    hit_ents[eid] = (float(dists[si]), int(si))
+            for eid, (d, si) in hit_ents.items():
+                t_val = float(t[si])
+                wp3d = (self._skb_a3[si].astype(np.float64) * (1 - t_val) +
+                        self._skb_b3[si].astype(np.float64) * t_val)
+                candidates.append((d, self._skb_keys[eid], 0, wp3d))
+
         for body_id, sedges in self._se.items():
+            if body_id.startswith(_SKETCH_KEY_PREFIX):
+                continue
             for ei, se in enumerate(sedges):
                 if len(se) < 2:
                     continue
@@ -411,3 +497,10 @@ class HoverState:
         self._meshes    = None
         self._workspace = None
         self._ready     = False
+        self._sk_stage  = []
+        self._skb_keys  = []
+        self._skb_a2 = np.zeros((0, 2))
+        self._skb_b2 = np.zeros((0, 2))
+        self._skb_a3 = np.zeros((0, 3), dtype=np.float32)
+        self._skb_b3 = np.zeros((0, 3), dtype=np.float32)
+        self._skb_seg_ent = np.zeros(0, dtype=np.intp)
