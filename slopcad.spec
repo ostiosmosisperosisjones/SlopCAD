@@ -48,6 +48,10 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# Windows .exe icon — use slopcad.ico if the build generated it (see the CI
+# "Generate Windows icon" step); harmless to omit on Linux where it's unused.
+_icon = "slopcad.ico" if os.path.exists("slopcad.ico") else None
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -60,6 +64,7 @@ exe = EXE(
     upx=False,
     console=False,   # no terminal window
     disable_windowed_traceback=False,
+    icon=_icon,
 )
 
 coll = COLLECT(

@@ -8,6 +8,8 @@ The camera fits itself to the scene bounding box instead.
 
 import numpy as np
 from ocp_tessellate.tessellator import tessellate
+from OCP.BRep import BRep_Tool
+from OCP.TopLoc import TopLoc_Location
 from OpenGL.GL import *
 
 
@@ -62,10 +64,41 @@ class Mesh:
             cache_key = cache_key + "_r"
 
         if tess is None:
-            raise RuntimeError(
-                f"Face count mismatch after all retry attempts: tessellator gave "
-                f"{len(tri_per_face)} faces but shape.faces() gave {len(self.occt_faces)}."
-            )
+            # The tessellator silently drops faces it can't triangulate — most
+            # often zero-area sliver faces imported from a STEP file (e.g. a
+            # cylinder with a ~1e-12 UV span). It emits triangles for the
+            # remaining faces *in shape.faces() order*, so its dense
+            # triangles_per_face list is missing exactly one entry per dropped
+            # face. Rather than abort the whole load, re-expand the list to full
+            # length by inserting 0 for each face that has no triangulation.
+            # This keeps triangles_per_face aligned with occt_faces (which the
+            # whole app indexes in build123d order), so face picking stays
+            # correct and the dropped slivers simply render/pick as empty.
+            tess = t  # last (loosest) attempt
+            full = np.zeros(len(self.occt_faces), dtype=np.int32)
+            dense = tri_per_face
+            di = 0
+            dropped = []
+            for fi, face in enumerate(self.occt_faces):
+                loc = TopLoc_Location()
+                has_tri = BRep_Tool.Triangulation_s(face.wrapped, loc) is not None
+                if has_tri and di < len(dense):
+                    full[fi] = dense[di]
+                    di += 1
+                elif not has_tri:
+                    dropped.append(fi)
+            if di != len(dense):
+                # Skip-detection didn't line up with the dense count — the
+                # positional splice would be wrong, so fail loudly rather than
+                # silently corrupt face picking.
+                raise RuntimeError(
+                    f"Face count mismatch: tessellator gave {len(dense)} faces "
+                    f"but shape.faces() gave {len(self.occt_faces)}; could not "
+                    f"reconcile ({di} triangulated faces matched)."
+                )
+            self.triangles_per_face = full
+            print(f"  [mesh] {len(dropped)} un-meshable face(s) skipped "
+                  f"(indices {dropped}); rendering the rest.")
 
         self.verts   = np.array(tess['vertices'], dtype=np.float32).reshape(-1, 3)
         self.tris    = np.array(tess['triangles'], dtype=np.uint32).reshape(-1, 3)

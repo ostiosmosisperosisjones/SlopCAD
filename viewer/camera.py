@@ -268,8 +268,18 @@ class Camera:
         Converts the cursor to a normalised offset from the viewport centre,
         then shifts `target` so that world point stays fixed under the cursor
         as the scale changes.
+
+        `delta` is Qt's angleDelta().y() in eighths-of-a-degree; one physical
+        wheel notch is 120. Qt coalesces several notches into a single event
+        with a proportionally larger delta, so the zoom step MUST scale with
+        magnitude — a fixed per-event factor makes a coalesced 3-notch event
+        zoom the same as one notch, which reads as "scroll notches ignored".
         """
-        factor = 0.9 if delta > 0 else 1.1
+        if delta == 0:
+            return
+        notches = abs(delta) / 120.0
+        base = 0.9 if delta > 0 else 1.1
+        factor = base ** notches
 
         R = _quat_to_matrix(self.rotation)
         right = R[:, 0]

@@ -11,17 +11,22 @@ from __future__ import annotations
 from typing import Callable, Any
 
 
-def bboxes_overlap(a, b) -> bool:
+def bboxes_overlap(a, b, tol: float = 0.0) -> bool:
     """
     True when two axis-aligned bounding boxes (build123d BoundingBox or
     anything with .min.{X,Y,Z} and .max.{X,Y,Z}) overlap on every axis.
 
     Used as a cheap prefilter to skip bodies the cut tool can't intersect
     before paying for a boolean operation.
+
+    tol expands each box before comparing — pass a small positive value when
+    abutting must count as overlap: two bodies in exact face-to-face contact
+    can have bboxes separated by float noise (~1e-7 mm), which a zero-tol
+    check reads as disjoint.
     """
-    return (a.min.X <= b.max.X and a.max.X >= b.min.X and
-            a.min.Y <= b.max.Y and a.max.Y >= b.min.Y and
-            a.min.Z <= b.max.Z and a.max.Z >= b.min.Z)
+    return (a.min.X - tol <= b.max.X and a.max.X + tol >= b.min.X and
+            a.min.Y - tol <= b.max.Y and a.max.Y + tol >= b.min.Y and
+            a.min.Z - tol <= b.max.Z and a.max.Z + tol >= b.min.Z)
 
 
 def fan_out_cut(viewport, tool_solid, build_op: Callable[[str], Any],

@@ -15,6 +15,12 @@ from __future__ import annotations
 
 _TOUCH_TOL = 1e-6  # mm — shapes within this distance are considered touching
 
+# Padding for the tier-1 bbox prefilter in _mark_disjoint_inputs.  Abutting
+# bodies can have bboxes separated by float noise (seen: 1.2e-7 mm), and a
+# zero-tol bbox miss skips the exact check entirely.  Generous is fine — a
+# false positive only costs running the exact per-op check, which decides.
+_BBOX_PAD = 1e-3
+
 
 def _shape_contains(outer, inner) -> bool:
     """True if a vertex of inner lies strictly inside a solid of outer."""
@@ -382,7 +388,7 @@ class BooleanMixin:
             if bboxes[i] is None or bboxes[j] is None:
                 cache[key] = True   # can't tell — give the benefit of the doubt
                 return True
-            if not bboxes_overlap(bboxes[i], bboxes[j]):
+            if not bboxes_overlap(bboxes[i], bboxes[j], tol=_BBOX_PAD):
                 cache[key] = False
                 return False
             # Bboxes overlap; confirm with the exact per-op check.

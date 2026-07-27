@@ -1,15 +1,41 @@
 import os
 import sys
 
-# On X11 WMs with no compositor (e.g. awesomewm), Qt6's GLX path swaps buffers
-# via Mesa DRI3 (loader_dri3_swap_buffers_msc -> xcb_wait_for_special_event),
-# which can block the GUI thread forever during the expose/flush that follows a
-# window resize — the whole app freezes on its last frame on every resize.
-# Disabling the DRI3 vblank wait removes that blocking swap. Keep the default
-# (GLX) GL integration so PyOpenGL's GLX-based context detection still works
-# (switching Qt to EGL breaks glVertexPointer's getContext()).  Must be set
-# before Qt is imported. (Allow external override so other envs can opt out.)
-os.environ.setdefault("vblank_mode", "0")
+# In a frozen build (PyInstaller AppImage/exe) there is no console, so any
+# startup crash or our diagnostic prints (e.g. the GPU-pick CPU fallback) vanish
+# — a friend just sees "it didn't open" with nothing to send back. Tee stdout/
+# stderr to a log file next to the user's config so failures are recoverable.
+# Only in the frozen build; a dev run keeps its normal terminal output.
+if getattr(sys, "frozen", False):
+    try:
+        if os.name == "nt":
+            _log_base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        else:
+            _log_base = os.environ.get(
+                "XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config"))
+        _log_dir = os.path.join(_log_base, "cadapp")
+        os.makedirs(_log_dir, exist_ok=True)
+        _log_file = open(os.path.join(_log_dir, "slopcad.log"), "w",
+                         buffering=1, encoding="utf-8")
+        sys.stdout = _log_file
+        sys.stderr = _log_file
+        import faulthandler
+        faulthandler.enable(_log_file)   # dump native tracebacks on hard crash
+    except Exception:
+        pass   # never let logging setup stop the app from launching
+
+# Linux/Mesa only: on X11 WMs with no compositor (e.g. awesomewm), Qt6's GLX
+# path swaps buffers via Mesa DRI3 (loader_dri3_swap_buffers_msc ->
+# xcb_wait_for_special_event), which can block the GUI thread forever during the
+# expose/flush after a window resize — the app freezes on its last frame. The
+# vblank_mode env var disables that DRI3 vblank wait. It is a MESA-ONLY variable:
+# the NVIDIA proprietary driver and Windows (WGL) ignore it, so it's a harmless
+# no-op there. Keep the default (GLX) GL integration so PyOpenGL's GLX-based
+# context detection still works (switching Qt to EGL breaks glVertexPointer's
+# getContext()). Must be set before Qt is imported; setdefault lets any env
+# override it. Only touch the environment on Linux so Windows stays pristine.
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("vblank_mode", "0")
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QPalette, QColor

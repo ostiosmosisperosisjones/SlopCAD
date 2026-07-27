@@ -284,6 +284,7 @@ class _EntryWidget(QFrame):
 class _HistoryList(QListWidget):
     reorder_requested = pyqtSignal(int, int)  # src, dst
     delete_requested  = pyqtSignal(int)
+    edit_requested    = pyqtSignal(int)       # re-enter/edit the entry at index
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -356,6 +357,12 @@ class _HistoryList(QListWidget):
             }
             QMenu::item:selected { background: #2f3f52; }
         """)
+
+        edit_act = QAction("Edit / Re-enter", self)
+        edit_act.triggered.connect(lambda: self.edit_requested.emit(hidx))
+        menu.addAction(edit_act)
+
+        menu.addSeparator()
 
         del_act = QAction("Delete", self)
         del_act.triggered.connect(lambda: self.delete_requested.emit(hidx))
@@ -443,6 +450,7 @@ class HistoryPanel(QWidget):
         self._list = _HistoryList()
         self._list.reorder_requested.connect(self.reorder_requested)
         self._list.delete_requested.connect(self.delete_requested)
+        self._list.edit_requested.connect(self._on_edit_requested)
         self._list.itemClicked.connect(self._on_item_clicked)
         self._list.itemDoubleClicked.connect(self._on_item_double_clicked)
         root.addWidget(self._list, stretch=1)
@@ -535,6 +543,18 @@ class HistoryPanel(QWidget):
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
         self._on_item_double_clicked_idx(self._item_index(item))
+
+    def _on_edit_requested(self, index: int):
+        """Right-click 'Edit / Re-enter' → seek to the entry first (so the
+        'future entry' guard passes), then run the normal edit dispatch.
+
+        Unlike double-click, the context-menu action carries a fixed index and
+        can't be re-targeted by a scrollbar reset, so seeking here is safe.
+        """
+        if index < 0 or index >= len(self._history.entries):
+            return
+        self.seek_requested.emit(index)
+        self._on_item_double_clicked_idx(index)
 
     def _on_item_double_clicked_idx(self, index: int):
         entries = self._history.entries

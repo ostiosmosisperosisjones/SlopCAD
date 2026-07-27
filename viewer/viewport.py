@@ -93,6 +93,42 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.selection = SelectionSet()
         self.hover     = HoverState()
 
+        from viewer.gpu_pick import GpuPicker
+        self._gpu_pick = GpuPicker()
+        # While the camera is actively moving (orbit/pan/zoom) we skip the
+        # ~12ms GPU-pick id-image render — the user is manipulating the view,
+        # not hovering, so a stale id-image is fine. A short settle timer
+        # re-renders it once motion stops so hover/pick work again.
+        self._interacting = False
+        from PyQt6.QtCore import QTimer, Qt as _Qt
+        self._interact_settle = QTimer(self)
+        self._interact_settle.setSingleShot(True)
+        self._interact_settle.setInterval(120)
+        self._interact_settle.timeout.connect(self._end_interaction)
+
+        # Steady repaint pump for the duration of a camera interaction. On this
+        # no-compositor X11 + vblank_mode=0 setup, on-demand update() paints are
+        # delivered by the platform in irregular BURSTS (frames freeze, then a
+        # flood fires at once — visible as the profiler frame counter stalling
+        # then jumping). Pacing update() from a real-interval QTimer while
+        # interacting gives the platform a smooth, continuous paint stream —
+        # like a held mouse-button does — so motion doesn't hitch. Runs ONLY
+        # during interaction (stopped by _end_interaction), never when idle.
+        self._interact_pump = QTimer(self)
+        self._interact_pump.setInterval(8)   # ~120 Hz ceiling
+        self._interact_pump.setTimerType(_Qt.TimerType.PreciseTimer)
+        self._interact_pump.timeout.connect(self.update)
+
+        # Smooth-zoom animation. The compositor delivers wheel events in slow
+        # ~300ms clumps (coalesced), so applying each instantly makes zoom jump
+        # in a few big steps/sec. Instead each event ADDS to a pending notch
+        # budget that _step_zoom_before_paint eases onto the camera one frame at
+        # a time, self-perpetuating via update() — clocked by the repaint loop,
+        # NOT a QTimer (whose ticks starve when the event loop idles between the
+        # compositor's wheel clumps; that starvation was the residual stutter).
+        self._zoom_pending = 0.0            # unspent notches (signed)
+        self._zoom_cursor  = (0.0, 0.0)     # cursor pos to anchor zoom at
+
         self._hovered_vertex: tuple[str | None, int | None] = (None, None)
         self._hovered_edge:   tuple[str | None, int | None] = (None, None)
 
@@ -476,6 +512,13 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         from cad.profiler import profiler
         profiler.frame_begin()
 
+        # Advance the smooth-zoom animation from within the paint loop and
+        # request the next frame. This rides the widget's own repaint cycle —
+        # the same mechanism that stays hot (and buttery) when a mouse button is
+        # held — instead of a QTimer whose ticks starve when the event loop goes
+        # idle between the compositor's slow wheel-event clumps.
+        self._step_zoom_before_paint()
+
         self._set_projection(self.width(), self.height())
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
@@ -518,14 +561,41 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         # edge once their preview is on screen.
         hover_meshes = {bid: m for bid, m in self._meshes.items()
                         if self._body_visible.get(bid, True)}
-        with profiler.section("hover.rebuild"):
-            self.hover.rebuild(hover_meshes, self.workspace,
-                               self._modelview, self._projection,
-                               self._viewport, self.devicePixelRatio(),
-                               camera_eye=self.camera.get_eye(),
-                               history=self.history,
-                               active_sketch=self._sketch,
-                               editing_sketch_idx=self._editing_sketch_history_idx)
+        # During active camera motion, hover projections are stale the instant
+        # they're built and nothing queries them (a mouse button is held / the
+        # wheel is spinning), so skip the rebuild too. It re-runs when the
+        # settle timer fires a final frame.
+        if not self._interacting:
+            with profiler.section("hover.rebuild"):
+                self.hover.rebuild(hover_meshes, self.workspace,
+                                   self._modelview, self._projection,
+                                   self._viewport, self.devicePixelRatio(),
+                                   camera_eye=self.camera.get_eye(),
+                                   history=self.history,
+                                   active_sketch=self._sketch,
+                                   editing_sketch_idx=self._editing_sketch_history_idx,
+                                   occlusion_fn=self._gpu_occlusion)
+
+        # GPU pick id-image: rendered here so it uses the same matrices/viewport
+        # as the on-screen draw. Signature-gated so it only re-renders when the
+        # view or visible-body set changes — repeated picks between camera moves
+        # are then a single glReadPixels.
+        # Skip the pick id-image render while the camera is actively moving —
+        # it's the dominant per-frame cost (~12ms) and picking isn't needed
+        # mid-drag. The settle timer re-renders it once motion stops.
+        if not self._interacting:
+            with profiler.section("gpu_pick.render"):
+                pick_sig = (
+                    np.asarray(self._modelview).tobytes(),
+                    np.asarray(self._projection).tobytes(),
+                    tuple(sorted((bid, id(m)) for bid, m in hover_meshes.items())),
+                )
+                try:
+                    self._gpu_pick.render(hover_meshes, self.workspace,
+                                          self._viewport, pick_sig)
+                except Exception as ex:
+                    print(f"[gpu_pick] render failed, falling back to CPU: {ex}")
+                    self._gpu_pick.invalidate()
 
         with profiler.section("sketch_faces"):
             self._draw_sketch_faces()
@@ -841,7 +911,111 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     return True
         return False
 
+    def _begin_interaction(self):
+        """Mark the camera as actively moving; (re)arm the settle timer and run
+        the steady repaint pump. The GPU-pick id-image render is skipped until
+        motion stops."""
+        self._interacting = True
+        self._interact_settle.start()   # restarts if already running
+        if not self._interact_pump.isActive():
+            self._interact_pump.start()
+
+    def _end_interaction(self):
+        """Motion settled. Just clear the flag and request one repaint. We do
+        NOT invalidate the pick image here — the render in paintGL is
+        signature-gated on the camera matrices, so it re-renders exactly once
+        (the camera moved since the last valid render) and then stays cached.
+        Eagerly invalidating caused a render ping-pong (settle→invalidate→
+        paint re-renders→...) that got violent under F8's free-running repaints
+        and on enter/leave events."""
+        if not self._interacting:
+            return
+        self._interacting = False
+        self._interact_pump.stop()
+        self.update()   # one settle frame renders the fresh id-image
+
+    def _ensure_pick_current(self):
+        """Render the pick id-image on demand if it's stale (e.g. the camera
+        moved while interacting, so paintGL skipped it). Cheap when already
+        valid — the render is signature-gated. Needs the GL context current."""
+        gp = getattr(self, '_gpu_pick', None)
+        if gp is None or self._modelview is None:
+            return
+        if gp._valid or gp._disabled:
+            return
+        hover_meshes = {bid: m for bid, m in self._meshes.items()
+                        if self._body_visible.get(bid, True)}
+        pick_sig = (
+            np.asarray(self._modelview).tobytes(),
+            np.asarray(self._projection).tobytes(),
+            tuple(sorted((bid, id(m)) for bid, m in hover_meshes.items())),
+        )
+        self.makeCurrent()
+        try:
+            gp.render(hover_meshes, self.workspace, self._viewport, pick_sig)
+        except Exception as ex:
+            print(f"[gpu_pick] on-demand render failed: {ex}")
+            gp.invalidate()
+        finally:
+            self.doneCurrent()
+
+    def _gpu_occlusion(self, world_pt):
+        """Occlusion test for hover: is `world_pt` the front-most surface at its
+        screen pixel? Returns True (visible), False (occluded), or None if the
+        GPU id-image can't answer (caller falls back to CPU ray casting).
+
+        Uses the depth buffer of the pick FBO: project the point to window
+        space, compare its depth to the stored scene depth at that pixel.
+        """
+        gp = getattr(self, '_gpu_pick', None)
+        if gp is None or self._modelview is None:
+            return None
+        self._ensure_pick_current()
+        if not gp._valid:
+            return None
+        try:
+            wx, wy, wz = gluProject(float(world_pt[0]), float(world_pt[1]),
+                                    float(world_pt[2]),
+                                    self._modelview, self._projection,
+                                    self._viewport)
+        except Exception:
+            return None
+        x_px, y_px = int(round(wx)), int(round(wy))
+        self.makeCurrent()
+        try:
+            scene_z = gp.depth_at(x_px, y_px)
+        finally:
+            self.doneCurrent()
+        if scene_z is None:
+            # Nothing drawn at that pixel — the point is in free space, visible.
+            return True
+        # Small bias so the point's own surface doesn't self-occlude (depth
+        # buffer is non-linear; a fixed epsilon in window-z is adequate here).
+        return wz <= scene_z + 1e-4
+
     def _pick_at(self, pos):
+        # GPU colour-pick: one glReadPixels against the id-image rendered in
+        # paintGL. O(1) in triangle count (CPU ray/triangle was ~180ms on a 2M-
+        # triangle assembly and ran on every mouse move). Falls back to CPU if
+        # the id-image isn't valid (e.g. FBO unavailable).
+        if self._viewport is not None and getattr(self, '_gpu_pick', None) is not None:
+            # Render the id-image on demand if stale (camera moved while
+            # interacting). Cheap glReadPixels if already current — no forced
+            # full-scene repaint on the interaction path.
+            self._ensure_pick_current()
+            dpr  = self.devicePixelRatio()
+            x_px = int(pos.x() * dpr)
+            y_px = int(self._viewport[3] - pos.y() * dpr)
+            if self._gpu_pick._valid:
+                self.makeCurrent()
+                try:
+                    return self._gpu_pick.pick(x_px, y_px)
+                finally:
+                    self.doneCurrent()
+
+        return self._pick_at_cpu(pos)
+
+    def _pick_at_cpu(self, pos):
         from cad.picker import pick_face
         origin, direction = self.get_ray(pos.x(), pos.y())
         if origin is None:
@@ -2039,51 +2213,60 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             return
 
         if buttons & Qt.MouseButton.RightButton:
-            self.camera.orbit(e.position()); self.update(); return
+            self.camera.orbit(e.position()); self._begin_interaction(); self.update(); return
         if buttons & Qt.MouseButton.MiddleButton:
-            self.camera.pan(e.position());   self.update(); return
+            self.camera.pan(e.position());   self._begin_interaction(); self.update(); return
 
         x, y = e.position().x(), e.position().y()
 
-        R = _quat_to_matrix(self.camera.rotation)
-        cube_changed = self._view_cube.handle_mouse_move(
-            int(x), int(y), self.width(), self.height(), R,
-            self.devicePixelRatio())
-        if cube_changed:
-            self.update()
+        # While the camera is mid-motion (notably the smooth-zoom animation),
+        # skip mesh hover/pick. During motion the id-image render is skipped in
+        # paintGL, so running hover here would force a synchronous ~12ms GPU
+        # re-render on each mouse-move — the stutter that shows up only when the
+        # cursor moves during a zoom. Hover is meaningless while the view moves
+        # anyway. The active-sketch cursor update below still runs so rubber-band
+        # line drawing keeps tracking even if the user zooms mid-draw.
+        hover_changed = False
+        if not self._interacting:
+            R = _quat_to_matrix(self.camera.rotation)
+            cube_changed = self._view_cube.handle_mouse_move(
+                int(x), int(y), self.width(), self.height(), R,
+                self.devicePixelRatio())
+            if cube_changed:
+                self.update()
 
-        new_v = self.hover.vertex_at(x, y)
-        new_e = (None, None) if new_v[0] is not None \
-                else self.hover.edge_at(x, y)
-        # While picking edges for fillet/chamfer, sketch edges are not valid
-        # targets — drop them from hover so they don't highlight or click.
-        if new_e[0] is not None and (
-                getattr(self, '_fillet3d_pick_edge', False) or
-                getattr(self, '_chamfer_pick_edge', False)):
-            from viewer.hover import parse_sketch_key
-            if parse_sketch_key(new_e[0]) is not None:
-                new_e = (None, None)
-        hover_changed = (new_v != self._hovered_vertex or
-                         new_e != self._hovered_edge)
-        self._hovered_vertex = new_v
-        self._hovered_edge   = new_e
+            new_v = self.hover.vertex_at(x, y)
+            new_e = (None, None) if new_v[0] is not None \
+                    else self.hover.edge_at(x, y)
+            # While picking edges for fillet/chamfer, sketch edges are not valid
+            # targets — drop them from hover so they don't highlight or click.
+            if new_e[0] is not None and (
+                    getattr(self, '_fillet3d_pick_edge', False) or
+                    getattr(self, '_chamfer_pick_edge', False)):
+                from viewer.hover import parse_sketch_key
+                if parse_sketch_key(new_e[0]) is not None:
+                    new_e = (None, None)
+            hover_changed = (new_v != self._hovered_vertex or
+                             new_e != self._hovered_edge)
+            self._hovered_vertex = new_v
+            self._hovered_edge   = new_e
 
-        # Plane hover — only when no body-surface element is under the cursor,
-        # and we're not in active sketch mode.
-        new_plane_idx = None
-        if (new_v[0] is None and new_e[0] is None and
-                self._sketch is None):
-            from viewer.plane_overlay import pick_offset_plane
-            ro, rd = self.get_ray(x, y)
-            if ro is not None:
-                # Also need to lose to a face hit so picking-a-face-behind-a-plane
-                # still works in pick modes.  Cheap check: ask the GPU pick.
-                face_body, face_idx = self._pick_at(e.position())
-                if face_idx is None:
-                    new_plane_idx = pick_offset_plane(self, ro, rd)
-        if new_plane_idx != self._hovered_plane_idx:
-            self._hovered_plane_idx = new_plane_idx
-            hover_changed = True
+            # Plane hover — only when no body-surface element is under the
+            # cursor, and we're not in active sketch mode.
+            new_plane_idx = None
+            if (new_v[0] is None and new_e[0] is None and
+                    self._sketch is None):
+                from viewer.plane_overlay import pick_offset_plane
+                ro, rd = self.get_ray(x, y)
+                if ro is not None:
+                    # Also need to lose to a face hit so picking-a-face-behind-a
+                    # -plane still works in pick modes. Cheap check: GPU pick.
+                    face_body, face_idx = self._pick_at(e.position())
+                    if face_idx is None:
+                        new_plane_idx = pick_offset_plane(self, ro, rd)
+            if new_plane_idx != self._hovered_plane_idx:
+                self._hovered_plane_idx = new_plane_idx
+                hover_changed = True
 
         sketch_changed = False
         if self._sketch is not None:
@@ -2298,13 +2481,40 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.update()
 
     def wheelEvent(self, e):
+        dy = e.angleDelta().y()
+        if dy == 0:
+            return
         pos = e.position()
-        self.camera.scroll_at(
-            e.angleDelta().y(),
-            pos.x(), pos.y(),
-            self.width(), self.height(),
-        )
+        # Top up the pending zoom budget; the actual easing happens in
+        # _step_zoom_before_paint (driven by the repaint loop, not a timer).
+        self._zoom_pending += dy / 120.0
+        self._zoom_cursor   = (pos.x(), pos.y())
+        self._begin_interaction()
         self.update()
+
+    def _step_zoom_before_paint(self):
+        """Ease a fraction of the pending zoom budget onto the camera, then ask
+        for the next frame if any budget remains. Called at the top of paintGL
+        so the animation is clocked by the widget's repaint cycle — which stays
+        alive under this compositor (unlike an idle QTimer)."""
+        pending = self._zoom_pending
+        if abs(pending) < 1e-3:
+            self._zoom_pending = 0.0
+            return
+        # Spend ~25% of the remaining budget per frame (exponential ease-out),
+        # with a floor so the tail finishes in a frame instead of crawling.
+        step = pending * 0.25
+        if abs(step) < 0.05:
+            step = pending
+        self._zoom_pending -= step
+        # scroll_at anchors zoom at the cursor and takes an angleDelta-style
+        # magnitude (notches * 120), preserving zoom-to-cursor per increment.
+        cx, cy = self._zoom_cursor
+        self.camera.scroll_at(step * 120.0, cx, cy,
+                              self.width(), self.height())
+        self._begin_interaction()   # keep pick/hover work deferred during zoom
+        if abs(self._zoom_pending) >= 1e-3:
+            self.update()           # self-perpetuate the animation
 
 
 # ---------------------------------------------------------------------------

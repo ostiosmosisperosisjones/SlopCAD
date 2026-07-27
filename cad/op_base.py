@@ -11,6 +11,23 @@ if TYPE_CHECKING:
     from cad.history import History
 
 
+def _compound_of(solids):
+    """Build one raw TopoDS_Compound from a list of build123d solids.
+
+    Used to store a split op's *retained* solids (the parent's own pieces)
+    without dragging along the split-away children.  Wrap the return in
+    build123d's Compound(...) at the call site.
+    """
+    from OCP.TopoDS import TopoDS_Compound
+    from OCP.BRep import BRep_Builder
+    comp = TopoDS_Compound()
+    builder = BRep_Builder()
+    builder.MakeCompound(comp)
+    for s in solids:
+        builder.Add(comp, s.wrapped)
+    return comp
+
+
 class Op:
     """Marker base class for all operation types."""
 
@@ -185,12 +202,29 @@ def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
         return set()
 
     solids = list(shape_after.solids())
+    is_split = len(solids) > original_solid_count
+
+    if is_split:
+        # A split: the parent body keeps only its own solid(s); the extra
+        # solids become new child bodies.  Previously the parent entry stored
+        # the FULL multi-solid compound, so the parent body rendered every
+        # disconnected piece — "two disjoint objects still treated as one".
+        # Trim the parent to its retained solids and fingerprint them with
+        # SolidRefs so replay re-selects the same pieces (OCCT solid order is
+        # not stable across a rebuild).
+        from cad.solid_ref import solid_refs_to_dicts
+        retained = solids[:original_solid_count]
+        op_params["retained_solid_refs"] = solid_refs_to_dicts(retained)
+        parent_shape = Compound(_compound_of(retained))
+    else:
+        parent_shape = shape_after
+
     parent_entry = viewport.history.push(
         label=label, operation=op_str, params=op_params,
         body_id=body_id, face_ref=face_ref,
-        shape_before=shape_before, shape_after=shape_after)
+        shape_before=shape_before, shape_after=parent_shape)
 
-    if len(solids) > original_solid_count:
+    if is_split:
         # New solids produced — add import entries for extras.
         from cad.op_types import ImportOp
         extra_solids = solids[original_solid_count:]
@@ -199,10 +233,17 @@ def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
             name = ws.next_part_name()
             new_body = ws.add_body(name, Compound(solid.wrapped))
             new_body.created_at_entry_id = parent_entry.entry_id
+            # Fingerprint the child's solid so replay re-derives it from the
+            # parent's full result by geometry, not fragile solid-iteration
+            # order (the baked shape isn't persisted across save/load).
+            from cad.solid_ref import SolidRef
+            _r = SolidRef.from_b3d_solid(solid)
             imp_params = {
                 "source_entry_id": parent_entry.entry_id,
                 split_key:         body_id,
                 "solid_index":     original_solid_count + i,
+                "solid_ref":       {"volume": _r.volume, "com": list(_r.com),
+                                    "extents": list(_r.extents)},
             }
             viewport.history.push(
                 label=f"import  {name}", operation="import",

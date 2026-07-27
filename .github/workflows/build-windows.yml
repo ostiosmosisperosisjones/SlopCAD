@@ -48,6 +48,13 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Generate Windows icon
+        # slopcad.spec picks up slopcad.ico automatically if present. Build it
+        # from the brand avatar with Pillow (already a dependency), multi-res so
+        # it looks right in the taskbar and Explorer.
+        run: |
+          python -c "from PIL import Image; Image.open('brand/avatar-640.png').save('slopcad.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+
       - name: Build with PyInstaller
         run: |
           pyinstaller --noconfirm --clean slopcad.spec
@@ -78,7 +85,13 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgl1 libglib2.0-0 libdbus-1-3 \
+          # libglu1-mesa provides libGLU.so.1. The app calls gluProject/
+          # gluPerspective/gluUnProject, and GLU is NOT part of the base GL
+          # runtime — many minimal/modern distros don't ship it, so we bundle it
+          # into the AppImage below. Unlike libGL/libEGL (driver-coupled, must
+          # come from the user's system), GLU is pure vendor-neutral math and is
+          # safe to ship.
+          sudo apt-get install -y libgl1 libglu1-mesa libglib2.0-0 libdbus-1-3 \
             libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
             libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
             libxkbcommon-x11-0 fuse
@@ -104,6 +117,23 @@ jobs:
           rm -f libGL.so* libGL-*.so* libEGL.so* libEGL-*.so*
           rm -f libxcb-glx.so*
 
+      - name: Bundle libGLU (vendor-neutral; not always present on target)
+        run: |
+          # GLU is safe to ship (pure math, not driver-coupled). Copy the real
+          # library from the build host into _internal so gluProject/
+          # gluPerspective resolve on minimal distros that lack libglu1-mesa.
+          set -e
+          glu="$(ldconfig -p | awk '/libGLU\.so\.1/ {print $NF; exit}')"
+          if [ -z "$glu" ]; then
+            glu="$(find /usr/lib -name 'libGLU.so.1*' 2>/dev/null | head -n1)"
+          fi
+          if [ -z "$glu" ]; then
+            echo "libGLU.so.1 not found on build host" >&2
+            exit 1
+          fi
+          echo "Bundling $glu"
+          cp -Lv "$glu" dist/slopcad/_internal/libGLU.so.1
+
       - name: Assemble AppDir
         run: |
           mkdir -p AppDir/usr/bin
@@ -118,12 +148,8 @@ jobs:
           Categories=Graphics;
           EOF
 
-          # Placeholder icon (1x1 white PNG) — replace with a real one later
-          python3 -c "
-          import base64, pathlib
-          png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg==')
-          pathlib.Path('AppDir/slopcad.png').write_bytes(png)
-          "
+          # App icon — the SlopCAD brand avatar (must match Icon=slopcad above).
+          cp brand/avatar-640.png AppDir/slopcad.png
 
           cat > AppDir/AppRun << 'EOF'
           #!/bin/bash

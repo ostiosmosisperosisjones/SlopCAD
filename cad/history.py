@@ -383,6 +383,23 @@ class History:
                     mutated_bodies.add(bid)
                     continue
 
+                # Split op: the parent keeps only its own solid(s). execute()
+                # returns the FULL multi-solid boolean result (both halves of a
+                # cut). Before trimming the parent, hand each split-away piece to
+                # its ImportOp child body (their baked shape_after isn't
+                # persisted across save/load — no STEP path — so replay must
+                # re-derive it from the full result here). THEN trim the parent
+                # to the retained solids by SolidRef; otherwise the parent body
+                # renders every disconnected piece and a split reads as one
+                # object. (Commit does the same in _push_result; this makes it
+                # survive replay/reload.)
+                retained_dicts = entry.params.get("retained_solid_refs")
+                if retained_dicts and new_shape is not None:
+                    _seed_split_import_children(self._entries, i, new_shape,
+                                                current_shapes, shape_cache,
+                                                mutated_bodies)
+                    new_shape = _trim_to_retained_solids(new_shape, retained_dicts)
+
                 entry.shape_before = current_shape
                 entry.shape_after  = new_shape
                 current_shapes[bid] = new_shape
@@ -584,6 +601,91 @@ def reproject_consumed_sketch(se, history: History, before_index: int,
             return True, ""
 
     return False, err
+
+
+def _trim_to_retained_solids(shape, retained_dicts):
+    """Return a Compound of just the solids in *shape* that match the stored
+    SolidRefs — the parent body's own pieces after a split.
+
+    Matches each retained ref to its best solid by geometric fingerprint (robust
+    to OCCT solid-ordering churn across a rebuild) and never claims a solid
+    twice.  If nothing matches (e.g. the op degenerated), the original shape is
+    returned unchanged so the body doesn't silently vanish.
+    """
+    from cad.solid_ref import solid_refs_from_dicts
+    from build123d import Compound
+    from cad.op_base import _compound_of
+
+    refs = solid_refs_from_dicts(retained_dicts)
+    if not refs:
+        return shape
+    solids = list(shape.solids())
+    if len(solids) <= len(refs):
+        # Nothing split off (or fewer solids than expected) — keep as-is.
+        return shape
+
+    chosen, used = [], set()
+    for ref in refs:
+        idx, _ = ref.find_in(shape)
+        if idx is None or idx in used:
+            # Fall back to the first unused solid so we still trim something
+            # sane rather than dropping the body.
+            idx = next((j for j in range(len(solids)) if j not in used), None)
+        if idx is not None:
+            used.add(idx)
+            chosen.append(solids[idx])
+
+    if not chosen:
+        return shape
+    return Compound(_compound_of(chosen))
+
+
+def _seed_split_import_children(entries, parent_idx, full_shape,
+                                current_shapes, shape_cache, mutated_bodies):
+    """Give each split-away ImportOp child body its solid from the parent op's
+    FULL (pre-trim) result.
+
+    The `split_from`/`solid_index` child bodies bake their geometry at commit,
+    but that shape isn't persisted across save/load (no STEP path), so on reload
+    the child would have no shape once the parent trims itself.  Here we recover
+    each child's solid from the full multi-solid result: by SolidRef fingerprint
+    when the child stored one (robust to OCCT ordering), else by solid_index.
+    """
+    from build123d import Compound
+    from cad.solid_ref import SolidRef
+
+    solids = list(full_shape.solids())
+    if not solids:
+        return
+    parent_id = entries[parent_idx].entry_id
+    used = set()
+    for e in entries[parent_idx + 1:]:
+        if e.operation != "import":
+            continue
+        if e.params.get("source_entry_id") != parent_id:
+            continue
+        idx = None
+        ref_dict = e.params.get("solid_ref")
+        if ref_dict is not None:
+            ref = SolidRef(volume=float(ref_dict["volume"]),
+                           com=tuple(ref_dict["com"]),
+                           extents=tuple(ref_dict["extents"]))
+            j, _ = ref.find_in(full_shape)
+            if j is not None and j not in used:
+                idx = j
+        if idx is None:
+            si = int(e.params.get("solid_index", 0))
+            idx = si if (0 <= si < len(solids) and si not in used) else \
+                next((k for k in range(len(solids)) if k not in used), None)
+        if idx is None:
+            continue
+        used.add(idx)
+        child_shape = Compound(solids[idx].wrapped)
+        e.shape_after = child_shape
+        cbid = e.body_id
+        current_shapes[cbid] = child_shape
+        shape_cache[cbid]    = (parent_idx, child_shape)
+        mutated_bodies.add(cbid)
 
 
 def _null_split_dependents(entries: list, parent_idx: int) -> None:

@@ -132,14 +132,55 @@ class HoverState:
         self._skb_a3 = np.zeros((0, 3), dtype=np.float32)
         self._skb_b3 = np.zeros((0, 3), dtype=np.float32)
         self._skb_seg_ent = np.zeros(0, dtype=np.intp)
+        # Signature of the last rebuild's inputs. rebuild() re-projects
+        # everything (thousands of edge polylines) which is expensive; on a
+        # static scene the projection is identical frame-to-frame, so we skip
+        # the work when nothing that affects it has changed.
+        self._sig = None
 
     # ------------------------------------------------------------------
     # Build
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _sketch_sig(history, active_sketch, editing_sketch_idx):
+        """Cheap signature of the sketch/history inputs to rebuild().
+
+        Catches committed-sketch visibility toggles, cursor moves, and live
+        edits to the active sketch (drags mutate entity coords in place, so we
+        fold endpoint coordinates in, not just the entity count)."""
+        parts = []
+        if history is not None:
+            parts.append(("cur", history.cursor, editing_sketch_idx))
+            for i, entry in enumerate(history.entries):
+                if i > history.cursor or entry.operation != "sketch":
+                    continue
+                se = entry.params.get("sketch_entry")
+                if se is None:
+                    continue
+                parts.append((i, se.visible, len(se.entities)))
+        if active_sketch is not None:
+            ents = active_sketch.entities
+            parts.append(("active", id(active_sketch), len(ents)))
+            # Fold a coordinate digest so in-place drags invalidate the cache.
+            acc = 0.0
+            for e in ents:
+                for attr in ("p0", "p1", "center", "radius",
+                             "start_angle", "end_angle"):
+                    v = getattr(e, attr, None)
+                    if v is None:
+                        continue
+                    if isinstance(v, (tuple, list, np.ndarray)):
+                        acc += float(v[0]) + float(v[1])
+                    else:
+                        acc += float(v)
+            parts.append(("acc", round(acc, 6)))
+        return tuple(parts)
+
     def rebuild(self, meshes, workspace, modelview, projection, viewport, dpr,
                 camera_eye: np.ndarray = None, history=None,
-                active_sketch=None, editing_sketch_idx=None):
+                active_sketch=None, editing_sketch_idx=None,
+                occlusion_fn=None):
         """
         Project all topo verts/edges, committed sketch line entities,
         and active sketch line entities to screen space.
@@ -152,12 +193,40 @@ class HoverState:
             picks resolve to the committed entry and break active-sketch
             selection (mirror/construction toggle) after re-entry.
         """
-        self._ready = False
+        self._occlusion_fn = occlusion_fn
+
         if modelview is None:
+            self._ready = False
             return
 
         mv  = np.array(modelview,  dtype=np.float64).reshape(4, 4)
         prj = np.array(projection, dtype=np.float64).reshape(4, 4)
+
+        # Skip the (expensive) re-projection when nothing that affects it has
+        # changed since the last rebuild. The matrices capture every camera
+        # move; the mesh id/visibility set captures body add/remove/hide; the
+        # sketch digest captures committed toggles and live drags.
+        # Per-body: (id, visibility, mesh object identity). The mesh id changes
+        # whenever a body is re-meshed (edit/undo), which reprojects its edges;
+        # visibility gates whether it's projected at all.
+        mesh_sig = tuple(sorted(
+            (bid,
+             bool(workspace.bodies.get(bid).visible)
+                  if workspace.bodies.get(bid) is not None else True,
+             id(mesh))
+            for bid, mesh in meshes.items()))
+        sig = (mv.tobytes(), prj.tobytes(),
+               float(viewport[2]), float(viewport[3]), float(dpr),
+               mesh_sig,
+               self._sketch_sig(history, active_sketch, editing_sketch_idx))
+        if self._ready and sig == self._sig:
+            # Occlusion queries need a current eye even when we skip rebuild.
+            if camera_eye is not None:
+                self._eye = camera_eye.copy()
+            return
+        self._sig = sig
+
+        self._ready = False
         mvp = mv @ prj
         vw  = float(viewport[2])
         vh  = float(viewport[3])
@@ -198,17 +267,23 @@ class HoverState:
                                    else np.zeros((0, 2))
             self._sv3d[body_id] = tv
 
-            se_list, se3d_list, sefn_list = [], [], []
-            fn_list = getattr(mesh, 'topo_edge_face_normals', [])
-            for i, edge_pts in enumerate(mesh.topo_edges):
-                proj = _project(edge_pts)
-                se_list.append(proj)
-                se3d_list.append(edge_pts)
-                sefn_list.append(fn_list[i] if i < len(fn_list) else
-                                 np.zeros((0, 3), dtype=np.float32))
-                if not np.all(np.isfinite(proj)):
-                    mid3d = edge_pts[len(edge_pts)//2]
-                    print(f"[DBG] body={body_id} edge {i} projects to non-finite: 3d={mid3d.tolist()} screen={proj}")
+            se3d_list = list(mesh.topo_edges)
+            fn_list   = getattr(mesh, 'topo_edge_face_normals', [])
+            sefn_list = [fn_list[i] if i < len(fn_list)
+                         else np.zeros((0, 3), dtype=np.float32)
+                         for i in range(len(se3d_list))]
+            # Project every edge of this body in a single batched matmul rather
+            # than one _project() call per edge — with thousands of imported
+            # edges the per-call overhead dominated rebuild().
+            if se3d_list:
+                counts  = [len(e) for e in se3d_list]
+                all_pts = np.concatenate(se3d_list)
+                all_2d  = _project(all_pts)
+                offs    = np.concatenate([[0], np.cumsum(counts)])
+                se_list = [all_2d[offs[i]:offs[i + 1]]
+                           for i in range(len(se3d_list))]
+            else:
+                se_list = []
             self._se[body_id]   = se_list
             self._se3d[body_id] = se3d_list
             self._se_fn[body_id] = sefn_list
@@ -356,6 +431,13 @@ class HoverState:
     def _visible(self, world_pt: np.ndarray) -> bool:
         if self._eye is None or self._meshes is None:
             return True
+        # Prefer a GPU depth-buffer occlusion test if the viewport supplied one
+        # (O(1) vs the CPU ray/triangle sweep over every body).
+        occ = getattr(self, "_occlusion_fn", None)
+        if occ is not None:
+            res = occ(world_pt)
+            if res is not None:
+                return res
         return not _ray_hits_anything(self._eye, world_pt,
                                       self._meshes, self._workspace)
 
@@ -504,3 +586,4 @@ class HoverState:
         self._skb_a3 = np.zeros((0, 3), dtype=np.float32)
         self._skb_b3 = np.zeros((0, 3), dtype=np.float32)
         self._skb_seg_ent = np.zeros(0, dtype=np.intp)
+        self._sig = None
