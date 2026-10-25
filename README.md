@@ -12,9 +12,27 @@ It's more capable than the name suggests and rougher than a finished product.
   points from the keyboard rather than dragging, in the style of OMAX Layout.
   A SolveSpace constraint solver is available so sketches can be made parametric
   (coincidence, tangency, dimensions).
-- **Feature history.** Extrude, revolve, loft, boolean union/subtract/intersect,
-  fillet, chamfer, thicken/shell, offset datum planes. Editing an earlier
-  feature replays the tree.
+- **Feature history.** Extrude, cut, revolve, loft, boolean
+  union/subtract/intersect, fillet, chamfer, thicken/shell, offset datum
+  planes. Cuts that split a body produce separate bodies. Editing an earlier
+  feature replays the tree; sketches, faces and edges picked downstream follow
+  the geometry they came from, so moderate upstream edits don't break them.
+- **Named parameters.** Define document parameters (`width = 40mm`,
+  `wall = width/20`) and type expressions into any dimension or feature size.
+  Changing a parameter replays the whole model.
+- **Python scripting.** `cad.api` builds and edits models from a script and
+  writes a normal `.vc` you can open in the GUI:
+
+  ```python
+  from cad.api import Doc
+  doc = Doc.new()
+  doc.param("w", "40mm")
+  box = doc.extrude(doc.sketch("XY").rect("w", 20), "w/4")
+  doc.extrude(doc.sketch(box, ">Z").circle((0, 0), 6), 3, cut=True)
+  doc.save("box.vc")
+  ```
+
+  Run headless with `python -m cad.api script.py out.vc`.
 - **Solid modeling on OpenCASCADE**, the same geometry kernel used by FreeCAD.
 - **Image tracing.** Load a photo or line-art image and trace it into sketch
   geometry (lines and tangent arcs). Two front ends: silhouette/fill and
@@ -41,6 +59,8 @@ This is a one-person project still under development. Expect the following:
 - **Fillets and chamfers can fail or run slowly** on difficult edges (long
   splines, awkward geometry). Fillets run in a separate process with a timeout
   so a bad one cannot hang the application, but some edges will not round.
+  If an upstream edit removes an edge a fillet or chamfer used, the feature
+  reports it and you reselect.
 - **Image tracing requires a clean input.** It uses classical thresholding,
   contour/skeleton tracing, and curve fitting, with manual sliders — no machine
   learning. Photos with shadows, gradients, or busy backgrounds are difficult.
