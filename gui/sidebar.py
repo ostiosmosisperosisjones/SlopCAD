@@ -2,8 +2,9 @@
 gui/sidebar.py
 
 Sidebar — vertical splitter:
-  top    (30%): PartsPanel   — body list with visibility toggles
-  bottom (70%): HistoryPanel — flat op history with rollback bar
+  top    : PartsPanel   — body list with visibility toggles
+  middle : ParamsPanel  — document parameters
+  bottom : HistoryPanel — flat op history with rollback bar
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 
 from gui.parts_panel import PartsPanel
 from gui.history_panel import HistoryPanel
+from gui.params_panel import ParamsPanel
 from cad.workspace import Workspace
 from cad.history import History
 
@@ -29,13 +31,16 @@ class Sidebar(QSplitter):
         self.setStyleSheet("QSplitter::handle { background: #2a2a2a; }")
 
         self.parts_panel   = PartsPanel(workspace)
+        self.params_panel  = ParamsPanel(history)
         self.history_panel = HistoryPanel(workspace, history)
 
         self.addWidget(self.parts_panel)
+        self.addWidget(self.params_panel)
         self.addWidget(self.history_panel)
         self.setStretchFactor(0, 0)
-        self.setStretchFactor(1, 1)
-        self.setSizes([180, 420])
+        self.setStretchFactor(1, 0)
+        self.setStretchFactor(2, 1)
+        self.setSizes([180, 110, 420])
 
         # Wire parts → history (body selection dims other entries)
         self.parts_panel.body_selected.connect(
@@ -61,4 +66,5 @@ class Sidebar(QSplitter):
 
     def refresh(self):
         self.parts_panel.refresh()
+        self.params_panel.refresh()
         self.history_panel.refresh()

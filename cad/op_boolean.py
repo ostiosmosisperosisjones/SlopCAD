@@ -14,6 +14,7 @@ Subtract          : result replaces the target body (body_ids[0]); tool bodies
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
@@ -101,7 +102,7 @@ class BooleanOp(Op):
         if not bool_op.IsDone():
             raise RuntimeError(f"BooleanOp: {self.operation} failed")
 
-        return Compound(bool_op.Shape())
+        return as_compound(bool_op.Shape())
 
     # ------------------------------------------------------------------
     # Execute (replay)

@@ -98,6 +98,8 @@ class _EditDialog(QDialog):
         layout.setSpacing(10)
 
         self._spinboxes: dict[str, ExprSpinBox | QDoubleSpinBox] = {}
+        self._signs: dict[str, float] = {}   # sign to re-apply to bound fields
+        exprs = entry.params.get("exprs", {})
 
         signed_val_mm = float(entry.params.get("distance", 0))
         if entry.operation == "cut":
@@ -110,7 +112,12 @@ class _EditDialog(QDialog):
             if kind == "length":
                 spin = ExprSpinBox(decimals=decimals)
                 val_mm = signed_val_mm if key == "distance" else float(entry.params.get(key, 0))
-                spin.set_mm(val_mm)
+                if exprs.get(key):
+                    # Bindings are magnitudes; the sign stays the entry's.
+                    spin.set_binding(exprs[key], abs(val_mm))
+                else:
+                    spin.set_mm(val_mm)
+                self._signs[key] = -1.0 if val_mm < 0 else 1.0
             else:
                 spin = QDoubleSpinBox()
                 spin.setDecimals(decimals)
@@ -134,12 +141,20 @@ class _EditDialog(QDialog):
         layout.addRow(buttons)
 
     def _on_accept(self):
-        result = {}
+        result = {"_exprs": {}}
         for k, s in self._spinboxes.items():
             if isinstance(s, ExprSpinBox):
                 val = s.mm_value()
                 if val is None:
                     return   # invalid expression — don't accept
+                b = s.binding()
+                if b is not None:
+                    if val <= 0:
+                        s.setToolTip("A parameter expression must be positive "
+                                     "— the extrude/cut type sets the sign")
+                        return
+                    val *= self._signs.get(k, 1.0)
+                result["_exprs"][k] = b
                 result[k] = val
             else:
                 result[k] = s.value()
@@ -232,6 +247,8 @@ class _EntryWidget(QFrame):
             lbl_text = "✎ " + lbl_text
         elif entry.error:
             lbl_text = "⚠ " + lbl_text
+        elif entry.warning:
+            lbl_text = "△ " + lbl_text
         lbl = QLabel(lbl_text)
         lbl.setStyleSheet(prefs.scale_stylesheet(
             f"color: {text_color}; font-size: 12px; "
@@ -240,6 +257,8 @@ class _EntryWidget(QFrame):
                           QSizePolicy.Policy.Preferred)
         if entry.error and entry.error_msg:
             lbl.setToolTip(entry.error_msg)
+        elif entry.warning:
+            lbl.setToolTip(entry.warning)
         row.addWidget(lbl)
 
         if editable:
@@ -667,7 +686,14 @@ class HistoryPanel(QWidget):
         if dist == 0:
             return
 
-        self._history.update_entry_op(index, {}, new_distance=dist)
+        entry = self._history.entries[index]
+        exprs = dict(entry.params.get("exprs", {}))
+        for k, b in dlg.result_params.get("_exprs", {}).items():
+            if b:
+                exprs[k] = b
+            else:
+                exprs.pop(k, None)   # plain number typed: drop the binding
+        self._history.update_entry_op(index, {"exprs": exprs}, new_distance=dist)
         self.replay_requested.emit(index)
 
     def _on_sketch_vis_toggled(self, index: int):

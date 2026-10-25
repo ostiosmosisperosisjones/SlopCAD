@@ -93,7 +93,13 @@ class AsyncOpMixin:
                 _orig(body_id)
                 return
             _used[body_id] = True
-            if mesh is not None:
+            # The worker tessellated compute()'s raw result; it is only this
+            # body's mesh if finalize stored that same shape.  A split stores
+            # the parent trimmed to its own solid(s) — uploading the full mesh
+            # drew every piece as the parent and offered faces it doesn't have.
+            cur = self.workspace.current_shape(body_id)
+            if (mesh is not None and cur is not None and shape_after is not None
+                    and cur.wrapped.IsSame(shape_after.wrapped)):
                 _upload_mesh(self, body_id, mesh)
             else:
                 _orig(body_id)

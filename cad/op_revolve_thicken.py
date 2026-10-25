@@ -6,6 +6,7 @@ Revolve and thicken operation types:
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
@@ -142,6 +143,8 @@ class ThickenOp(Op):
         panel = getattr(vp, '_thicken_panel', None)
         if panel is not None:
             panel.set_thickness(self.thickness)
+            panel._spinbox.set_binding(entry.params.get("exprs", {}).get("thickness"),
+                                       abs(self.thickness))
             panel._emit_preview()
 
     def to_params(self) -> dict:
@@ -311,7 +314,7 @@ class FaceRevolveOp(Op):
             for solid in solids:
                 new_name = viewport.workspace.next_part_name()
                 new_body = viewport.workspace.add_body(
-                    new_name, Compound(solid.wrapped))
+                    new_name, as_compound(solid))
                 new_bodies.append(new_body)
             op_params["child_body_ids"] = [b.id for b in new_bodies]
             # Per-child geometric fingerprint, aligned with child_body_ids.
@@ -346,7 +349,8 @@ class FaceRevolveOp(Op):
         panel.set_axis(
             np.array(self.axis_point, dtype=float),
             np.array(self.axis_dir,   dtype=float))
-        panel._angle_spinbox.set_mm(self.angle_deg)
+        panel._angle_spinbox.set_binding(
+            entry.params.get("exprs", {}).get("angle_deg"), self.angle_deg)
         panel._emit_preview()
 
     def to_params(self) -> dict:
@@ -387,6 +391,88 @@ class FaceRevolveOp(Op):
 # SketchRevolveOp  —  revolve a sketch profile around an axis
 # ---------------------------------------------------------------------------
 
+def _sketch_frame(se):
+    import numpy as np
+    return (np.asarray(se.plane_origin, dtype=float),
+            np.asarray(se.plane_x_axis, dtype=float),
+            np.asarray(se.plane_y_axis, dtype=float))
+
+
+def _axis_line_ends(se, uid):
+    """UV ends of the straight line (or straight include) with this uid."""
+    import numpy as np
+    from cad.sketch import LineEntity
+    for ent in se.entities:
+        if getattr(ent, "uid", None) != uid:
+            continue
+        if isinstance(ent, LineEntity):
+            return np.asarray(ent.p0, dtype=float), np.asarray(ent.p1, dtype=float)
+        pts = getattr(ent, "points", None)
+        if pts is None or len(pts) < 2:
+            return None
+        pts = np.asarray(pts, dtype=float)
+        a, b = pts[0], pts[-1]
+        d = b - a
+        L = float(np.linalg.norm(d))
+        if L < 1e-9:
+            return None
+        off = np.abs((pts - a) @ np.array([-d[1], d[0]]) / L)
+        return (a, b) if float(off.max()) < 1e-6 * max(1.0, L) else None
+    return None
+
+
+def axis_in_sketch(se, axis_pt, axis_dir, line_uid=None):
+    """Sketch-relative form of a world axis, so it follows the sketch when an
+    upstream edit moves the sketch's face (a world axis stays behind, as the
+    extrude direction once did).  Returns (axis_local, axis_line_uid):
+    axis_local = [u, v, du, dv] when the axis lies in the sketch plane;
+    axis_line_uid kept when it names a straight line of this sketch."""
+    import numpy as np
+    if se is None or axis_pt is None or axis_dir is None:
+        return None, None
+    o, x, y = _sketch_frame(se)
+    n = np.cross(x, y)
+    p = np.asarray(axis_pt, dtype=float)
+    d = np.asarray(axis_dir, dtype=float)
+    d = d / np.linalg.norm(d)
+    if line_uid is not None and _axis_line_ends(se, line_uid) is None:
+        line_uid = None
+    r = p - o
+    if abs(float(d @ n)) > 1e-6 or abs(float(r @ n)) > 1e-6 * max(1.0, float(np.linalg.norm(r))):
+        return None, line_uid
+    return [float(r @ x), float(r @ y), float(d @ x), float(d @ y)], line_uid
+
+
+def sketch_axis(se, axis_point, axis_dir, axis_local=None, axis_line_uid=None):
+    """The world axis now: from the named sketch line, else the sketch-plane
+    coordinates, else the stored world axis (older files, off-plane axes)."""
+    import numpy as np
+    if se is not None and (axis_line_uid or axis_local):
+        o, x, y = _sketch_frame(se)
+        ends = _axis_line_ends(se, axis_line_uid) if axis_line_uid else None
+        if ends is not None:
+            a, b = ends
+            pt = o + a[0] * x + a[1] * y
+            d = (b[0] - a[0]) * x + (b[1] - a[1]) * y
+            if axis_local:
+                ref = axis_local[2] * x + axis_local[3] * y
+                if float(d @ ref) < 0:     # keep the authored rotation sense
+                    d = -d
+            return pt, d / np.linalg.norm(d)
+        if axis_local:
+            u, v, du, dv = axis_local
+            d = du * x + dv * y
+            return o + u * x + v * y, d / np.linalg.norm(d)
+    return (np.array(axis_point, dtype=float), np.array(axis_dir, dtype=float))
+
+
+def _axis_fields(viewport, sketch_id, se, axis_pt, axis_dir):
+    """Commit-time axis_local / axis_line_uid; the line uid comes from the
+    viewport's last axis pick when that was a line of this same sketch."""
+    ref = getattr(viewport, "_revolve_axis_ref", None)
+    uid = ref[1] if ref and ref[0] == sketch_id else None
+    return axis_in_sketch(se, axis_pt, axis_dir, uid)
+
 def _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle_deg):
     """Revolve each face and fuse the results into one tool solid (build123d
     Compound). Shared by commit and replay so the two can't drift."""
@@ -407,7 +493,7 @@ def _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle_deg):
             fu.SetArguments(lst_a); fu.SetTools(lst_b)
             fu.SetRunParallel(True); fu.Build()
             if fu.IsDone():
-                tool = Compound(fu.Shape())
+                tool = as_compound(fu.Shape())
     return tool
 
 
@@ -425,7 +511,7 @@ def _fuse_tool_into_target(tool, target_occ):
     fu.SetRunParallel(True); fu.Build()
     if not fu.IsDone():
         raise RuntimeError("Revolve fuse failed.")
-    return Compound(fu.Shape())
+    return as_compound(fu.Shape())
 
 
 @dataclass
@@ -448,7 +534,10 @@ class SketchRevolveOp(Op):
     merge_body_id  : str | None       = None
     face_indices   : list[int] | None = None
     face_centroids : list[list[float]] | None = None
+    face_boundaries: list[list[str]] | None = None
     force_new_body : bool = True   # revolves always produce a standalone solid
+    axis_local     : list[float] | None = None   # [u, v, du, dv] in the sketch plane
+    axis_line_uid  : str | None = None           # sketch line the axis follows
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         import numpy as np
@@ -488,11 +577,15 @@ class SketchRevolveOp(Op):
             raise RuntimeError("SketchRevolveOp: sketch has no closed loops")
 
         if self.face_centroids:
-            from cad.op_base import _match_face_by_centroid
-            centroids = np.array(self.face_centroids, dtype=float)
-            faces = [_match_face_by_centroid(t, all_faces, all_regions,
-                                             "SketchRevolveOp")
-                     for t in centroids]
+            from cad.op_base import _match_sketch_faces
+            from cad.op_base import _lost_region_warning
+            lost = []
+            faces, matched = _match_sketch_faces(
+                se, all_faces, all_regions, self.face_centroids,
+                self.face_boundaries, "SketchRevolveOp", lost)
+            _lost_region_warning(history, entry_index, lost)
+            if not self.face_boundaries:
+                self.face_boundaries = matched   # backfill (see History.replay_from)
         elif self.face_indices is not None:
             faces = [all_faces[i] for i in self.face_indices if i < len(all_faces)]
             if not faces:
@@ -500,8 +593,8 @@ class SketchRevolveOp(Op):
         else:
             faces = all_faces
 
-        axis_pt  = np.array(self.axis_point, dtype=float)
-        axis_dir = np.array(self.axis_dir,   dtype=float)
+        axis_pt, axis_dir = sketch_axis(se, self.axis_point, self.axis_dir,
+                                        self.axis_local, self.axis_line_uid)
 
         # Merge-into-target case: the entry is tagged to merge_body_id, so the
         # `shape` passed in by replay IS that target body's current shape. We
@@ -609,21 +702,31 @@ class SketchRevolveOp(Op):
             arr = np.array(outer_uvs)
             return arr.mean(axis=0).tolist()
         face_centroids = [_uv_centroid(all_faces[i][1]) for i in face_indices]
+        _bounds = se.build_face_boundaries()
+        face_boundaries = [sorted(_bounds[i]) for i in face_indices
+                           if i < len(_bounds)]
 
         body_id      = se.body_id
         shape_before = viewport.workspace.current_shape(body_id)
         axis_pt      = np.array(self.axis_point, dtype=float)
         axis_dir     = np.array(self.axis_dir,   dtype=float)
         angle_deg    = self.angle_deg
+        self.axis_local, self.axis_line_uid = _axis_fields(
+            viewport, self.from_sketch_id, se, axis_pt, axis_dir)
 
         op_params = {
             "angle_deg":      angle_deg,
             "from_sketch_id": self.from_sketch_id,
             "face_indices":   face_indices,
             "face_centroids": face_centroids,
+            "face_boundaries": face_boundaries,
             "axis_point":     self.axis_point,
             "axis_dir":       self.axis_dir,
         }
+        if self.axis_local is not None:
+            op_params["axis_local"] = self.axis_local
+        if self.axis_line_uid is not None:
+            op_params["axis_line_uid"] = self.axis_line_uid
         if extra_params:
             op_params.update(extra_params)
 
@@ -673,7 +776,7 @@ class SketchRevolveOp(Op):
                 new_bodies = []
                 for solid in solids:
                     new_name = viewport.workspace.next_part_name()
-                    new_body = viewport.workspace.add_body(new_name, Compound(solid.wrapped))
+                    new_body = viewport.workspace.add_body(new_name, as_compound(solid))
                     new_bodies.append(new_body)
                     op_params["child_body_ids"].append(new_body.id)
                 primary_body = new_bodies[0] if new_bodies else None
@@ -715,10 +818,14 @@ class SketchRevolveOp(Op):
         if panel is None:
             return
 
-        panel.set_axis(
-            np.array(self.axis_point, dtype=float),
-            np.array(self.axis_dir,   dtype=float))
-        panel._angle_spinbox.set_mm(abs(self.angle_deg))
+        se = (vp.history.entries[sketch_idx].params.get("sketch_entry")
+              if sketch_idx is not None else None)
+        if self.axis_line_uid:
+            vp._revolve_axis_ref = (self.from_sketch_id, self.axis_line_uid)
+        panel.set_axis(*sketch_axis(se, self.axis_point, self.axis_dir,
+                                    self.axis_local, self.axis_line_uid))
+        panel._angle_spinbox.set_binding(
+            entry.params.get("exprs", {}).get("angle_deg"), abs(self.angle_deg))
 
         if self.merge_body_id and self.merge_body_id in vp.workspace.bodies:
             panel.set_merge_body(
@@ -742,6 +849,12 @@ class SketchRevolveOp(Op):
             p["face_indices"] = self.face_indices
         if self.face_centroids is not None:
             p["face_centroids"] = self.face_centroids
+        if self.face_boundaries is not None:
+            p["face_boundaries"] = self.face_boundaries
+        if self.axis_local is not None:
+            p["axis_local"] = self.axis_local
+        if self.axis_line_uid is not None:
+            p["axis_line_uid"] = self.axis_line_uid
         return p
 
     @classmethod
@@ -754,6 +867,9 @@ class SketchRevolveOp(Op):
             merge_body_id  = params.get("merge_body_id"),
             face_indices   = params.get("face_indices"),
             face_centroids = params.get("face_centroids"),
+            face_boundaries = params.get("face_boundaries"),
+            axis_local     = params.get("axis_local"),
+            axis_line_uid  = params.get("axis_line_uid"),
         )
 
 
@@ -787,6 +903,9 @@ class CrossBodyRevolveCutOp(Op):
     axis_dir         : list[float] | None = None
     face_indices     : list[int]   | None = None
     face_centroids   : list[list[float]] | None = None
+    face_boundaries  : list[list[str]] | None = None
+    axis_local       : list[float] | None = None   # see SketchRevolveOp
+    axis_line_uid    : str | None = None
 
     # Used by Op._push_failed_entry to tag the failed history entry correctly
     # (the base class's fallback otherwise produces "crossbodyrevolvecut").
@@ -831,11 +950,14 @@ class CrossBodyRevolveCutOp(Op):
             raise RuntimeError("CrossBodyRevolveCutOp: sketch has no closed loops")
 
         if self.face_centroids:
-            from cad.op_base import _match_face_by_centroid
-            centroids = np.array(self.face_centroids, dtype=float)
-            faces = [_match_face_by_centroid(t, all_faces, all_regions,
-                                             "CrossBodyRevolveCutOp")
-                     for t in centroids]
+            from cad.op_base import _match_sketch_faces, _lost_region_warning
+            lost = []
+            faces, matched = _match_sketch_faces(
+                se, all_faces, all_regions, self.face_centroids,
+                self.face_boundaries, "CrossBodyRevolveCutOp", lost)
+            _lost_region_warning(history, entry_index, lost)
+            if not self.face_boundaries:
+                self.face_boundaries = matched   # backfill (see History.replay_from)
         elif self.face_indices is not None:
             faces = [all_faces[i] for i in self.face_indices if i < len(all_faces)]
             if not faces:
@@ -843,8 +965,8 @@ class CrossBodyRevolveCutOp(Op):
         else:
             faces = all_faces
 
-        axis_pt  = np.array(self.axis_point, dtype=float)
-        axis_dir = np.array(self.axis_dir,   dtype=float)
+        axis_pt, axis_dir = sketch_axis(se, self.axis_point, self.axis_dir,
+                                        self.axis_local, self.axis_line_uid)
 
         tool = None
         for face in faces:
@@ -858,7 +980,7 @@ class CrossBodyRevolveCutOp(Op):
                 fu.SetArguments(lst_a); fu.SetTools(lst_b)
                 fu.SetRunParallel(True); fu.Build()
                 if fu.IsDone():
-                    tool = Compound(fu.Shape())
+                    tool = as_compound(fu.Shape())
 
         lst_a = TopTools_ListOfShape(); lst_a.Append(shape.wrapped)
         lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
@@ -867,7 +989,7 @@ class CrossBodyRevolveCutOp(Op):
         op.SetRunParallel(True); op.Build()
         if not op.IsDone():
             raise RuntimeError("CrossBodyRevolveCutOp: boolean cut failed")
-        return Compound(op.Shape())
+        return as_compound(op.Shape())
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
@@ -927,6 +1049,9 @@ class CrossBodyRevolveCutOp(Op):
             arr = np.array(outer_uvs)
             return arr.mean(axis=0).tolist()
         face_centroids = [_uv_centroid(all_sketch[i][1]) for i in face_indices]
+        _bounds = se.build_face_boundaries()
+        face_boundaries = [sorted(_bounds[i]) for i in face_indices
+                           if i < len(_bounds)]
 
         target_shape = viewport.workspace.current_shape(self.cut_body_id)
         if target_shape is None:
@@ -937,10 +1062,13 @@ class CrossBodyRevolveCutOp(Op):
         axis_pt  = np.array(self.axis_point, dtype=float)
         axis_dir = np.array(self.axis_dir,   dtype=float)
         angle    = self.angle_deg
+        self.axis_local, self.axis_line_uid = _axis_fields(
+            viewport, self.source_sketch_id, se, axis_pt, axis_dir)
 
         op_params = self.to_params()
         op_params["face_indices"]   = face_indices
         op_params["face_centroids"] = face_centroids
+        op_params["face_boundaries"] = face_boundaries
         if extra_params:
             op_params.update(extra_params)
 
@@ -957,7 +1085,7 @@ class CrossBodyRevolveCutOp(Op):
                     fu.SetArguments(lst_a); fu.SetTools(lst_b)
                     fu.SetRunParallel(True); fu.Build()
                     if fu.IsDone():
-                        tool = Compound(fu.Shape())
+                        tool = as_compound(fu.Shape())
             lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
             lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
             op = BRepAlgoAPI_Cut()
@@ -965,7 +1093,7 @@ class CrossBodyRevolveCutOp(Op):
             op.SetRunParallel(True); op.Build()
             if not op.IsDone():
                 raise RuntimeError("Revolve cut failed.")
-            return Compound(op.Shape())
+            return as_compound(op.Shape())
 
         def finalize(result):
             _push_result(viewport, "revolve_cut", op_params, self.cut_body_id,
@@ -1000,10 +1128,14 @@ class CrossBodyRevolveCutOp(Op):
             return
 
         if self.axis_point is not None and self.axis_dir is not None:
-            panel.set_axis(
-                np.array(self.axis_point, dtype=float),
-                np.array(self.axis_dir,   dtype=float))
-        panel._angle_spinbox.set_mm(abs(self.angle_deg))
+            se = (vp.history.entries[sketch_idx].params.get("sketch_entry")
+                  if sketch_idx is not None else None)
+            if self.axis_line_uid:
+                vp._revolve_axis_ref = (self.source_sketch_id, self.axis_line_uid)
+            panel.set_axis(*sketch_axis(se, self.axis_point, self.axis_dir,
+                                        self.axis_local, self.axis_line_uid))
+        panel._angle_spinbox.set_binding(
+            entry.params.get("exprs", {}).get("angle_deg"), abs(self.angle_deg))
 
         panel._radio_cut.setChecked(True)
         panel._on_mode_changed(1)
@@ -1030,6 +1162,12 @@ class CrossBodyRevolveCutOp(Op):
             p["face_indices"] = self.face_indices
         if self.face_centroids is not None:
             p["face_centroids"] = self.face_centroids
+        if self.face_boundaries is not None:
+            p["face_boundaries"] = self.face_boundaries
+        if self.axis_local is not None:
+            p["axis_local"] = self.axis_local
+        if self.axis_line_uid is not None:
+            p["axis_line_uid"] = self.axis_line_uid
         return p
 
     @classmethod
@@ -1043,4 +1181,7 @@ class CrossBodyRevolveCutOp(Op):
             axis_dir         = params.get("axis_dir"),
             face_indices     = params.get("face_indices"),
             face_centroids   = params.get("face_centroids"),
+            face_boundaries  = params.get("face_boundaries"),
+            axis_local       = params.get("axis_local"),
+            axis_line_uid    = params.get("axis_line_uid"),
         )

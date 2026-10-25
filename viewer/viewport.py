@@ -165,9 +165,6 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._chamfer_face_indices     = []
         self._chamfer_edge_indices     = []
         self._chamfer_preview_mesh     = None
-        self._chamfer_preview_token    = None
-        self._chamfer_computing        = False
-        self._chamfer_pending          = None
         self._chamfer_pick_face        = False
         self._chamfer_pick_edge        = False
         self._editing_chamfer_idx      = None
@@ -211,9 +208,6 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._thicken_cage_wires          = None
         self._thicken_cage_key            = None
         self._thicken_last_preview_params = None
-        self._thicken_mesh_gen            = 0
-        self._thicken_mesh_inflight       = False
-        self._thicken_mesh_pending        = None
         self._editing_thicken_idx         = None
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -537,7 +531,6 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         # World planes drawn after opaque geometry so they never occlude it
         if any(self.workspace.world_plane_visible.values()):
             from viewer.renderer import draw_world_planes
-            import numpy as np
             if visible:
                 all_mins = np.vstack([m.bbox_min for m in visible.values()])
                 all_maxs = np.vstack([m.bbox_max for m in visible.values()])
@@ -1118,7 +1111,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._drag_arrow_active = True
         self._drag_arrow_op     = 'thicken'
         # Invalidate any inflight mesh compute so stale results don't land during drag.
-        self._thicken_mesh_gen = getattr(self, '_thicken_mesh_gen', 0) + 1
+        self._thicken_job().cancel()
         self._thicken_preview_mesh = None
         return True
 
@@ -1806,37 +1799,39 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             return  # geometric labels are not editable via click
         if self._sketch is None:
             return  # sketch exited before mouse-release arrived
-        from PyQt6.QtWidgets import QInputDialog
+        from gui.value_dialog import ask_value
         from cad.sketch import SketchConstraint
-        from cad.prefs import prefs
-        from cad.units import from_mm, to_mm
-        unit = prefs.default_unit
 
         ci = lbl['constraint_idx']
         ei = lbl['entity_idx']
         is_diameter = lbl.get('is_diameter', False)
         con_type    = 'diameter' if is_diameter else 'distance'
         edit_title  = "Edit Diameter" if is_diameter else "Edit Length"
-        edit_label  = f"Diameter ({unit}):" if is_diameter else f"Length ({unit}):"
+        edit_label  = "Diameter:" if is_diameter else "Length:"
 
-        def _ask(current_mm):
-            return QInputDialog.getDouble(
-                self, edit_title, edit_label,
-                from_mm(current_mm, unit), 0.0, 1_000_000, prefs.display_decimals)
-
-        def _make_con(old_con, new_val_mm):
-            return SketchConstraint(con_type, (ei,), new_val_mm,
-                                    label_offset=old_con.label_offset,
-                                    label_angle=getattr(old_con, 'label_angle', None))
+        def _ask(con):
+            """(ok, new constraint) — keeps label placement, swaps value/expr."""
+            answer = ask_value(self, edit_title, edit_label, con.value,
+                               getattr(con, 'expr', None),
+                               getattr(con, 'expr_unit', None))
+            if answer is None:
+                return False, None
+            val, binding = answer
+            return True, SketchConstraint(
+                con_type, (ei,), val,
+                label_offset=con.label_offset,
+                label_angle=getattr(con, 'label_angle', None),
+                expr=binding["expr"] if binding else None,
+                expr_unit=binding["unit"] if binding else "mm")
 
         # Active sketch.
         if self._sketch is not None and ci < len(self._sketch.constraints):
             con = self._sketch.constraints[ci]
             if con.type == con_type and con.indices[0] == ei:
-                val_disp, ok = _ask(con.value)
+                ok, new_con = _ask(con)
                 if ok:
                     self._sketch.push_undo_snapshot()
-                    self._sketch.constraints[ci] = _make_con(con, to_mm(val_disp, unit))
+                    self._sketch.constraints[ci] = new_con
                     from cad.sketch import SketchEntry, LineEntity, ArcEntity
                     tmp = SketchEntry.from_sketch_mode(self._sketch)
                     if tmp.apply_last_constraint():
@@ -1864,9 +1859,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             con = se.constraints[ci]
             if con.type != con_type or con.indices[0] != ei:
                 continue
-            val_disp, ok = _ask(con.value)
+            ok, new_con = _ask(con)
             if ok:
-                se.constraints[ci] = _make_con(con, to_mm(val_disp, unit))
+                se.constraints[ci] = new_con
                 se.apply_last_constraint()
                 self._rebuild_sketch_faces()
                 self.history_changed.emit()

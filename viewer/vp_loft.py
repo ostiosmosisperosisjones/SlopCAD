@@ -10,6 +10,7 @@ history_changed signal.
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 
 
 class LoftMixin:
@@ -387,7 +388,7 @@ class LoftMixin:
         try:
             faces = probe_op._resolve_profile_faces(
                 self.history, self.history.cursor + 1)
-            tool_solid = Compound(probe_op._build_loft(faces).wrapped)
+            tool_solid = as_compound(probe_op._build_loft(faces))
         except Exception as ex:
             print(f"[Loft cut] Tool construction failed: {ex}")
             return

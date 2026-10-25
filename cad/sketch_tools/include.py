@@ -59,6 +59,28 @@ def _collapse_if_degenerate(uv_pts: list, tol: float = 1e-3) -> list:
     return [uv_pts[i_min], uv_pts[i_max]]
 
 
+def project_body_edge(world_pts, occ_edge, project, normal,
+                      collapse: bool = True) -> tuple:
+    """(uv points, occ_edges) for an included body edge.  The Include tool
+    and replay both go through here, so a re-projected include keeps the
+    shape it was included with: straight edges collapse to their two ends
+    (replay passes collapse=False for includes saved uncollapsed — their
+    point count decides the sketch's regions), and the occ edge is dropped
+    for an edge-on circle.
+    With an occ edge the points are sampled from it exactly — float32 mesh
+    points sit ~1e-7 off and drawn geometry snapped to them would no
+    longer meet the include after replay."""
+    if occ_edge is not None:
+        from cad.edge_ref import sample_occ_edge
+        world_pts = sample_occ_edge(occ_edge)
+    uv_pts = [project(np.asarray(p, dtype=np.float64)) for p in world_pts]
+    if collapse:
+        uv_pts = _collapse_if_degenerate(uv_pts)
+    if occ_edge is not None and _is_circle_edge_on(occ_edge, normal):
+        occ_edge = None
+    return uv_pts, ([occ_edge] if occ_edge is not None else None)
+
+
 class IncludeTool:
 
     @staticmethod
@@ -93,31 +115,34 @@ class IncludeTool:
             if mesh is None or es.edge_idx >= len(mesh.topo_edges):
                 continue
 
-            world_pts = mesh.topo_edges[es.edge_idx]          # (N,3) float32
-            uv_pts    = [sketch.plane.project_point(p) for p in world_pts]
-            uv_pts    = _collapse_if_degenerate(uv_pts)
-            if len(uv_pts) < 2:
-                continue
-
             occ_edge = None
             source   = None
             if es.edge_idx < len(mesh.topo_edges_occ):
                 occ_edge = mesh.topo_edges_occ[es.edge_idx]
                 edge_ref = EdgeRef.from_occ_edge(occ_edge)
                 if edge_ref is not None:
-                    source = BodyEdgeSource(es.body_id, edge_ref)
+                    origin = None
+                    if history is not None:
+                        from cad.face_origin import edge_origin
+                        try:
+                            origin = edge_origin(
+                                history, es.body_id, mesh.shape.wrapped, occ_edge,
+                                history.cursor + 1)
+                        except Exception as ex:
+                            print(f"[Include] edge provenance skipped: {ex}")
+                    source = BodyEdgeSource(es.body_id, edge_ref, origin)
 
-            # A circle viewed edge-on projects to a line — drop occ_edges so
-            # snap and face-building use the collapsed 2-point polyline instead
-            # of treating it as a circle.
-            if occ_edge is not None and _is_circle_edge_on(occ_edge, sketch.plane.normal):
-                occ_edge = None
+            uv_pts, occ_edges = project_body_edge(
+                mesh.topo_edges[es.edge_idx], occ_edge,
+                sketch.plane.project_point, sketch.plane.normal)
+            if len(uv_pts) < 2:
+                continue
 
             sketch.entities.append(
                 ReferenceEntity(
                     uv_pts,
                     source_type = 'edge',
-                    occ_edges   = [occ_edge] if occ_edge is not None else None,
+                    occ_edges   = occ_edges,
                     source      = source,
                 )
             )

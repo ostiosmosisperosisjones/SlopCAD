@@ -235,10 +235,10 @@ class OffsetPlaneMixin:
             faces = list(shape.faces())
             if face_idx >= len(faces):
                 return None
-            face_ref = FaceRef.from_b3d_face(faces[face_idx])
-            if face_ref is None:
+            parent = FacePlaneSource.for_face(
+                self.history, body_id, faces[face_idx], self.history.cursor + 1)
+            if parent is None:
                 return None
-            parent = FacePlaneSource(body_id, face_ref)
             return OffsetPlaneSource(parent, dist)
         return None
 

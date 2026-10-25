@@ -14,8 +14,10 @@ fillet_preview(shape, face_indices, edge_occs, radius)
     Same but used for live preview — identical result, separate name for clarity.
 """
 
+from cad.solid_ref import as_compound
 from build123d import Compound
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.ChFi3d import ChFi3d_FilletShape
 
 
@@ -25,23 +27,40 @@ def _collect_edges(shape, face_indices, edge_occs):
       - all edges belonging to each face in face_indices
       - the directly supplied edge_occs list
     """
-    seen = set()
     unique = []
 
     def _add(e_occ):
-        eid = id(e_occ)
-        if eid not in seen:
-            seen.add(eid)
+        # By topology: each .edges() call makes new wrappers, so ids differ
+        # for an edge shared by two picked faces.
+        if not any(e_occ.IsSame(u) for u in unique):
             unique.append(e_occ)
+
+    from cad.operations.chamfer import _build_edge_to_faces_map, smooth_edges
+    edge_face_map = _build_edge_to_faces_map(
+        shape.wrapped if hasattr(shape, 'wrapped') else shape)
+
+    explicit = list(edge_occs or [])
+    smooth = smooth_edges(explicit, edge_face_map)
+    if smooth:
+        raise RuntimeError(
+            f"Fillet: selected edge{'s' if len(smooth) > 1 else ''} "
+            f"{', '.join(str(i + 1) for i in smooth)} "
+            f"{'are' if len(smooth) > 1 else 'is'} smooth (the faces meet "
+            f"tangentially) — there is no corner to round")
 
     all_faces = list(shape.faces())
     for fi in face_indices:
         if fi >= len(all_faces):
             raise RuntimeError(f"Fillet: face_idx {fi} out of range")
-        for edge in all_faces[fi].edges():
-            _add(edge.wrapped)
+        face_edges = [edge.wrapped for edge in all_faces[fi].edges()]
+        # A picked face means its corners: skip boundaries it already
+        # blends into (e.g. where an earlier fillet meets it).
+        skip = set(smooth_edges(face_edges, edge_face_map))
+        for k, e_occ in enumerate(face_edges):
+            if k not in skip:
+                _add(e_occ)
 
-    for e_occ in (edge_occs or []):
+    for e_occ in explicit:
         _add(e_occ)
 
     return unique
@@ -102,8 +121,13 @@ def _run_fillet(source_occ, unique_edges, radius):
             raise RuntimeError(f"Fillet: build failed — {ex}")
     if not nf.IsDone():
         raise RuntimeError(f"Fillet failed — {_fillet_failure_reason(nf)}")
+    # IsDone() isn't proof: the kernel can hand back an invalid solid, and
+    # tessellating one can spin forever (walker seed 14).
+    if not BRepCheck_Analyzer(nf.Shape()).IsValid():
+        raise RuntimeError("Fillet failed — the kernel produced an invalid "
+                           "solid; try a smaller radius")
 
-    return Compound(nf.Shape())
+    return as_compound(nf.Shape())
 
 
 def _fillet_failure_reason(nf) -> str:

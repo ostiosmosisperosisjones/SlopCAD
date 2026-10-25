@@ -52,14 +52,20 @@ class ChamferOp(Op):
                 out.append(mesh.topo_edges_occ[ei])
         return out
 
-    def _resolve_edge_refs(self, shape) -> list:
-        """Re-find edges via EdgeRef geometry fingerprints (replay-safe)."""
+    def _resolve_edge_refs(self, shape, history=None) -> list:
+        """Re-find edges via EdgeRef provenance/fingerprints (replay-safe)."""
         if not self.edge_refs:
             return []
         out = []
         for ref in self.edge_refs:
-            _, occ, _ = ref.find_in(shape)
+            occ = ref.resolve(history, shape)
             if occ is None:
+                if history is not None and ref.origin is not None \
+                        and ref.origin.faces_apart(history, shape):
+                    raise RuntimeError(
+                        "ChamferOp: a selected edge no longer exists — an upstream "
+                        "change removed it (e.g. an earlier fillet now runs over "
+                        "it); edit the chamfer and reselect")
                 raise RuntimeError(
                     f"ChamferOp: could not relocate edge "
                     f"(midpoint={ref.midpoint}, length={ref.length:.3f})")
@@ -68,18 +74,19 @@ class ChamferOp(Op):
 
     def _collect_face_edges(self, shape) -> list:
         """Return raw TopoDS_Edge objects from every face in face_indices."""
+        from cad.operations.chamfer import _build_edge_to_faces_map, smooth_edges
+        edge_face_map = _build_edge_to_faces_map(shape.wrapped)
         out = []
-        seen = set()
         all_faces = list(shape.faces())
         for fi in self.face_indices:
             if fi >= len(all_faces):
                 raise RuntimeError(f"Chamfer: face_idx {fi} out of range")
-            for edge in all_faces[fi].edges():
-                eid = id(edge.wrapped)
-                if eid not in seen:
-                    seen.add(eid)
-                    out.append(edge.wrapped)
-        return out
+            face_edges = [edge.wrapped for edge in all_faces[fi].edges()]
+            # A picked face means its corners, not boundaries it already
+            # blends into (e.g. where an earlier fillet meets it).
+            skip = set(smooth_edges(face_edges, edge_face_map))
+            out += [e for k, e in enumerate(face_edges) if k not in skip]
+        return _unique_edges(out)
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         from cad.operations.chamfer import chamfer_edges
@@ -91,13 +98,8 @@ class ChamferOp(Op):
             shape = src
         # Combine face-derived edges with EdgeRef-resolved edges (dedup by id).
         face_edges = self._collect_face_edges(shape)
-        ref_edges  = self._resolve_edge_refs(shape)
-        seen = set(); edges = []
-        for e in face_edges + ref_edges:
-            if id(e) in seen:
-                continue
-            seen.add(id(e))
-            edges.append(e)
+        ref_edges  = self._resolve_edge_refs(shape, history)
+        edges = _unique_edges(face_edges + ref_edges)
         if not edges:
             raise RuntimeError("ChamferOp: no edges to chamfer on replay "
                                 "(face_indices and edge_refs both empty)")
@@ -128,23 +130,20 @@ class ChamferOp(Op):
         if shape_before is None:
             raise RuntimeError(f"[Chamfer] No shape for body {self.source_body_id}")
 
-        # Combine face_indices and direct edge picks (dedup by id).
+        # Combine face_indices and direct edge picks.
         face_edges = self._collect_face_edges(shape_before)
         direct_edges = self._resolve_edge_occs(viewport)
-        seen = set(); edges = []
-        for e in face_edges + direct_edges:
-            if id(e) in seen:
-                continue
-            seen.add(id(e))
-            edges.append(e)
+        edges = _unique_edges(face_edges + direct_edges)
 
         # Capture replay-stable fingerprints for the directly-picked edges,
         # including adjacent-face signatures for topology-aware fallback so
         # downstream replay survives upstream edits (e.g. draft applied to
         # extrude) that move the edge geometrically.
         parent_occ = shape_before.wrapped
+        hist = viewport.history
         self.edge_refs = [
-            r for r in (EdgeRef.from_occ_edge(e, parent_shape=parent_occ)
+            r for r in (EdgeRef.for_edge(hist, self.source_body_id, e, parent_occ,
+                                         hist.cursor + 1)
                         for e in direct_edges)
             if r is not None
         ]
@@ -181,25 +180,13 @@ class ChamferOp(Op):
         if self.flip_reference_face:
             p["flip_reference_face"] = True
         if self.edge_refs:
-            p["edge_refs"] = [
-                {"midpoint":  list(r.midpoint),
-                 "length":    r.length,
-                 "tangent":   list(r.tangent),
-                 "face_sigs": list(r.face_sigs)}
-                for r in self.edge_refs
-            ]
+            p["edge_refs"] = [r.to_dict() for r in self.edge_refs]
         return p
 
     @classmethod
     def _from_params(cls, params: dict) -> "ChamferOp":
         from cad.edge_ref import EdgeRef
-        edge_refs = [
-            EdgeRef(midpoint=tuple(r["midpoint"]),
-                    length=float(r["length"]),
-                    tangent=tuple(r["tangent"]),
-                    face_sigs=list(r.get("face_sigs", [])))
-            for r in params.get("edge_refs", [])
-        ]
+        edge_refs = [EdgeRef.from_dict(r) for r in params.get("edge_refs", [])]
         return cls(
             source_body_id      = params.get("source_body_id", ""),
             face_indices        = list(params.get("face_indices", [])),
@@ -209,3 +196,13 @@ class ChamferOp(Op):
             flip_reference_face = bool(params.get("flip_reference_face", False)),
             edge_refs           = edge_refs,
         )
+
+
+def _unique_edges(edges: list) -> list:
+    """Drop repeats by topology (IsSame), not Python id: every .edges() call
+    makes new wrappers, so an edge shared by two picked faces has two ids."""
+    out = []
+    for e in edges:
+        if not any(e.IsSame(o) for o in out):
+            out.append(e)
+    return out

@@ -2,6 +2,7 @@
 cad/operations/revolve.py
 """
 
+from cad.solid_ref import as_compound
 import numpy as np
 from build123d import revolve, Plane, Face, Compound, Axis, Vector, Location
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
@@ -30,7 +31,7 @@ def revolve_face_direct(body_shape, face: Face, axis_point: np.ndarray,
     revolved = _do_revolve_solid(face, axis_point, axis_dir, angle_deg)
 
     if body_shape is None:
-        return Compound(revolved.wrapped)
+        return as_compound(revolved)
 
     return _do_revolve_boolean(body_shape, revolved, angle_deg)
 
@@ -56,7 +57,7 @@ def _do_revolve_boolean(shape, revolved_solid, angle_deg: float):
         op.Build()
         if not op.IsDone():
             raise RuntimeError("Boolean fuse (revolve) failed")
-        return Compound(op.Shape())
+        return as_compound(op.Shape())
     else:
         op = BRepAlgoAPI_Cut()
         op.SetArguments(_to_list(shape.wrapped))
@@ -65,7 +66,7 @@ def _do_revolve_boolean(shape, revolved_solid, angle_deg: float):
         op.Build()
         if not op.IsDone():
             raise RuntimeError("Boolean cut (revolve) failed")
-        result = Compound(op.Shape())
+        result = as_compound(op.Shape())
         if not list(result.solids()):
             raise RuntimeError("Revolve cut produced empty result")
         return result

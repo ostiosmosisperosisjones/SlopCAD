@@ -46,9 +46,30 @@ class FacePlaneSource(SketchPlaneSource):
     it is resolved so it follows the face as upstream operations change.
     """
 
-    def __init__(self, body_id: str, face_ref):
+    def __init__(self, body_id: str, face_ref, origin=None):
         self.body_id  = body_id
         self.face_ref = face_ref          # cad.face_ref.FaceRef
+        self.origin   = origin            # cad.face_origin.FaceOrigin | ChamferFaceOrigin | None
+
+    @classmethod
+    def for_face(cls, history, body_id: str, face, before_index: int):
+        """Source for a build123d Face of body_id as of before_index, with
+        provenance when an extruded sketch line made the face.  None if the
+        face isn't planar."""
+        from cad.face_ref import FaceRef
+        face_ref = FaceRef.from_b3d_face(face)
+        if face_ref is None:
+            return None
+        origin = None
+        if history is not None:
+            from cad.face_origin import origin_for_face, chamfer_origin_for_face
+            try:
+                origin = (origin_for_face(history, body_id, face.wrapped, before_index)
+                          or chamfer_origin_for_face(history, body_id, face.wrapped,
+                                                     before_index))
+            except Exception as ex:
+                print(f"[Sketch] face provenance skipped: {ex}")
+        return cls(body_id, face_ref, origin)
 
     def resolve(self, history, before_index: int):
         from build123d import Plane
@@ -57,7 +78,15 @@ class FacePlaneSource(SketchPlaneSource):
             raise RuntimeError(
                 f"FacePlaneSource: no shape for body '{self.body_id}' "
                 f"before history index {before_index}")
-        face_idx, face = self.face_ref.find_in(shape)
+        face = None
+        if self.origin is not None:
+            # Provenance first: follows a wall that rotated or resized,
+            # which the geometric FaceRef can't.
+            _, face = self.origin.find_in(history, shape)
+        if face is None:
+            face_idx, face = self.face_ref.find_in(shape)
+        if face is None and self.face_ref is not None:
+            face_idx, face = self.face_ref.find_coplanar_in(shape)
         if face is None:
             detail = ""
             if self.face_ref is not None:

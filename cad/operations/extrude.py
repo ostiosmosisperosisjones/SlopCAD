@@ -2,6 +2,7 @@
 cad/operations/extrude.py
 """
 
+from cad.solid_ref import as_compound
 import numpy as np
 from build123d import extrude, Plane, Face, Compound
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
@@ -67,7 +68,7 @@ def extrude_face_direct(body_shape, face: Face, distance: float,
         extruded = _do_extrude_solid(face, distance, direction,
                                      start_offset=start_offset, end_offset=end_offset,
                                      draft_angle=draft_angle)
-        return Compound(extruded.wrapped)
+        return as_compound(extruded)
 
     return _do_extrude_boolean(body_shape, face, distance, glue=False,
                                direction=direction,
@@ -160,11 +161,12 @@ def _do_extrude_boolean(shape, face: Face, distance: float,
         op.Build()
         if not op.IsDone():
             raise RuntimeError("Boolean fuse failed")
-        return Compound(op.Shape())
+        return as_compound(op.Shape())
 
-    # Cut path — add a small epsilon so the tool face never lands exactly
-    # coincident with an existing face (OCCT drops geometry when that happens).
-    cut_dist = distance - 0.01  # more negative = 0.01mm deeper
+    # Cut path — exact depth. A 0.01mm overshoot once guarded against a tool
+    # face coincident with an existing one, but OCCT cuts those cleanly and
+    # the overshoot made every blind pocket 0.01mm too deep.
+    cut_dist = distance
     extruded = _do_extrude_solid(face, cut_dist, direction,
                                  start_offset=start_offset, end_offset=end_offset,
                                  draft_angle=draft_angle)
@@ -175,7 +177,7 @@ def _do_extrude_boolean(shape, face: Face, distance: float,
     op.Build()
     if not op.IsDone():
         raise RuntimeError("Boolean cut failed")
-    result = Compound(op.Shape())
+    result = as_compound(op.Shape())
     if not list(result.solids()):
         # Tool went the wrong direction — retry flipped.
         if direction is not None:
@@ -193,7 +195,7 @@ def _do_extrude_boolean(shape, face: Face, distance: float,
         op2.SetRunParallel(True)
         op2.Build()
         if op2.IsDone():
-            result2 = Compound(op2.Shape())
+            result2 = as_compound(op2.Shape())
             if list(result2.solids()):
                 print("[Cut] Flipped direction succeeded.")
                 return result2

@@ -22,6 +22,7 @@ from OpenGL.GL import *
 
 VERTEX_HOVER_RADIUS = 12   # screen pixels
 EDGE_HOVER_RADIUS   = 6    # screen pixels
+EDGE_TIE_PX         = 1.5  # screen-distance ties broken by depth (front edge wins)
 
 # Arc/spline tessellation for hover picking only. Deliberately decoupled from
 # prefs.sketch_curve_segments (a *display* fidelity setting that can be 256+):
@@ -559,11 +560,22 @@ class HoverState:
             return None, None
 
         candidates.sort(key=lambda c: c[0])
-        for d, body_id, ei, wp3d in candidates:
-            if self._edge_visible(body_id, ei, wp3d):
-                return body_id, ei
-
-        return None, None
+        visible = []
+        for c in candidates:
+            if visible and c[0] > visible[0][0] + EDGE_TIE_PX:
+                break
+            if self._edge_visible(c[1], c[2], c[3]):
+                visible.append(c)
+        if not visible:
+            return None, None
+        # Edges that overlap on screen (e.g. a wall's near and far top edges
+        # seen face-on) both pass the grazing occlusion test: take the front one.
+        if self._eye is not None and len(visible) > 1:
+            depth = [float(np.linalg.norm(c[3] - self._eye)) for c in visible]
+            tol = 1e-4 * min(depth)
+            front = min(depth)
+            visible = [c for c, z in zip(visible, depth) if z <= front + tol]
+        return visible[0][1], visible[0][2]
 
     def vertex_world_pos(self, body_id: str, vertex_idx: int) -> np.ndarray | None:
         """Return the 3D world position of a cached vertex, or None."""

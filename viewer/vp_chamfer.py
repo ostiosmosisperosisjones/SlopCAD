@@ -8,7 +8,6 @@ helper, and carries an extra angle + flip-reference-face parameter.
 """
 
 from __future__ import annotations
-from PyQt6.QtCore import pyqtSlot, QMetaObject, Qt, Q_ARG
 
 
 class ChamferMixin:
@@ -62,10 +61,8 @@ class ChamferMixin:
         self._chamfer_body_id        = body_id
         self._chamfer_face_indices   = list(face_indices)
         self._chamfer_edge_indices   = list(edge_indices) if edge_indices else []
-        self._chamfer_preview_token  = None
+        self._chamfer_job().cancel()          # drop a previous session's preview
         self._chamfer_preview_mesh   = None
-        self._chamfer_computing      = False
-        self._chamfer_pending        = None
         self._chamfer_pick_face      = False
         self._chamfer_pick_edge      = False
         self._chamfer_arrow_base     = None
@@ -77,6 +74,9 @@ class ChamferMixin:
 
         panel = ChamferPanel(self.workspace, parent=self)
         panel.set_distance(distance)
+        if editing_entry is not None:
+            panel._distance_spin.set_binding(
+                editing_entry.params.get("exprs", {}).get("distance"), distance)
         panel.set_angle(angle_deg)
         panel.set_flip(flip)
 
@@ -141,10 +141,8 @@ class ChamferMixin:
         if getattr(self, '_editing_chamfer_idx', None) is not None:
             self._cancel_chamfer_edit()
 
-        self._chamfer_preview_token = None
+        self._chamfer_job().cancel()
         self._chamfer_preview_mesh  = None
-        self._chamfer_computing     = False
-        self._chamfer_pending       = None
         self._chamfer_pick_face     = False
         self._chamfer_pick_edge     = False
         self._chamfer_arrow_base    = None
@@ -280,49 +278,46 @@ class ChamferMixin:
 
         params = (list(face_indices), edge_occs, float(dist), angle, flip)
 
-        if getattr(self, '_chamfer_computing', False):
-            self._chamfer_pending = params
-            return
-
         panel.clear_entry_errors()
-        self._chamfer_computing = True
-        self._chamfer_pending   = None
-        self._launch_chamfer_thread(shape, params)
+        self._chamfer_job().submit(self._chamfer_preview_compute(shape, params))
 
-    def _launch_chamfer_thread(self, shape, params):
-        import threading
+    def _chamfer_job(self):
+        from viewer.preview_job import job_for
+        return job_for(self, '_chamfer_preview_job', self._on_chamfer_preview_done,
+                       "Chamfer preview")
+
+    def _chamfer_preview_compute(self, shape, params):
+        """Main-thread prep; returns the worker closure for PreviewJob."""
         from cad.operations.chamfer import chamfer_edges
 
         face_indices, edge_occs, dist, angle, flip = params
-        token = object()
-        self._chamfer_preview_token = token
 
         # Resolve face-derived edges on the main thread before handing off
         # (build123d traversal must not run from a worker).
         # edge_owners[i] = ('face', face_entry_idx) | ('edge', edge_entry_idx)
         face_edges  = []
         edge_owners = []
-        seen = {}                       # id(occ_edge) → owner tuple
+        from cad.operations.chamfer import _build_edge_to_faces_map, smooth_edges
         try:
+            edge_face_map = _build_edge_to_faces_map(shape.wrapped)
             all_faces = list(shape.faces())
             for face_entry_i, fi in enumerate(face_indices):
                 if fi < len(all_faces):
-                    for e in all_faces[fi].edges():
-                        if id(e.wrapped) not in seen:
-                            owner = ('face', face_entry_i)
-                            seen[id(e.wrapped)] = owner
-                            face_edges.append(e.wrapped)
-                            edge_owners.append(owner)
+                    fe = [e.wrapped for e in all_faces[fi].edges()]
+                    skip = set(smooth_edges(fe, edge_face_map))   # as ChamferOp
+                    for k, e in enumerate(fe):
+                        if k in skip or any(e.IsSame(o) for o in face_edges):
+                            continue
+                        face_edges.append(e)
+                        edge_owners.append(('face', face_entry_i))
         except Exception:
             pass
         all_edges = list(face_edges)
         for edge_entry_i, e in enumerate(edge_occs):
-            if id(e) in seen:
+            if any(e.IsSame(o) for o in all_edges):
                 continue
-            owner = ('edge', edge_entry_i)
-            seen[id(e)] = owner
             all_edges.append(e)
-            edge_owners.append(owner)
+            edge_owners.append(('edge', edge_entry_i))
 
         def _compute():
             # Errors come from chamfer_edges itself — no second validate pass.
@@ -343,21 +338,14 @@ class ChamferMixin:
             for i, msg in per_edge:
                 if 0 <= i < len(errors):
                     errors[i] = msg
-            QMetaObject.invokeMethod(
-                self, "_chamfer_preview_done",
-                Qt.ConnectionType.QueuedConnection,
-                Q_ARG(object, token),
-                Q_ARG(object, preview_mesh),
-                Q_ARG(object, (edge_owners, errors, kernel_err)),
-            )
+            return preview_mesh, (edge_owners, errors, kernel_err)
 
-        threading.Thread(target=_compute, daemon=True).start()
+        return _compute
 
-    @pyqtSlot(object, object, object)
-    def _chamfer_preview_done(self, token, preview_mesh, validation):
-        if getattr(self, '_chamfer_preview_token', None) is not token:
-            self._chamfer_computing = False
+    def _on_chamfer_preview_done(self, result, error):
+        if result is None:
             return
+        preview_mesh, validation = result
         if preview_mesh is not None:
             self.makeCurrent()
             try:
@@ -369,16 +357,6 @@ class ChamferMixin:
         self._reposition_chamfer_arrow()
         self.update()
 
-        pending = getattr(self, '_chamfer_pending', None)
-        self._chamfer_pending   = None
-        self._chamfer_computing = False
-        if pending is not None:
-            shape = self.workspace.current_shape(
-                getattr(self, '_chamfer_body_id', None))
-            if shape is not None:
-                self._chamfer_computing = True
-                self._launch_chamfer_thread(shape, pending)
-
     # ------------------------------------------------------------------
     # Commit
     # ------------------------------------------------------------------
@@ -388,6 +366,9 @@ class ChamferMixin:
         face_indices = getattr(self, '_chamfer_face_indices', [])
         edge_indices = getattr(self, '_chamfer_edge_indices', [])
         editing_idx  = getattr(self, '_editing_chamfer_idx', None)
+        from gui.expr_spinbox import exprs_extra
+        panel = getattr(self, '_chamfer_panel', None)
+        extra = exprs_extra(distance=panel._distance_spin if panel else None)
 
         if editing_idx is not None:
             self._editing_chamfer_idx = None
@@ -400,14 +381,14 @@ class ChamferMixin:
         if editing_idx is not None:
             self._editing_chamfer_idx = editing_idx
             self._commit_chamfer_edit(body_id, face_indices, edge_indices,
-                                       distance, angle_deg, flip)
+                                       distance, angle_deg, flip, extra)
             return
         ChamferOp(source_body_id      = body_id,
                   face_indices        = face_indices,
                   edge_indices        = edge_indices,
                   distance            = distance,
                   angle_deg           = angle_deg,
-                  flip_reference_face = flip).commit_async(self)
+                  flip_reference_face = flip).commit_async(self, extra)
 
     # ------------------------------------------------------------------
     # Edit / reopen
@@ -446,7 +427,8 @@ class ChamferMixin:
 
     def _commit_chamfer_edit(self, body_id: str, face_indices: list,
                               edge_indices: list, distance: float,
-                              angle_deg: float, flip: bool):
+                              angle_deg: float, flip: bool,
+                              extra: dict | None = None):
         from cad.op_types import ChamferOp
 
         idx = getattr(self, '_editing_chamfer_idx', None)
@@ -497,7 +479,7 @@ class ChamferMixin:
                   edge_indices        = edge_indices,
                   distance            = distance,
                   angle_deg           = angle_deg,
-                  flip_reference_face = flip).commit_async(self)
+                  flip_reference_face = flip).commit_async(self, extra)
 
     def _cancel_chamfer_edit(self):
         idx = getattr(self, '_editing_chamfer_idx', None)

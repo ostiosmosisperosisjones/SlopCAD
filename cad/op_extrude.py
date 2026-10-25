@@ -6,6 +6,7 @@ Extrude and sketch operation types:
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
@@ -44,7 +45,7 @@ def _extrude_faces_to_tool(faces, distance, direction,
             fu.SetArguments(lst_a); fu.SetTools(lst_b)
             fu.SetRunParallel(True); fu.Build()
             if fu.IsDone():
-                tool = Compound(fu.Shape())
+                tool = as_compound(fu.Shape())
     return tool
 
 
@@ -62,7 +63,7 @@ def _fuse_tool_into_target(tool, target_occ):
     fu.SetRunParallel(True); fu.Build()
     if not fu.IsDone():
         raise RuntimeError("Extrude fuse failed.")
-    return Compound(fu.Shape())
+    return as_compound(fu.Shape())
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +388,7 @@ class FaceExtrudeOp(Op):
                     existing = viewport.workspace.bodies.get(preserved) if preserved else None
                     new_name = existing.name if existing else viewport.workspace.next_part_name()
                     new_body = viewport.workspace.add_body(
-                        new_name, Compound(solid.wrapped), body_id=preserved)
+                        new_name, as_compound(solid), body_id=preserved)
                     new_bodies.append(new_body)
                     op_params["child_body_ids"].append(new_body.id)
                     print(f"[Extrude] New body '{new_name}' ({len(list(solid.faces()))} faces)")
@@ -480,10 +481,13 @@ class FaceExtrudeOp(Op):
         if self.direction is not None:
             panel.set_direction(np.array(self.direction, dtype=float))
 
-        if self.start_offset:
-            panel._start_offset.set_mm(self.start_offset)
-        if self.end_offset:
-            panel._end_offset.set_mm(self.end_offset)
+        exprs = entry.params.get("exprs", {})
+        if self.start_offset or "start_offset" in exprs:
+            panel._start_offset.set_binding(exprs.get("start_offset"),
+                                            self.start_offset)
+        if self.end_offset or "end_offset" in exprs:
+            panel._end_offset.set_binding(exprs.get("end_offset"),
+                                          self.end_offset)
 
         if self.draft_angle:
             panel.set_draft(self.draft_angle)
@@ -493,7 +497,7 @@ class FaceExtrudeOp(Op):
             panel._on_target_mode_changed(1)
             panel.set_vertex_target(np.array(self.target_vertex, dtype=float))
         else:
-            panel._spinbox.set_mm(abs(self.distance))
+            panel._spinbox.set_binding(exprs.get("distance"), abs(self.distance))
 
         panel._emit_preview()
 
@@ -609,6 +613,9 @@ class CrossBodyCutOp(Op):
     # Baked at commit so replay reproduces the user's selection instead of
     # reading mutable UI state (see op pick/selection pitfalls).
     face_indices:      list[int] | None = None
+    # ±1 → `direction` is the sketch normal (signed) and follows it; see
+    # SketchExtrudeOp.along_normal / bind_along_normal().
+    along_normal:      int = 0
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         import numpy as np
@@ -651,6 +658,8 @@ class CrossBodyCutOp(Op):
                 if not ok:
                     raise RuntimeError(
                         f"CrossBodyCutOp: sketch reprojection failed: {err}")
+            if self.along_normal and tool_dir is not None:
+                tool_dir = self.along_normal * np.asarray(sketch_entry.plane_normal, dtype=float)
             all_faces, _ = sketch_entry.build_faces()
             if not all_faces:
                 raise RuntimeError("CrossBodyCutOp: sketch has no closed loops")
@@ -683,7 +692,7 @@ class CrossBodyCutOp(Op):
                     raise RuntimeError("CrossBodyCutOp: no source_face_idx")
                 faces = [list(src_shape.faces())[self.source_face_idx]]
 
-        tool_dist = self.distance + 0.01
+        tool_dist = self.distance          # exact (see operations/extrude.py)
 
         tool_solid = None
         for face in faces:
@@ -704,7 +713,7 @@ class CrossBodyCutOp(Op):
                 fuse.SetArguments(lst_a); fuse.SetTools(lst_b)
                 fuse.SetRunParallel(True); fuse.Build()
                 if fuse.IsDone():
-                    tool_solid = Compound(fuse.Shape())
+                    tool_solid = as_compound(fuse.Shape())
 
         lst_a = TopTools_ListOfShape(); lst_a.Append(shape.wrapped)
         lst_b = TopTools_ListOfShape(); lst_b.Append(tool_solid.wrapped)
@@ -713,7 +722,7 @@ class CrossBodyCutOp(Op):
         op.SetRunParallel(True); op.Build()
         if not op.IsDone():
             raise RuntimeError("CrossBodyCutOp: boolean cut failed")
-        return Compound(op.Shape())
+        return as_compound(op.Shape())
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
@@ -790,7 +799,7 @@ class CrossBodyCutOp(Op):
             raise RuntimeError("[Cut] Target body has no shape.")
         original_solid_count = len(list(target_shape.solids()))
         target_occ   = target_shape.wrapped
-        tool_dist    = self.distance + 0.01
+        tool_dist    = self.distance       # exact (see operations/extrude.py)
         start_offset = self.start_offset
         end_offset   = self.end_offset
         draft_angle  = self.draft_angle
@@ -819,7 +828,7 @@ class CrossBodyCutOp(Op):
                     fuse.SetArguments(lst_a); fuse.SetTools(lst_b)
                     fuse.SetRunParallel(True); fuse.Build()
                     if fuse.IsDone():
-                        tool_solid = Compound(fuse.Shape())
+                        tool_solid = as_compound(fuse.Shape())
             lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
             lst_b = TopTools_ListOfShape(); lst_b.Append(tool_solid.wrapped)
             op = BRepAlgoAPI_Cut()
@@ -827,7 +836,7 @@ class CrossBodyCutOp(Op):
             op.SetRunParallel(True); op.Build()
             if not op.IsDone():
                 raise RuntimeError("Boolean cut failed")
-            return Compound(op.Shape())
+            return as_compound(op.Shape())
 
         def finalize(result):
             _push_result(viewport, "cut", op_params, self.cut_body_id,
@@ -884,10 +893,13 @@ class CrossBodyCutOp(Op):
         if self.direction is not None:
             panel.set_direction(np.array(self.direction, dtype=float))
 
-        if self.start_offset:
-            panel._start_offset.set_mm(self.start_offset)
-        if self.end_offset:
-            panel._end_offset.set_mm(self.end_offset)
+        exprs = entry.params.get("exprs", {})
+        if self.start_offset or "start_offset" in exprs:
+            panel._start_offset.set_binding(exprs.get("start_offset"),
+                                            self.start_offset)
+        if self.end_offset or "end_offset" in exprs:
+            panel._end_offset.set_binding(exprs.get("end_offset"),
+                                          self.end_offset)
 
         if self.draft_angle:
             panel.set_draft(self.draft_angle)
@@ -897,7 +909,7 @@ class CrossBodyCutOp(Op):
             panel._on_target_mode_changed(1)
             panel.set_vertex_target(np.array(self.target_vertex, dtype=float))
         else:
-            panel._spinbox.set_mm(self.distance)
+            panel._spinbox.set_binding(exprs.get("distance"), abs(self.distance))
 
         panel._emit_preview()
 
@@ -923,6 +935,8 @@ class CrossBodyCutOp(Op):
             p["draft_angle"] = self.draft_angle
         if self.face_indices is not None:
             p["face_indices"] = list(self.face_indices)
+        if self.along_normal:
+            p["along_normal"] = self.along_normal
         return p
 
     @classmethod
@@ -940,6 +954,7 @@ class CrossBodyCutOp(Op):
             end_offset       = float(params.get("end_offset", 0.0)),
             draft_angle      = float(params.get("draft_angle", 0.0)),
             face_indices     = list(fi) if fi is not None else None,
+            along_normal     = int(params.get("along_normal", 0)),
         )
 
 
@@ -962,12 +977,18 @@ class SketchExtrudeOp(Op):
     end_offset      : mm
     force_new_body  : True → always create a new body
     merged_from     : source body id when fusing into another body (legacy key)
+    along_normal    : ±1 → `direction` is the sketch normal (signed) and must
+                      follow it when an upstream edit turns the sketch plane;
+                      0 → `direction` is a fixed custom world vector.  Bound
+                      once by bind_along_normal() while the normal is still
+                      the authored one.
     """
     from_sketch_id: str
     distance:        float
     merge_body_id:   str  | None       = None
     face_indices:    list[int] | None  = None
     face_centroids:  list[list[float]] | None = None
+    face_boundaries:  list[list[str]] | None = None
     direction:       list[float] | None = None
     target_vertex:   list[float] | None = None
     start_offset:    float = 0.0
@@ -975,6 +996,7 @@ class SketchExtrudeOp(Op):
     draft_angle:     float = 0.0       # taper angle in degrees (signed)
     force_new_body:  bool  = False
     merged_from:     str   | None = None
+    along_normal:    int   = 0
 
     def creates_body_from_nothing(self, history: "History", entry_index: int) -> bool:
         """
@@ -1036,11 +1058,15 @@ class SketchExtrudeOp(Op):
 
         if self.face_centroids:
             import numpy as np
-            from cad.op_base import _match_face_by_centroid
-            centroids = np.array(self.face_centroids, dtype=float)
-            faces = [_match_face_by_centroid(t, all_faces, all_regions,
-                                             "SketchExtrudeOp")
-                     for t in centroids]
+            from cad.op_base import _match_sketch_faces
+            from cad.op_base import _lost_region_warning
+            lost = []
+            faces, matched = _match_sketch_faces(
+                se, all_faces, all_regions, self.face_centroids,
+                self.face_boundaries, "SketchExtrudeOp", lost)
+            _lost_region_warning(history, entry_index, lost)
+            if not self.face_boundaries:
+                self.face_boundaries = matched   # backfill (see History.replay_from)
         elif self.face_indices is not None:
             faces = [all_faces[i] for i in self.face_indices if i < len(all_faces)]
             if not faces:
@@ -1053,6 +1079,8 @@ class SketchExtrudeOp(Op):
         import numpy as np
         direction = (np.array(self.direction, dtype=float)
                      if self.direction is not None else None)
+        if self.along_normal and direction is not None:
+            direction = self.along_normal * np.asarray(se.plane_normal, dtype=float)
 
         # Merge-into-target case: the entry is tagged to merge_body_id, so the
         # `shape` passed in by replay IS that target body's current shape. Build
@@ -1172,6 +1200,9 @@ class SketchExtrudeOp(Op):
             arr = np.array(outer_uvs)
             return arr.mean(axis=0).tolist()
         face_centroids = [_uv_centroid(all_faces[i][1]) for i in face_indices]
+        _bounds = se.build_face_boundaries()
+        face_boundaries = [sorted(_bounds[i]) for i in face_indices
+                           if i < len(_bounds)]
 
         body_id      = se.body_id
         shape_before = viewport.workspace.current_shape(body_id)
@@ -1181,7 +1212,8 @@ class SketchExtrudeOp(Op):
         op_params = {"distance": abs(self.distance),
                      "from_sketch_id": self.from_sketch_id,
                      "face_indices": face_indices,
-                     "face_centroids": face_centroids}
+                     "face_centroids": face_centroids,
+                     "face_boundaries": face_boundaries}
         if self.force_new_body:
             op_params["force_new_body"] = True
         if direction is not None:
@@ -1210,7 +1242,8 @@ class SketchExtrudeOp(Op):
                             "merge_body_id": self.merge_body_id,
                             "from_sketch_id": self.from_sketch_id,
                             "face_indices": face_indices,
-                            "face_centroids": face_centroids}
+                            "face_centroids": face_centroids,
+                            "face_boundaries": face_boundaries}
             if direction is not None:
                 merge_params["direction"] = direction.tolist()
             if extra_params:
@@ -1268,7 +1301,7 @@ class SketchExtrudeOp(Op):
                     existing = viewport.workspace.bodies.get(preserved) if preserved else None
                     new_name = existing.name if existing else viewport.workspace.next_part_name()
                     new_body = viewport.workspace.add_body(
-                        new_name, Compound(solid.wrapped), body_id=preserved)
+                        new_name, as_compound(solid), body_id=preserved)
                     new_bodies.append(new_body)
                     op_params["child_body_ids"].append(new_body.id)
                     print(f"[Extrude] New body '{new_name}' ({len(list(solid.faces()))} faces)")
@@ -1342,10 +1375,13 @@ class SketchExtrudeOp(Op):
         if self.direction is not None:
             panel.set_direction(np.array(self.direction, dtype=float))
 
-        if self.start_offset:
-            panel._start_offset.set_mm(self.start_offset)
-        if self.end_offset:
-            panel._end_offset.set_mm(self.end_offset)
+        exprs = entry.params.get("exprs", {})
+        if self.start_offset or "start_offset" in exprs:
+            panel._start_offset.set_binding(exprs.get("start_offset"),
+                                            self.start_offset)
+        if self.end_offset or "end_offset" in exprs:
+            panel._end_offset.set_binding(exprs.get("end_offset"),
+                                          self.end_offset)
 
         if self.draft_angle:
             panel.set_draft(self.draft_angle)
@@ -1355,7 +1391,7 @@ class SketchExtrudeOp(Op):
             panel._on_target_mode_changed(1)
             panel.set_vertex_target(np.array(self.target_vertex, dtype=float))
         else:
-            panel._spinbox.set_mm(abs(self.distance))
+            panel._spinbox.set_binding(exprs.get("distance"), abs(self.distance))
 
         panel._emit_preview()
 
@@ -1372,6 +1408,8 @@ class SketchExtrudeOp(Op):
             p["face_indices"] = self.face_indices
         if self.face_centroids is not None:
             p["face_centroids"] = self.face_centroids
+        if self.face_boundaries is not None:
+            p["face_boundaries"] = self.face_boundaries
         if self.direction is not None:
             p["direction"] = self.direction
         if self.target_vertex is not None:
@@ -1384,6 +1422,8 @@ class SketchExtrudeOp(Op):
             p["draft_angle"] = self.draft_angle
         if self.force_new_body:
             p["force_new_body"] = True
+        if self.along_normal:
+            p["along_normal"] = self.along_normal
         return p
 
     @classmethod
@@ -1395,6 +1435,7 @@ class SketchExtrudeOp(Op):
             merge_body_id  = params.get("merge_body_id"),
             face_indices   = params.get("face_indices"),
             face_centroids = params.get("face_centroids"),
+            face_boundaries = params.get("face_boundaries"),
             direction      = params.get("direction"),
             target_vertex  = params.get("target_vertex"),
             start_offset   = float(params.get("start_offset", 0.0)),
@@ -1402,6 +1443,7 @@ class SketchExtrudeOp(Op):
             draft_angle    = float(params.get("draft_angle", 0.0)),
             force_new_body = bool(params.get("force_new_body", False)),
             merged_from    = params.get("merged_from"),
+            along_normal   = int(params.get("along_normal", 0)),
         )
 
 
@@ -1417,10 +1459,21 @@ class SketchOp(Op):
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         from cad.history import _replay_sketch_entry
         se = self.sketch_entry
+        entry = (history._entries[entry_index]
+                 if 0 <= entry_index < len(history._entries) else None)
+        if entry is not None:
+            entry.warning = ""
         if se is not None and se.plane_source is not None:
-            ok, err = _replay_sketch_entry(se, history, before_index=entry_index)
+            ok, err = _replay_sketch_entry(se, history, before_index=entry_index, own=True)
             if not ok:
                 raise RuntimeError(err)
+            stale = getattr(se, "stale_includes", [])
+            if stale and entry is not None:
+                entry.warning = (
+                    f"{len(stale)} included edge(s) couldn't be found after an upstream "
+                    f"change and kept their last position (entity "
+                    f"{', '.join(str(i) for i, _ in stale)}): {stale[0][1]}")
+                print(f"[Sketch] Entry {entry_index}: {entry.warning}")
         return shape
 
     def to_params(self) -> dict:
@@ -1471,3 +1524,32 @@ class ImportOp(Op):
             split_from      = params.get("split_from"),
             solid_index     = int(params.get("solid_index", 1)),
         )
+
+
+def bind_along_normal(history, entry) -> None:
+    """Record whether a sketch-driven extrude/cut's stored direction is just
+    its sketch's normal (the panel's default) — see SketchExtrudeOp.along_normal.
+    Call while the sketch plane is still the one the op was authored
+    against: at push, or on load before the first replay.  No-op once bound
+    (the "along_normal" key is present) or for other ops."""
+    import numpy as np
+    op = entry.op
+    if isinstance(op, SketchExtrudeOp):
+        sketch_id = op.from_sketch_id
+    elif isinstance(op, CrossBodyCutOp) and op.source_sketch_id is not None:
+        sketch_id = op.source_sketch_id
+    else:
+        return
+    if "along_normal" in entry.params:
+        return
+    sign = 0
+    if op.direction is not None:
+        idx = history.id_to_index(sketch_id)
+        se = history._entries[idx].params.get("sketch_entry") if idx is not None else None
+        if se is not None and se.plane_normal is not None:
+            d = np.asarray(op.direction, dtype=float)
+            dot = float(np.dot(d / np.linalg.norm(d), np.asarray(se.plane_normal, dtype=float)))
+            if abs(abs(dot) - 1.0) < 1e-9:
+                sign = 1 if dot > 0 else -1
+    op.along_normal = sign
+    entry.params["along_normal"] = sign

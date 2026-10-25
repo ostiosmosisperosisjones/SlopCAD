@@ -12,7 +12,7 @@ Expects self to have:
 """
 
 from __future__ import annotations
-from PyQt6.QtCore import pyqtSlot
+from cad.solid_ref import as_compound
 
 class RevolveMixin:
 
@@ -63,6 +63,7 @@ class RevolveMixin:
 
         self._revolve_panel          = panel
         self._revolve_axis_active    = False
+        self._revolve_axis_ref       = None   # (sketch entry_id, line uid) of a sketch-line axis
         self._revolve_face_active    = False
         self._revolve_body_active    = False
         self._revolve_preview_mesh   = None
@@ -110,11 +111,9 @@ class RevolveMixin:
         self._revolve_axis_dir      = None
         self._revolve_preview_angle = 0.0
         self._revolve_last_preview_params = None
-        # Bump gen so any in-flight background mesh compute that lands after
-        # this point is discarded — otherwise a worker that started during
-        # the last spin can revive the preview seconds after the panel closed.
-        self._revolve_mesh_gen     = getattr(self, '_revolve_mesh_gen', 0) + 1
-        self._revolve_mesh_pending = None
+        # Discard any in-flight mesh compute — a worker that started during
+        # the last spin must not revive the preview after the panel closed.
+        self._revolve_job().cancel()
         if getattr(self, '_editing_history_idx', None) is not None:
             self._cancel_revolve_edit()
         self.update()
@@ -182,108 +181,28 @@ class RevolveMixin:
 
         self.update()
 
-    def _revolve_compute_mesh(self, faces, axis_pt, axis_d, angle):
-        """Spawn a background worker to build the mesh. One at a time — newer
-        params overwrite pending; stale results are dropped via gen counter."""
-        gen = getattr(self, '_revolve_mesh_gen', 0) + 1
-        self._revolve_mesh_gen     = gen
-        self._revolve_mesh_pending = (faces, axis_pt, axis_d, angle, gen)
-        if getattr(self, '_revolve_mesh_inflight', False):
-            return
-        self._revolve_mesh_inflight = True
-        self._revolve_mesh_gen      = gen
+    def _revolve_job(self):
+        from viewer.preview_job import job_for
+        return job_for(self, '_revolve_preview_job', self._on_revolve_mesh_done,
+                       "Revolve preview")
 
+    def _revolve_compute_mesh(self, faces, axis_pt, axis_d, angle):
+        """Build the preview mesh in the background (one worker at a time,
+        latest params win — see viewer/preview_job.py)."""
         def _compute():
             from cad.operations.revolve import _do_revolve_solid
-            from OCP.BRepMesh import BRepMesh_IncrementalMesh
-            from OCP.BRep import BRep_Tool
-            from OCP.TopExp import TopExp_Explorer
-            from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
-            from OCP.TopoDS import TopoDS
-            from OCP.TopLoc import TopLoc_Location
-            from OCP.BRepAdaptor import BRepAdaptor_Curve
-            from OCP.GCPnts import GCPnts_UniformAbscissa
-            solids   = [_do_revolve_solid(f, axis_pt, axis_d, angle) for f in faces]
-            tris_list  = []
-            edges_list = []
-            identity   = TopLoc_Location()
-            for solid in solids:
-                wrapped = solid.wrapped
-                BRepMesh_IncrementalMesh(wrapped, 1.0)
-                tris = []
-                exp = TopExp_Explorer(wrapped, TopAbs_FACE)
-                while exp.More():
-                    face = TopoDS.Face_s(exp.Current())
-                    tri  = BRep_Tool.Triangulation_s(face, identity)
-                    if tri is not None:
-                        for i in range(1, tri.NbTriangles() + 1):
-                            n1, n2, n3 = tri.Triangle(i).Get()
-                            for ni in (n1, n2, n3):
-                                p = tri.Node(ni)
-                                tris.append((p.X(), p.Y(), p.Z()))
-                    exp.Next()
-                tris_list.append(tris)
-                edges = []
-                exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
-                while exp2.More():
-                    edge = TopoDS.Edge_s(exp2.Current())
-                    try:
-                        adp  = BRepAdaptor_Curve(edge)
-                        disc = GCPnts_UniformAbscissa()
-                        disc.Initialize(adp, 16)
-                        if disc.IsDone() and disc.NbPoints() >= 2:
-                            pts = []
-                            for pi in range(1, disc.NbPoints() + 1):
-                                p = adp.Value(disc.Parameter(pi))
-                                pts.append((p.X(), p.Y(), p.Z()))
-                            edges.append(pts)
-                    except Exception:
-                        pass
-                    exp2.Next()
-                edges_list.append(edges)
-            return tris_list, edges_list
+            from viewer.preview_job import preview_mesh_data
+            meshes = [preview_mesh_data(
+                          _do_revolve_solid(f, axis_pt, axis_d, angle).wrapped, 1.0)
+                      for f in faces]
+            return [m[0] for m in meshes], [m[1] for m in meshes]
+        self._revolve_job().submit(_compute)
 
-        def _deliver(result, finished_gen):
-            self._revolve_mesh_inflight = False
-            # Panel closed while we were computing — drop the result, never
-            # assign it. Gen counter alone is not enough: a worker that started
-            # mid-drag and lands here after OK click would otherwise revive
-            # the preview because the gen was still current at start time.
-            if getattr(self, '_revolve_panel', None) is None:
-                return
-            if getattr(self, '_revolve_mesh_gen', 0) == finished_gen:
-                self._revolve_preview_mesh = result
-                self.update()
-            # Fire once more if newer params arrived while we were computing.
-            pending = getattr(self, '_revolve_mesh_pending', None)
-            if pending is not None and pending[4] != finished_gen:
-                pfaces, ppt, pd, pangle, _ = pending
-                self._revolve_compute_mesh(pfaces, ppt, pd, pangle)
-
-        def _worker():
-            try:
-                result = _compute()
-                err    = None
-            except Exception as ex:
-                result = None
-                err    = ex
-            if err is not None:
-                print(f"[Revolve preview] {err}")
-            from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
-            QMetaObject.invokeMethod(
-                self, "_revolve_mesh_deliver",
-                Qt.ConnectionType.QueuedConnection,
-                Q_ARG(object, _deliver),
-                Q_ARG(object, result),
-                Q_ARG(object, gen),
-            )
-
-        import threading
-        threading.Thread(target=_worker, daemon=True).start()
-
-    @pyqtSlot(object, object, object)
-    def _revolve_mesh_deliver(self, deliver_fn, result, finished_gen):
-        deliver_fn(result, finished_gen)
+    def _on_revolve_mesh_done(self, result, error):
+        if getattr(self, '_revolve_panel', None) is None:
+            return
+        self._revolve_preview_mesh = result
+        self.update()
 
     def _update_revolve_arrow(self, faces, axis_pt, axis_d, angle_deg: float):
         """Compute arrow position at the swept tip of the revolve."""
@@ -521,6 +440,8 @@ class RevolveMixin:
                 return False
             direction /= norm
 
+            # Remember the line so the op can follow it through sketch edits.
+            self._revolve_axis_ref = (entries[history_idx].entry_id, ent.uid)
             panel.set_axis(p0, direction)
             return True
         except Exception as ex:
@@ -558,6 +479,7 @@ class RevolveMixin:
             print(f"[Revolve] Edge axis failed: {ex}")
             return False
 
+        self._revolve_axis_ref = None
         panel.set_axis(axis_pt, axis_dir)
         return True
 
@@ -686,6 +608,13 @@ class RevolveMixin:
         axis_d   = list(map(float, axis_dir))
         angle    = float(angle_deg)
 
+        # Parameter binding on the angle field — every commit path below
+        # forwards it as extra_params (read before the panel closes).
+        from gui.expr_spinbox import exprs_extra
+        panel = getattr(self, '_revolve_panel', None)
+        self._revolve_commit_extra = exprs_extra(
+            angle_deg=panel._angle_spinbox if panel else None)
+
         # Prevent _close_revolve_panel from cancelling the edit
         if editing_idx is not None:
             self._editing_history_idx = None
@@ -734,7 +663,7 @@ class RevolveMixin:
                 axis_dir         = axis_d,
                 face_indices     = cut_face_indices,
             )
-            op.commit(self)
+            op.commit(self, self._revolve_commit_extra)
             return
 
         # Revolve (merge / new body) ---------------------------------------
@@ -764,7 +693,7 @@ class RevolveMixin:
             print("[Revolve] No profile selected.")
             return
 
-        new_op.commit_async(self)
+        new_op.commit_async(self, getattr(self, '_revolve_commit_extra', None))
 
     def _do_revolve_cut_all_intersecting(self, angle_deg, axis_pt, axis_d,
                                           sketch_id, src_body_id):
@@ -813,7 +742,7 @@ class RevolveMixin:
                     fu.SetArguments(lst_a); fu.SetTools(lst_b)
                     fu.SetRunParallel(True); fu.Build()
                     if fu.IsDone():
-                        tool_solid = Compound(fu.Shape())
+                        tool_solid = as_compound(fu.Shape())
         except Exception as ex:
             print(f"[Revolve cut] Tool construction failed: {ex}"); return
 
@@ -828,7 +757,9 @@ class RevolveMixin:
                 face_indices     = cut_face_indices,
             )
 
-        fan_out_cut(self, tool_solid, build_op, None, op_label="Revolve cut")
+        fan_out_cut(self, tool_solid, build_op,
+                    getattr(self, '_revolve_commit_extra', None),
+                    op_label="Revolve cut")
 
     def _commit_revolve_edit_from_panel(self, editing_idx, angle, axis_pt,
                                          axis_d, merge_body_id, is_cut,
@@ -961,7 +892,7 @@ class RevolveMixin:
         self._editing_body_id = None
         self._delete_revolve_edit_group(idx)
 
-        new_op.commit(self)
+        new_op.commit(self, getattr(self, '_revolve_commit_extra', None))
 
         new_idx = self.history.cursor
         ok, err, _ = self.history.replay_all_from(new_idx + 1)

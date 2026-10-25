@@ -402,9 +402,10 @@ def _apply_fillet_result(corner_pt, ent_a, end_a, ent_b, end_b,
     hi, lo = (idx_a, idx_b) if idx_a > idx_b else (idx_b, idx_a)
     hi_kept = kept_a if idx_a > idx_b else kept_b
     lo_kept = kept_b if idx_a > idx_b else kept_a
-    sketch.entities[hi] = hi_kept
-    sketch.entities[lo] = lo_kept
-    sketch.entities.insert(lo + 1, arc)
+    from cad.sketch import splice_entities
+    splice_entities(sketch, hi, hi + 1, [hi_kept])
+    splice_entities(sketch, lo, lo + 1, [lo_kept])
+    splice_entities(sketch, lo + 1, lo + 1, [arc])
     return True
 
 

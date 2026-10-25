@@ -77,6 +77,9 @@ KEYBIND_DEFAULTS: dict[str, str] = {
     "sketch_vline":      "V",
     # Sketch mode — navigation
     "sketch_projection_toggle": "",
+    # Anywhere (menu shortcuts)
+    "new_parameter":     "Ctrl+Shift+P",
+    "edit_parameters":   "",
 }
 
 # Actions that are only active in 3D mode (no sketch open)
@@ -131,6 +134,8 @@ KEYBIND_LABELS: dict[str, tuple[str, str]] = {
     "sketch_vline":             ("Sketch",     "Vertical line"),
     "sketch_commit":            ("Sketch",     "Commit sketch"),
     "sketch_projection_toggle": ("Sketch",     "Toggle ortho/perspective"),
+    "new_parameter":            ("Parameters", "New parameter"),
+    "edit_parameters":          ("Parameters", "Edit parameters (focus the table)"),
 }
 
 

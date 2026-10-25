@@ -16,9 +16,11 @@ chamfer_edges(shape, edge_occs, distance, angle_deg, flip_reference_face=False)
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 import math
 from build123d import Compound
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer
+from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.TopExp import TopExp
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
 from OCP.TopoDS import TopoDS
@@ -32,6 +34,29 @@ def _build_edge_to_faces_map(shape_occ):
     TopExp.MapShapesAndAncestors_s(shape_occ, TopAbs_EDGE, TopAbs_FACE,
                                     edge_face_map)
     return edge_face_map
+
+
+def smooth_edges(edge_occs, edge_face_map, tol_deg: float = 1.0) -> list:
+    """Indices into *edge_occs* of edges whose two faces meet tangentially
+    (e.g. where a fillet runs into a flat face).  There is no corner to
+    chamfer or fillet there: OCCT refuses, and the boolean fallback builds
+    a degenerate cutter that swallows the body."""
+    from OCP.TopoDS import TopoDS
+    import math
+    out = []
+    for i, e in enumerate(edge_occs):
+        if not edge_face_map.Contains(e):
+            continue
+        faces = list(edge_face_map.FindFromKey(e))
+        if len(faces) != 2 or faces[0].IsSame(faces[1]):
+            continue                        # boundary or seam edge
+        n1 = _face_normal_at_edge(e, TopoDS.Face_s(faces[0]))
+        n2 = _face_normal_at_edge(e, TopoDS.Face_s(faces[1]))
+        if n1 is None or n2 is None:
+            continue
+        if sum(a * b for a, b in zip(n1, n2)) > math.cos(math.radians(tol_deg)):
+            out.append(i)
+    return out
 
 
 def _face_area(face_occ) -> float:
@@ -219,6 +244,13 @@ def chamfer_edges(shape, edge_occs, distance: float, angle_deg: float,
             f"Chamfer: angle must be in (0, 90), got {angle_deg}")
 
     edge_face_map = _build_edge_to_faces_map(source_occ)
+    smooth = smooth_edges(edge_occs, edge_face_map)
+    if smooth:
+        raise RuntimeError(
+            f"Chamfer: selected edge{'s' if len(smooth) > 1 else ''} "
+            f"{', '.join(str(i + 1) for i in smooth)} "
+            f"{'are' if len(smooth) > 1 else 'is'} smooth (the faces meet "
+            f"tangentially) — there is no corner to chamfer")
     mk = BRepFilletAPI_MakeChamfer(source_occ)
     angle_rad = math.radians(angle_deg)
     added = 0
@@ -235,10 +267,13 @@ def chamfer_edges(shape, edge_occs, distance: float, angle_deg: float,
     if added > 0:
         try:
             mk.Build()
-            if mk.IsDone():
+            # IsDone() isn't enough: on e.g. an ellipse edge between two
+            # cylinders the kernel "succeeds" with an invalid solid missing
+            # a large chunk (walker seed 9). Treat that as a failure.
+            if mk.IsDone() and BRepCheck_Analyzer(mk.Shape()).IsValid():
                 if per_edge_errors is not None:
                     per_edge_errors.extend((i, None) for i in range(len(edge_occs)))
-                return Compound(mk.Shape())
+                return as_compound(mk.Shape())
         except Exception:
             # OCCT can throw "no suitable edges for chamfer or fillet" from
             # Build() even after AddDA accepts the edge (e.g. drafted seam
@@ -282,9 +317,13 @@ def chamfer_edges(shape, edge_occs, distance: float, angle_deg: float,
     # One boolean cut with all cutters together — much faster than chaining
     # N sequential cuts, and OCCT can parallelise the intersection work.
     la = TopTools_ListOfShape(); la.Append(source_occ)
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
     lb = TopTools_ListOfShape()
     for c in cutters:
-        lb.Append(c)
+        # Cut with a copy: the boolean raises the tool's tolerances in place,
+        # and a cached cutter that has been through one cut makes the next
+        # cut behave differently — live and reload disagreed (walker seed 2).
+        lb.Append(BRepBuilderAPI_Copy(c).Shape())
     op = BRepAlgoAPI_Cut()
     op.SetArguments(la); op.SetTools(lb); op.SetRunParallel(True)
     op.Build()
@@ -294,7 +333,7 @@ def chamfer_edges(shape, edge_occs, distance: float, angle_deg: float,
 
     # Filter out micro-sliver solids from cutter grazing. Same logic as the
     # old per-edge cut path, applied to the combined result.
-    raw_solids = list(Compound(result).solids())
+    raw_solids = list(as_compound(result).solids())
     if not raw_solids:
         raise RuntimeError("Chamfer: combined cut produced empty result")
     gp_before = GProp_GProps()
@@ -308,7 +347,19 @@ def chamfer_edges(shape, edge_occs, distance: float, angle_deg: float,
         if abs(gp_s.Mass()) > sliver_threshold:
             kept.append(s.wrapped)
     if not kept:
-        raise RuntimeError("Chamfer: result was all slivers")
+        raise RuntimeError("Chamfer: the kernel can't chamfer these edges and the "
+                           "fallback cut missed the body (common where two curved "
+                           "faces meet) — try a smaller distance or other edges")
+    # A chamfer only removes material, so it can't make bodies: a chip left
+    # between two cutters (0.01mm³, walker seed 13) is material the chamfer
+    # removes. Keep as many solids as went in, the largest.
+    n_in = max(1, len(as_compound(source_occ).solids()))
+    if len(kept) > n_in:
+        vol = {}
+        for s in kept:
+            BRepGProp.VolumeProperties_s(s, gp_s)
+            vol[id(s)] = abs(gp_s.Mass())
+        kept = sorted(kept, key=lambda s: -vol[id(s)])[:n_in]
     if len(kept) == 1:
         result = kept[0]
     else:
@@ -317,7 +368,10 @@ def chamfer_edges(shape, edge_occs, distance: float, angle_deg: float,
             BRep_Builder().Add(comp, s)
         result = comp
 
-    return Compound(result)
+    if not BRepCheck_Analyzer(result).IsValid():
+        raise RuntimeError("Chamfer: result is not a valid solid — "
+                           "try a smaller distance or fewer edges")
+    return as_compound(result)
 
 
 # ---------------------------------------------------------------------------

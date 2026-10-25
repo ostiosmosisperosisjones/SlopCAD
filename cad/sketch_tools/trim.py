@@ -215,7 +215,9 @@ class TrimTool(BaseTool):
         if not t_params:
             # No intersections — delete the whole entity
             sketch.push_undo_snapshot()
-            sketch.entities.remove(target)
+            from cad.sketch import splice_entities
+            i = sketch.entities.index(target)
+            splice_entities(sketch, i, i + 1, [])
             return True
 
         # Split target into pieces
@@ -263,7 +265,8 @@ class TrimTool(BaseTool):
         # Commit
         sketch.push_undo_snapshot()
         real_idx = entities.index(target)
-        entities[real_idx:real_idx + 1] = survivors
+        from cad.sketch import splice_entities
+        splice_entities(sketch, real_idx, real_idx + 1, survivors)
         return True
 
     def cancel(self) -> None:

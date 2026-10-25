@@ -20,6 +20,7 @@ index — BREP round-trip does not preserve topology order.
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 import os
 import tempfile
 import multiprocessing as _mp
@@ -29,6 +30,11 @@ import multiprocessing as _mp
 # heavy fillets (a long BSpline edge can take tens of seconds) but bounded so a
 # true kernel hang can't lock the app indefinitely.
 DEFAULT_TIMEOUT_S = 25.0
+
+# Per-probe cap for the fit-largest search. Includes child spawn + import
+# (~3s) — on filletbug.vc a *buildable* radius takes ~9s end to end, so 8s
+# rejected every candidate and fit-largest always failed.
+ATTEMPT_TIMEOUT_S = 15.0
 
 
 class FilletTimeout(RuntimeError):
@@ -93,7 +99,7 @@ def _worker(brep_path: str, face_indices, edge_mids, edge_radii, radius,
         builder = BRep_Builder()
         occ = TopoDS_Shape()
         BRepTools.Read_s(occ, brep_path, builder)
-        shape = Compound(occ)
+        shape = as_compound(occ)
 
         # Map midpoint → override radius (None entries fall back to scalar).
         mid_to_r = {m: r for m, r in zip(edge_mids, edge_radii or [])}
@@ -153,7 +159,7 @@ def _max_search_ceiling(edge_occs):
 
 def fillet_edges_find_max(shape, face_indices, edge_occs,
                           ceiling: float | None = None,
-                          attempt_timeout_s: float = 8.0,
+                          attempt_timeout_s: float = ATTEMPT_TIMEOUT_S,
                           tol_fraction: float = 0.05,
                           max_iters: int = 8,
                           repeats: int = 3,
@@ -218,7 +224,7 @@ def fillet_edges_find_max(shape, face_indices, edge_occs,
         return result
 
     hi = ceiling if ceiling and ceiling > 0 else _max_search_ceiling(edge_occs)
-    lo = max(hi * 0.02, 1e-3)
+    lo = 0.0
 
     # If the ceiling reliably builds, that's the answer.
     try:
@@ -226,14 +232,11 @@ def fillet_edges_find_max(shape, face_indices, edge_occs,
     except (FilletTimeout, RuntimeError):
         pass
 
-    # Known-good lower bound (must also be reliable); else nothing builds.
+    # Binary search in (0, hi): largest r that *reliably* builds. No up-front
+    # lower-bound probe — tiny radii on long BSpline edges are the *slowest*
+    # builds (0.14mm took 27s on filletbug.vc vs ~9s at 2mm), so they're only
+    # reached if nothing larger builds.
     best = None
-    try:
-        best = (_reliable(lo), lo)
-    except (FilletTimeout, RuntimeError):
-        raise FilletTimeout(hi, attempt_timeout_s)
-
-    # Binary search in (lo, hi): largest r that *reliably* builds.
     for _ in range(max_iters):
         if (hi - lo) <= tol_fraction * hi:
             break
@@ -247,6 +250,8 @@ def fillet_edges_find_max(shape, face_indices, edge_occs,
         except (FilletTimeout, RuntimeError):
             hi = mid          # mid failed at least once → pull upper bound down
 
+    if best is None:
+        raise FilletTimeout(hi, attempt_timeout_s)
     return best[0], round(best[1], 4)
 
 
@@ -254,7 +259,7 @@ def fillet_edges_find_max(shape, face_indices, edge_occs,
 # this is only reached via the explicit "Fit largest" action.
 def fillet_edges_autofit_isolated(shape, face_indices, edge_occs, radius: float,
                                   timeout_s: float = DEFAULT_TIMEOUT_S,
-                                  attempt_timeout_s: float = 8.0,
+                                  attempt_timeout_s: float = ATTEMPT_TIMEOUT_S,
                                   edge_radii=None, **_legacy):
     """Find the largest buildable radius, capped at *radius* (the requested
     value — we never fit larger than asked). Thin wrapper over

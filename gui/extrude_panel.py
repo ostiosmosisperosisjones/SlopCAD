@@ -154,6 +154,7 @@ class ExtrudePanel(QWidget):
         self._workspace      = workspace
         self._direction      : np.ndarray | None = None
         self._flip           : bool = False
+        self._is_cut         : bool = False
         self._picking_edge   : bool = False
         self._picking_vertex : bool = False
         self._picking_body   : bool = False
@@ -216,7 +217,7 @@ class ExtrudePanel(QWidget):
         self._mode_group = QButtonGroup(self)
         self._mode_group.addButton(self._radio_extrude, 0)
         self._mode_group.addButton(self._radio_cut,     1)
-        self._mode_group.idClicked.connect(self._on_mode_changed)
+        self._mode_group.idClicked.connect(self._on_mode_clicked)
         mode_row.addWidget(self._radio_extrude)
         mode_row.addWidget(self._radio_cut)
         root.addLayout(mode_row)
@@ -613,8 +614,18 @@ class ExtrudePanel(QWidget):
     # Internal slots
     # ------------------------------------------------------------------
 
+    def _on_mode_clicked(self, btn_id: int):
+        """User switched Extrude/Cut: a cut on a body face goes into the body,
+        so switching mode also flips direction, as if ⇅ were pressed.
+        (Edit paths call _on_mode_changed directly and restore direction.)"""
+        if (btn_id == 1) != self._is_cut:
+            self._flip_btn.setChecked(not self._flip_btn.isChecked())
+            self._on_flip(self._flip_btn.isChecked())
+        self._on_mode_changed(btn_id)
+
     def _on_mode_changed(self, btn_id: int):
         is_cut = btn_id == 1
+        self._is_cut = is_cut
         self._extrude_op_widget.setVisible(not is_cut)
         self._cut_op_widget.setVisible(is_cut)
         # Reset body pick when switching modes

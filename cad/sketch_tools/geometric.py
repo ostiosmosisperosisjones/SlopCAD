@@ -4,14 +4,16 @@ cad/sketch_tools/geometric.py
 GeometricConstraintTool — apply parallel, perpendicular, horizontal, or
 vertical constraints.
 
-Tab cycles through modes.  Horizontal/vertical are single-click; parallel
-and perpendicular require two clicks (reference line, then target line).
+Tab cycles through modes.  Horizontal/vertical are single-click; parallel,
+perpendicular and equal take two clicks (reference line, then target line).
+Either click of a two-click mode may be a straight included edge: it's
+fixed geometry, so it always becomes the reference.
 """
 
 from __future__ import annotations
 import numpy as np
 from cad.sketch_tools.base import BaseTool
-from cad.sketch_tools.dimension import _nearest_line
+from cad.sketch_tools.dimension import _nearest_line, _pt_to_seg_dist
 
 
 MODES = ['parallel', 'perpendicular', 'horizontal', 'vertical', 'equal']
@@ -36,6 +38,20 @@ MODE_LABELS = {
     'vertical':      'VERTICAL  (Tab→)',
     'equal':         'EQUAL  (Tab→)',
 }
+
+
+def _nearest_line_or_include(pt, entities, tol: float = 5.0) -> int | None:
+    """Closest drawn line or straight include within tol mm."""
+    from cad.sketch import line_ends
+    best_idx, best_dist = None, tol
+    for i, ent in enumerate(entities):
+        ends = line_ends(ent)
+        if ends is None:
+            continue
+        d = _pt_to_seg_dist(pt, ends[0], ends[1])
+        if d < best_dist:
+            best_idx, best_dist = i, d
+    return best_idx
 
 
 class GeometricConstraintTool(BaseTool):
@@ -74,13 +90,18 @@ class GeometricConstraintTool(BaseTool):
             self._hover_idx = None
             return
         self._cursor_2d = pt.copy()
-        self._hover_idx = _nearest_line(pt, sketch.entities)
+        self._hover_idx = self._pick(pt, sketch)
+
+    def _pick(self, pt, sketch) -> int | None:
+        if self._mode in ('horizontal', 'vertical'):
+            return _nearest_line(pt, sketch.entities)
+        return _nearest_line_or_include(pt, sketch.entities)
 
     def handle_click(self, snap_result, sketch) -> bool:
         pt = snap_result.point
         if pt is None:
             return False
-        idx = _nearest_line(pt, sketch.entities)
+        idx = self._pick(pt, sketch)
         if idx is None:
             return False
 
@@ -103,10 +124,17 @@ class GeometricConstraintTool(BaseTool):
         if idx == self._first_idx:
             return True
 
+        from cad.sketch import SketchConstraint, SketchEntry, ReferenceEntity
         ref_idx, mov_idx = self._first_idx, idx
         self._first_idx = None
+        is_ref = lambda i: isinstance(sketch.entities[i], ReferenceEntity)
+        if is_ref(ref_idx) and is_ref(mov_idx):
+            return True          # both fixed: nothing for the solver to move
+        if is_ref(mov_idx):
+            # The solver treats the first index as the reference; an include
+            # can't move, so it must be that one.
+            ref_idx, mov_idx = mov_idx, ref_idx
 
-        from cad.sketch import SketchConstraint, SketchEntry
         sketch.push_undo_snapshot()
         sketch.constraints.append(
             SketchConstraint(self._mode, (ref_idx, mov_idx), 0.0)

@@ -43,8 +43,8 @@ class SketchModalMixin:
         self.camera.snap_to_normal(n.X, n.Y, n.Z, origin=(wo.X, wo.Y, wo.Z),
                                    x_dir=(xd.X, xd.Y, xd.Z),
                                    y_dir=(yd.X, yd.Y, yd.Z))
-        face_ref     = FaceRef.from_b3d_face(mesh.occt_faces[face_idx])
-        plane_source = FacePlaneSource(body_id, face_ref) if face_ref else None
+        plane_source = FacePlaneSource.for_face(
+            self.history, body_id, mesh.occt_faces[face_idx], self.history.cursor + 1)
         self._sketch = SketchMode(b3d_plane, body_id, face_idx,
                                   plane_source=plane_source)
         self._selected_sketch_entry = None
@@ -117,25 +117,18 @@ class SketchModalMixin:
     def _on_dimension_requested(self, entity_idx: int, current_val: float,
                                 entity_type: str = 'line'):
         """Show a spinbox for the user to enter a length or diameter constraint."""
-        from PyQt6.QtWidgets import QInputDialog
+        from gui.value_dialog import ask_value
         from cad.sketch import SketchConstraint
-        from cad.prefs import prefs
-        from cad.units import from_mm, to_mm
-        unit = prefs.default_unit
 
         is_arc = (entity_type == 'arc')
-        label  = f"Diameter ({unit}):" if is_arc else f"Length ({unit}):"
+        label  = "Diameter:" if is_arc else "Length:"
         title  = "Set Diameter" if is_arc else "Set Length"
         con_type = 'diameter' if is_arc else 'distance'
 
-        display_val = from_mm(current_val, unit)
-        val_display, ok = QInputDialog.getDouble(
-            self, title, label,
-            display_val, 0.0, 1_000_000, prefs.display_decimals,
-        )
-        if not ok:
+        answer = ask_value(self, title, label, current_val)
+        if answer is None:
             return
-        val = to_mm(val_display, unit)
+        val, binding = answer
 
         self._sketch.push_undo_snapshot()
         # Replace any existing same-type constraint on this entity.
@@ -144,7 +137,9 @@ class SketchModalMixin:
             if not (c.type == con_type and c.indices == (entity_idx,))
         ]
         self._sketch.constraints.append(
-            SketchConstraint(con_type, (entity_idx,), val)
+            SketchConstraint(con_type, (entity_idx,), val,
+                             expr=binding["expr"] if binding else None,
+                             expr_unit=binding["unit"] if binding else "mm")
         )
         from cad.sketch import SketchEntry, LineEntity, ArcEntity
         tmp = SketchEntry.from_sketch_mode(self._sketch)

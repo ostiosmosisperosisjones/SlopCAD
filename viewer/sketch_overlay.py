@@ -1289,7 +1289,7 @@ class SketchOverlay:
 
     def _draw_constraint_tool_preview(self, sketch: SketchMode):
         """Highlight hovered/selected lines for dimension and parallel tools."""
-        from cad.sketch import LineEntity
+        from cad.sketch import line_ends
         tool = sketch._active_tool
         if tool is None:
             return
@@ -1300,24 +1300,24 @@ class SketchOverlay:
         glEnable(GL_BLEND)
         glLineWidth(3.0)
 
-        # First selected line — solid blue
+        # First selected line (drawn or straight include) — solid blue
         if first_idx is not None and first_idx < len(sketch.entities):
-            ent = sketch.entities[first_idx]
-            if isinstance(ent, LineEntity):
+            ends = line_ends(sketch.entities[first_idx])
+            if ends is not None:
                 glColor4f(0.25, 0.60, 1.00, 0.95)
                 glBegin(GL_LINES)
-                glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))
-                glVertex3f(*self._pt(sketch.plane, ent.p1[0], ent.p1[1]))
+                glVertex3f(*self._pt(sketch.plane, ends[0][0], ends[0][1]))
+                glVertex3f(*self._pt(sketch.plane, ends[1][0], ends[1][1]))
                 glEnd()
 
         # Hovered line — yellow
         if hover_idx is not None and hover_idx != first_idx and hover_idx < len(sketch.entities):
-            ent = sketch.entities[hover_idx]
-            if isinstance(ent, LineEntity):
+            ends = line_ends(sketch.entities[hover_idx])
+            if ends is not None:
                 glColor4f(1.00, 0.80, 0.20, 0.85)
                 glBegin(GL_LINES)
-                glVertex3f(*self._pt(sketch.plane, ent.p0[0], ent.p0[1]))
-                glVertex3f(*self._pt(sketch.plane, ent.p1[0], ent.p1[1]))
+                glVertex3f(*self._pt(sketch.plane, ends[0][0], ends[0][1]))
+                glVertex3f(*self._pt(sketch.plane, ends[1][0], ends[1][1]))
                 glEnd()
 
         glLineWidth(1.0)
@@ -1398,7 +1398,7 @@ class SketchOverlay:
             from cad.units import format_value
             labels.append({
                 'world':          np.array([float(mid_3d[0]), float(mid_3d[1]), float(mid_3d[2])]),
-                'text':           format_value(con.value, prefs.default_unit, prefs.display_decimals),
+                'text':           _dim_text(con, ''),
                 'constraint_idx': ci,
                 'entity_idx':     ei,
                 'dimmed':         dimmed,
@@ -1490,8 +1490,7 @@ class SketchOverlay:
             labels.append({
                 'world':            np.array([float(mid_3d[0]), float(mid_3d[1]),
                                               float(mid_3d[2])]),
-                'text':             'ø' + format_value(con.value, prefs.default_unit,
-                                                       prefs.display_decimals),
+                'text':             _dim_text(con, 'ø'),
                 'constraint_idx':   ci,
                 'entity_idx':       ei,
                 'dimmed':           dimmed,
@@ -1511,19 +1510,20 @@ class SketchOverlay:
 
         # Parallel constraint labels — "||" floating at each line's midpoint.
         # Group by constraint so paired lines share the same label index.
-        from cad.sketch import LineEntity as _LE
+        from cad.sketch import line_ends
         for ci, con in enumerate(constraints):
             if con.type not in ('parallel', 'perpendicular', 'horizontal', 'vertical', 'equal'):
                 continue
             for ei in con.indices:
-                if ei >= len(entities) or not isinstance(entities[ei], _LE):
+                ends = line_ends(entities[ei]) if ei < len(entities) else None
+                if ends is None:
                     continue
-                ent   = entities[ei]
-                mid_uv = (np.array([float(ent.p0[0]), float(ent.p0[1])]) +
-                          np.array([float(ent.p1[0]), float(ent.p1[1])])) * 0.5
+                e0, e1 = ends
+                mid_uv = (np.array([float(e0[0]), float(e0[1])]) +
+                          np.array([float(e1[0]), float(e1[1])])) * 0.5
                 # Offset slightly perpendicular to the line so it doesn't overlap.
-                seg   = np.array([float(ent.p1[0] - ent.p0[0]),
-                                   float(ent.p1[1] - ent.p0[1])])
+                seg   = np.array([float(e1[0] - e0[0]),
+                                   float(e1[1] - e0[1])])
                 slen  = float(np.linalg.norm(seg))
                 if slen > 1e-6:
                     perp = np.array([-seg[1], seg[0]]) / slen
@@ -1556,3 +1556,14 @@ class SketchOverlay:
 def _v3(pt) -> tuple[float, float, float]:
     """Convert a numpy array or sequence to a (x,y,z) float tuple."""
     return (float(pt[0]), float(pt[1]), float(pt[2]))
+
+
+def _dim_text(con, prefix: str) -> str:
+    """Dimension label: "12.000 mm", or "w/2 = 12.000 mm" when the value is
+    driven by a parameter expression."""
+    from cad.units import format_value
+    from cad.prefs import prefs
+    txt = prefix + format_value(con.value, prefs.default_unit,
+                                prefs.display_decimals)
+    expr = getattr(con, 'expr', None)
+    return f"{expr} = {txt}" if expr else txt

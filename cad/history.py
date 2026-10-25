@@ -30,6 +30,7 @@ Two special cases beyond the REGISTRY executors:
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 import uuid
 import numpy as np
 from dataclasses import dataclass, field
@@ -54,6 +55,9 @@ class HistoryEntry:
     diverged:     bool = False   # True when a branch was inserted before this entry
     error:        bool = False   # True when this entry failed to replay
     error_msg:    str  = ""
+    # Non-fatal: the entry replayed but not as authored (e.g. an included
+    # edge couldn't be re-found and kept its last position).  Set by replay.
+    warning:      str  = ""
     editing:      bool = False   # True while the ExtrudePanel is open editing this entry
     # Typed operation object — mirrors params, set by history.push()
     op:           Any  = field(default=None, repr=False)
@@ -64,6 +68,14 @@ class History:
         self._entries:   list[HistoryEntry] = []
         self._cursor:    int = -1
         self._workspace: Any = None   # set by Workspace after construction
+        from cad.params import ParamTable
+        self.params = ParamTable()
+        # Evaluated parameter values, cached for the duration of one replay
+        # (sketch replay reads them via param_values()).
+        self._param_cache: tuple | None = None
+        # Imported STEP files carried inside the project: {zip name: bytes}.
+        # Import entries point here via params["embed"] (cad/importer.py).
+        self.embedded: dict[str, bytes] = {}
 
     # ------------------------------------------------------------------
     # Mutation
@@ -84,6 +96,8 @@ class History:
         )
         if entry_id is not None:
             entry.entry_id = entry_id
+        from cad.op_extrude import bind_along_normal
+        bind_along_normal(self, entry)
         if insert_at < len(self._entries):
             self._entries.insert(insert_at, entry)
             for i in range(insert_at + 1, len(self._entries)):
@@ -294,6 +308,7 @@ class History:
         mutated_bodies: set[str] = set()
 
         self._replay_shape_cache = shape_cache
+        self._param_cache = self.params.evaluate()
         try:
             for i in range(index, len(self._entries)):
                 entry  = self._entries[i]
@@ -329,6 +344,21 @@ class History:
                     if not first_error: first_error = err
                     mutated_bodies.add(bid)
                     continue
+
+                if entry.params.get("exprs"):
+                    try:
+                        self._apply_bindings(i)
+                    except ValueError as ex:
+                        err = f"Entry {i} '{entry.label}': {ex}"
+                        entry.error = True; entry.error_msg = err
+                        entry.shape_before = current_shapes.get(bid)
+                        entry.shape_after = None
+                        _null_split_dependents(self._entries, i)
+                        chain_broken[bid] = True
+                        if not first_error: first_error = err
+                        mutated_bodies.add(bid)
+                        continue
+                    op = entry.op
 
                 current_shape = current_shapes.get(bid)
 
@@ -371,6 +401,7 @@ class History:
                     mutated_bodies.add(bid)
                     continue
 
+                entry.warning = ""
                 try:
                     new_shape = op.execute(current_shape, self, i)
                 except Exception as ex:
@@ -382,6 +413,13 @@ class History:
                     if not first_error: first_error = err
                     mutated_bodies.add(bid)
                     continue
+
+                # Ops saved before region boundaries existed matched their
+                # sketch region by centroid; persist the boundary that match
+                # found so later parameter changes match by identity.
+                fb = getattr(op, "face_boundaries", None)
+                if fb and "face_boundaries" not in entry.params:
+                    entry.params["face_boundaries"] = fb
 
                 # Split op: the parent keeps only its own solid(s). execute()
                 # returns the FULL multi-solid boolean result (both halves of a
@@ -426,8 +464,114 @@ class History:
 
         finally:
             self._replay_shape_cache = None
+            self._param_cache = None
 
         return (not first_error), first_error, mutated_bodies
+
+    # ------------------------------------------------------------------
+    # Parameters
+    # ------------------------------------------------------------------
+
+    def param_values(self) -> dict:
+        """Evaluated parameter values (name -> Quantity).  Failed params are
+        absent, so a binding that uses one errors with "Unknown name"."""
+        if self._param_cache is not None:
+            return self._param_cache[0]
+        return self.params.evaluate()[0]
+
+    def _apply_bindings(self, index: int) -> None:
+        """Recompute an entry's bound fields from their expressions and
+        rebuild entry.op if anything changed.  Raises ValueError."""
+        from cad.params import eval_binding
+        entry  = self._entries[index]
+        values = self.param_values()
+        new = {}
+        for key, b in entry.params.get("exprs", {}).items():
+            try:
+                v = eval_binding(b, values)
+            except ValueError as ex:
+                raise ValueError(f"{key} = {b.get('expr')!r}: {ex}") from ex
+            # Distances are stored as magnitudes; the sign is the op type.
+            # Bound fields are magnitudes: the panel fields that create
+            # bindings only take positive values, and some ops store the
+            # value signed (CrossBodyCutOp distance, flipped thicken) — the
+            # sign is the op's, not the expression's.
+            if v < 0:
+                raise ValueError(f"{key} = {b.get('expr')!r} evaluates to "
+                                 f"{v:g} — must be positive")
+            old = entry.params.get(key, 0)
+            if isinstance(old, (int, float)) and old < 0:
+                v = -v
+            if entry.params.get(key) != v:
+                new[key] = v
+        if new:
+            self.update_entry_op(index, new)
+
+    def param_users(self, names: set[str]) -> list[int]:
+        """Indices of entries whose op bindings or sketch dimensions
+        reference any of *names*."""
+        from cad.params import binding_refs, _safe_refs
+        out = []
+        for i, e in enumerate(self._entries):
+            refs: set[str] = set()
+            for b in e.params.get("exprs", {}).values():
+                refs |= binding_refs(b)
+            se = e.params.get("sketch_entry")
+            for c in getattr(se, "constraints", None) or []:
+                if getattr(c, "expr", None):
+                    refs |= _safe_refs(c.expr)
+            if refs & names:
+                out.append(i)
+        return out
+
+    def _changed_params(self, before: dict, after: dict) -> set[str]:
+        return {n for n in set(before) | set(after)
+                if before.get(n) != after.get(n)}
+
+    def set_param(self, param) -> tuple[bool, str, set[str]]:
+        """Add/replace a parameter and replay everything it affects.
+        Raises ParamError if the parameter itself doesn't evaluate."""
+        before, _ = self.params.evaluate()
+        self.params.set(param)
+        return self._replay_for_params(before)
+
+    def remove_param(self, name: str) -> None:
+        """Remove an unused parameter.  Raises ParamError if params or
+        history entries still reference it."""
+        from cad.params import ParamError
+        users = self.param_users({name})
+        if users:
+            labels = ", ".join(self._entries[i].label.strip() for i in users[:5])
+            raise ParamError(f"'{name}' is used by history: {labels}")
+        self.params.remove(name)
+
+    def rename_param(self, old: str, new: str) -> None:
+        """Rename a parameter everywhere it's referenced.  Values don't
+        change, so no replay is needed."""
+        from cad.expression import rename_ref
+        self.params.rename(old, new)
+        for e in self._entries:
+            for b in e.params.get("exprs", {}).values():
+                b["expr"] = rename_ref(b["expr"], old, new)
+            se = e.params.get("sketch_entry")
+            for c in getattr(se, "constraints", None) or []:
+                if getattr(c, "expr", None):
+                    c.expr = rename_ref(c.expr, old, new)
+
+    def replace_params(self, items: list[dict]) -> tuple[bool, str, set[str]]:
+        """Swap in a whole parameter table (undo/redo) and replay whatever
+        changed value."""
+        from cad.params import ParamTable
+        before, _ = self.params.evaluate()
+        self.params = ParamTable.from_list(items)
+        return self._replay_for_params(before)
+
+    def _replay_for_params(self, before: dict) -> tuple[bool, str, set[str]]:
+        after, _ = self.params.evaluate()
+        users = self.param_users(self._changed_params(before, after))
+        if not users:
+            return True, "", set()
+        return self.replay_from(users[0])
 
     # Legacy name — kept so existing viewer/serializer call sites keep working.
     # Both names invoke the same unified replay; pick replay_from() in new code.
@@ -484,8 +628,8 @@ class History:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _replay_sketch_entry(se, history: History, before_index: int
-                         ) -> tuple[bool, str]:
+def _replay_sketch_entry(se, history: History, before_index: int,
+                         own: bool = False) -> tuple[bool, str]:
     """
     Update the plane cache and re-project all parametric ReferenceEntity
     instances on a SketchEntry.  Called during replay_from() for sketch ops.
@@ -493,6 +637,11 @@ def _replay_sketch_entry(se, history: History, before_index: int
     Never mutates se if resolution fails — the cached plane stays valid so
     the sketch doesn't visually corrupt to Z=0 while in an error state.
     Also fails if the body the sketch plane references is itself in error.
+
+    own=True: this is the sketch's own entry replaying (not a consumer
+    reprojecting it later).  An include that can't be re-found there is
+    recorded in se.stale_includes and drops its cached occ edge, so the
+    profile is built from the same UV points a reload would use.
     """
     from cad.sketch import ReferenceEntity
 
@@ -521,15 +670,26 @@ def _replay_sketch_entry(se, history: History, before_index: int
     # user's drawn geometry — would fail to replay just because one Include
     # reference can no longer be re-found.
     ref_updates = []
-    for ent in se.entities:
+    stale = []
+    for i, ent in enumerate(se.entities):
         if not isinstance(ent, ReferenceEntity) or ent.source is None:
             continue
         try:
             world_pts, occ_edges = ent.source.resolve(history, before_index)
-        except Exception:
+        except Exception as ex:
             # Skip this reference — its cached UV remains in place.
+            stale.append((i, str(ex)))
             continue
         ref_updates.append((ent, world_pts, occ_edges))
+    if own:
+        se.stale_includes = stale
+        for i, _ in stale:
+            se.entities[i].occ_edges = None
+
+    # Where drawn points sit on includes, measured before the includes move.
+    from cad.sketch import include_attachments, attachment_targets, _drawn_points
+    attachments = include_attachments(se) if ref_updates else []
+    before = {id(ent): [p.copy() for p in ent.points] for ent, _, _ in ref_updates}
 
     # All resolved successfully — now commit.
     o = b3d_plane.origin
@@ -544,18 +704,93 @@ def _replay_sketch_entry(se, history: History, before_index: int
     se.plane_y_axis = plane_y_axis
     se.plane_normal = np.array([z.X, z.Y, z.Z], dtype=np.float64)
 
+    def _to_uv(wp):
+        delta = np.array(wp, dtype=np.float64) - plane_origin
+        return np.array([np.dot(delta, plane_x_axis),
+                         np.dot(delta, plane_y_axis)], dtype=np.float64)
+
+    from cad.edge_ref import BodyEdgeSource
+    from cad.sketch_tools.include import project_body_edge
     for ent, world_pts, occ_edges in ref_updates:
-        uv_pts = []
-        for wp in world_pts:
-            wp_arr = np.array(wp, dtype=np.float64)
-            delta  = wp_arr - plane_origin
-            u = float(np.dot(delta, plane_x_axis))
-            v = float(np.dot(delta, plane_y_axis))
-            uv_pts.append(np.array([u, v], dtype=np.float64))
-        ent.points = uv_pts
+        if isinstance(ent.source, BodyEdgeSource):
+            # Same projection the Include tool used, so the include keeps
+            # its point count and the drawn geometry snapped to it.
+            ent.points, ent.occ_edges = project_body_edge(
+                world_pts, (occ_edges or [None])[0], _to_uv, se.plane_normal,
+                collapse=len(ent.points) <= 2)
+            continue
+        ent.points = [_to_uv(wp) for wp in world_pts]
         if occ_edges is not None:
             ent.occ_edges = occ_edges
+    # A re-found edge can come back with its parameter running the other
+    # way.  Drawn ends are attached to the include's first/last point, so a
+    # flipped include swaps them and the profile crosses itself (walker
+    # seed 4: a quad became a bowtie).  Keep the previous orientation.
+    for ent, _, _ in ref_updates:
+        old, new = before[id(ent)], ent.points
+        if len(old) < 2 or len(new) < 2:
+            continue
+        d_old, d_new = old[-1] - old[0], new[-1] - new[0]
+        if np.linalg.norm(d_old) > 1e-6 and float(d_old @ d_new) < 0:
+            ent.points = new[::-1]
 
+    # Re-resolving an unchanged include jitters by ~1e-7; only a real move
+    # is worth a re-solve.
+    def _moved(ent):
+        old = before[id(ent)]
+        return len(old) != len(ent.points) or any(
+            np.linalg.norm(a - b) > 1e-6 for a, b in zip(old, ent.points))
+    moved = {i for i, ent in enumerate(se.entities)
+             if id(ent) in before and _moved(ent)}
+
+    targets = attachment_targets(se, attachments) if attachments else {}
+    current = dict(_drawn_points(se.entities))
+    any_pin_moved = any(np.linalg.norm(uv - current[k]) > 1e-6
+                        for k, uv in targets.items())
+    # Constraints naming a moved include (equal / parallel to it) need a
+    # re-solve even when no drawn point touches it.
+    refs_moved = bool(moved) and any(set(c.indices) & moved for c in se.constraints)
+    # Once re-solving, hold EVERY attached point at its target, moved or
+    # not: one left only on a sliding constraint gets dragged along its
+    # include by the snap implicit lengths of lines whose other end moved.
+    pins = targets if (any_pin_moved or refs_moved) else {}
+    return _resolve_bound_dimensions(se, history, pins, attachments, refs_moved)
+
+
+def _resolve_bound_dimensions(se, history: History, pins: dict | None = None,
+                              attachments: list | None = None,
+                              refs_moved: bool = False) -> tuple[bool, str]:
+    """Recompute parameter-driven dimension values and re-solve the sketch
+    if any changed, or if included geometry moved under attached points
+    (pins) or under constraints that reference it (refs_moved).  Untouched
+    sketches are never re-solved, so files without parameters or moving
+    includes replay exactly as before.
+
+    attachments: include_attachments() measured BEFORE the includes were
+    re-projected (afterwards the drawn points no longer sit on them)."""
+    from cad.expression import parse_expr
+    bound = [c for c in se.constraints if getattr(c, "expr", None)]
+    follow = bool(pins) or refs_moved
+    if not bound and not follow:
+        return True, ""
+    values = history.param_values()
+    changed = False
+    for c in bound:
+        try:
+            v = parse_expr(c.expr, c.expr_unit, values)
+        except ValueError as ex:
+            return False, f"Dimension {c.expr!r}: {ex}"
+        if v <= 0:
+            return False, f"Dimension {c.expr!r} evaluates to {v:g} — must be positive"
+        if abs(v - c.value) > 1e-9:
+            c.value = v
+            changed = True
+    if (changed or follow) and not se.apply_all_constraints(
+            pins=pins, attachments=attachments):
+        if follow and not changed:
+            return False, ("Sketch can't follow its included geometry: "
+                           "the constraint solver failed")
+        return False, "Sketch constraints can't be solved with the new parameter values"
     return True, ""
 
 
@@ -680,7 +915,7 @@ def _seed_split_import_children(entries, parent_idx, full_shape,
         if idx is None:
             continue
         used.add(idx)
-        child_shape = Compound(solids[idx].wrapped)
+        child_shape = as_compound(solids[idx])
         e.shape_after = child_shape
         cbid = e.body_id
         current_shapes[cbid] = child_shape

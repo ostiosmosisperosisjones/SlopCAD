@@ -10,6 +10,7 @@ from_sketch_ids defines the loft sweep direction.
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
@@ -168,7 +169,7 @@ class SketchLoftOp(Op):
         except Exception as ex:
             raise RuntimeError(f"SketchLoftOp: loft failed: {ex}")
 
-        loft_solid = Compound(loft_part.wrapped)
+        loft_solid = as_compound(loft_part)
 
         # ---- Cut path ----
         if self.cut_body_id is not None:
@@ -183,7 +184,7 @@ class SketchLoftOp(Op):
             op.SetRunParallel(True); op.Build()
             if not op.IsDone():
                 raise RuntimeError("SketchLoftOp: boolean cut failed")
-            return Compound(op.Shape())
+            return as_compound(op.Shape())
 
         # ---- Merge path ----
         if self.merge_body_id is not None and not self.force_new_body:
@@ -198,7 +199,7 @@ class SketchLoftOp(Op):
             op.SetRunParallel(True); op.Build()
             if not op.IsDone():
                 raise RuntimeError("SketchLoftOp: boolean fuse failed")
-            return Compound(op.Shape())
+            return as_compound(op.Shape())
 
         # ---- New body ----
         solids = list(loft_solid.solids())
@@ -284,7 +285,7 @@ class SketchLoftOp(Op):
                 op.SetRunParallel(True); op.Build()
                 if not op.IsDone():
                     raise RuntimeError("Boolean cut failed")
-                return Compound(op.Shape())
+                return as_compound(op.Shape())
 
             def finalize(result):
                 _push_result(viewport, "loft_cut", op_params, cut_body_id,
@@ -313,7 +314,7 @@ class SketchLoftOp(Op):
                 op.SetRunParallel(True); op.Build()
                 if not op.IsDone():
                     raise RuntimeError("Boolean fuse failed")
-                return Compound(op.Shape())
+                return as_compound(op.Shape())
 
             def finalize(merged):
                 _push_result(viewport, "loft", op_params, merge_body_id,
@@ -328,7 +329,7 @@ class SketchLoftOp(Op):
 
         def compute():
             loft_part = build_loft(faces)
-            return Compound(loft_part.wrapped)
+            return as_compound(loft_part)
 
         preserved_body_ids = list((extra_params or {}).get("_preserved_body_ids", []))
         if extra_params:
@@ -349,7 +350,7 @@ class SketchLoftOp(Op):
                 # Fresh "Part N" for a new body; keep existing name on re-commit.
                 existing = ws.bodies.get(preserved) if preserved else None
                 new_name = existing.name if existing else ws.next_part_name()
-                new_body = ws.add_body(new_name, Compound(solid.wrapped), body_id=preserved)
+                new_body = ws.add_body(new_name, as_compound(solid), body_id=preserved)
                 new_bodies.append(new_body)
                 op_params["child_body_ids"].append(new_body.id)
                 print(f"[Loft] New body '{new_name}'")

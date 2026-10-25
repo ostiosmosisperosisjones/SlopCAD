@@ -5,7 +5,6 @@ ThickenMixin — uniform body offset panel, preview, and commit.
 """
 
 from __future__ import annotations
-from PyQt6.QtCore import pyqtSlot
 
 
 class ThickenMixin:
@@ -93,8 +92,7 @@ class ThickenMixin:
         self._thicken_cage_tris           = None
         self._thicken_cage_key            = None
         self._thicken_last_preview_params = None
-        self._thicken_mesh_gen            = getattr(self, '_thicken_mesh_gen', 0) + 1  # invalidate any inflight
-        self._thicken_mesh_pending        = None
+        self._thicken_job().cancel()          # discard any in-flight preview
         self._thicken_arrow_origin        = None
         self._thicken_arrow_dir           = None
         self.update()
@@ -214,67 +212,23 @@ class ThickenMixin:
 
         self.update()
 
+    def _thicken_job(self):
+        from viewer.preview_job import job_for
+        return job_for(self, '_thicken_preview_job', self._on_thicken_mesh_done,
+                       "Thicken preview")
+
     def _thicken_compute_mesh(self, face_occs, thickness: float):
-        """Spawn a background worker to build the thicken preview mesh."""
-        gen = getattr(self, '_thicken_mesh_gen', 0) + 1
-        self._thicken_mesh_gen     = gen
-        self._thicken_mesh_pending = (face_occs, thickness, gen)
-        if getattr(self, '_thicken_mesh_inflight', False):
-            return
-        self._thicken_mesh_inflight = True
-        self._thicken_mesh_gen      = gen
-
-        panel = getattr(self, '_thicken_panel', None)
-
+        """Build the preview mesh in the background (one worker at a time,
+        latest params win — see viewer/preview_job.py)."""
         def _compute():
             from cad.operations.thicken import thicken_face_preview
-            from OCP.BRepMesh import BRepMesh_IncrementalMesh
-            from OCP.BRep import BRep_Tool
-            from OCP.TopExp import TopExp_Explorer
-            from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
-            from OCP.TopoDS import TopoDS
-            from OCP.TopLoc import TopLoc_Location
-            from OCP.BRepAdaptor import BRepAdaptor_Curve
-            from OCP.GCPnts import GCPnts_UniformAbscissa
-            tris_list  = []
-            edges_list = []
-            errors     = []
-            identity   = TopLoc_Location()
-            for i, fo in enumerate(face_occs):
+            from viewer.preview_job import preview_mesh_data
+            tris_list, edges_list, errors = [], [], []
+            for fo in face_occs:
                 try:
-                    slab    = thicken_face_preview(fo, thickness)
-                    wrapped = slab.wrapped
-                    BRepMesh_IncrementalMesh(wrapped, 0.15)
-                    tris = []
-                    exp = TopExp_Explorer(wrapped, TopAbs_FACE)
-                    while exp.More():
-                        face = TopoDS.Face_s(exp.Current())
-                        tri  = BRep_Tool.Triangulation_s(face, identity)
-                        if tri is not None:
-                            for j in range(1, tri.NbTriangles() + 1):
-                                n1, n2, n3 = tri.Triangle(j).Get()
-                                for ni in (n1, n2, n3):
-                                    p = tri.Node(ni)
-                                    tris.append((p.X(), p.Y(), p.Z()))
-                        exp.Next()
+                    tris, edges = preview_mesh_data(
+                        thicken_face_preview(fo, thickness).wrapped, 0.15)
                     tris_list.append(tris)
-                    edges = []
-                    exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
-                    while exp2.More():
-                        edge = TopoDS.Edge_s(exp2.Current())
-                        try:
-                            adp  = BRepAdaptor_Curve(edge)
-                            disc = GCPnts_UniformAbscissa()
-                            disc.Initialize(adp, 16)
-                            if disc.IsDone() and disc.NbPoints() >= 2:
-                                pts = []
-                                for pi in range(1, disc.NbPoints() + 1):
-                                    p = adp.Value(disc.Parameter(pi))
-                                    pts.append((p.X(), p.Y(), p.Z()))
-                                edges.append(pts)
-                        except Exception:
-                            pass
-                        exp2.Next()
                     edges_list.append(edges)
                     errors.append(None)
                 except Exception as ex:
@@ -282,50 +236,18 @@ class ThickenMixin:
                     edges_list.append([])
                     errors.append(str(ex))
             return tris_list, edges_list, errors
+        self._thicken_job().submit(_compute)
 
-        def _deliver(result, finished_gen):
-            self._thicken_mesh_inflight = False
-            if getattr(self, '_thicken_panel', None) is None:
-                return
-            if getattr(self, '_thicken_mesh_gen', 0) == finished_gen:
-                if result is not None:
-                    tris_list, edges_list, errors = result
-                    self._thicken_preview_mesh = (tris_list, edges_list)
-                    panel = getattr(self, '_thicken_panel', None)
-                    if panel is not None:
-                        for i, err in enumerate(errors):
-                            if err is not None:
-                                panel.set_face_entry_error(i, err)
-                self.update()
-            pending = getattr(self, '_thicken_mesh_pending', None)
-            if pending is not None and pending[2] != finished_gen:
-                pfaces, pthick, _ = pending
-                self._thicken_compute_mesh(pfaces, pthick)
-
-        def _worker():
-            try:
-                result = _compute()
-                err    = None
-            except Exception as ex:
-                result = None
-                err    = ex
+    def _on_thicken_mesh_done(self, result, error):
+        panel = getattr(self, '_thicken_panel', None)
+        if panel is None or result is None:
+            return
+        tris_list, edges_list, errors = result
+        self._thicken_preview_mesh = (tris_list, edges_list)
+        for i, err in enumerate(errors):
             if err is not None:
-                print(f"[Thicken preview] {err}")
-            from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
-            QMetaObject.invokeMethod(
-                self, "_thicken_mesh_deliver",
-                Qt.ConnectionType.QueuedConnection,
-                Q_ARG(object, _deliver),
-                Q_ARG(object, result),
-                Q_ARG(object, gen),
-            )
-
-        import threading
-        threading.Thread(target=_worker, daemon=True).start()
-
-    @pyqtSlot(object, object, object)
-    def _thicken_mesh_deliver(self, deliver_fn, result, finished_gen):
-        deliver_fn(result, finished_gen)
+                panel.set_face_entry_error(i, err)
+        self.update()
 
     def _draw_thicken_preview(self):
         from OpenGL.GL import (glDisable, glEnable, glColor4f, glBegin, glEnd,
@@ -522,6 +444,9 @@ class ThickenMixin:
         body_id      = getattr(self, '_thicken_body_id', None)
         face_indices = getattr(self, '_thicken_face_indices', None)
         editing_idx  = getattr(self, '_editing_thicken_idx', None)
+        from gui.expr_spinbox import exprs_extra
+        panel = getattr(self, '_thicken_panel', None)
+        extra = exprs_extra(thickness=panel._spinbox if panel else None)
         if editing_idx is not None:
             self._editing_thicken_idx = None  # prevent cancel on close
         self._close_thicken_panel()
@@ -530,11 +455,13 @@ class ThickenMixin:
         from cad.op_types import ThickenOp
         if editing_idx is not None:
             self._editing_thicken_idx = editing_idx  # restore for _commit
-            self._commit_thicken_edit(body_id, face_indices, thickness)
+            self._commit_thicken_edit(body_id, face_indices, thickness, extra)
             return
-        ThickenOp(source_body_id=body_id, face_indices=face_indices, thickness=thickness).commit_async(self)
+        ThickenOp(source_body_id=body_id, face_indices=face_indices,
+                  thickness=thickness).commit_async(self, extra)
 
-    def _commit_thicken_edit(self, body_id: str, face_indices: list, thickness: float):
+    def _commit_thicken_edit(self, body_id: str, face_indices: list,
+                             thickness: float, extra: dict | None = None):
         from cad.op_types import ThickenOp
 
         idx = getattr(self, '_editing_thicken_idx', None)
@@ -584,7 +511,7 @@ class ThickenMixin:
                 self.workspace.remove_body(bid)
 
         ThickenOp(source_body_id=body_id, face_indices=face_indices,
-                  thickness=thickness).commit_async(self)
+                  thickness=thickness).commit_async(self, extra)
 
     def reopen_thicken(self, history_idx: int):
         entries = self.history.entries

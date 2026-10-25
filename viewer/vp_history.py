@@ -281,3 +281,54 @@ class HistoryMixin:
         cmd = ReorderCommand(src, dst)
         self._cmd_stack._do_push_no_apply(cmd)
         self._do_reorder(src, dst)
+
+    # ------------------------------------------------------------------
+    # Global parameters (gui/params_panel.py)
+    # ------------------------------------------------------------------
+
+    def param_set(self, param, old_name: str | None = None) -> str | None:
+        """Add / edit (and optionally rename) a parameter, then replay what it
+        drives.  Returns an error message, or None on success."""
+        from cad.params import ParamError
+        from viewer.history_commands import ParamCommand
+        h = self.history
+        before_items = h.params.to_list()
+        before_vals, _ = h.params.evaluate()
+        rename = (old_name, param.name) if old_name and old_name != param.name else None
+        try:
+            if rename:
+                h.rename_param(*rename)
+            h.params.set(param)
+        except ParamError as ex:
+            if rename:
+                h.rename_param(rename[1], rename[0])
+            h.params = type(h.params).from_list(before_items)
+            return str(ex)
+        verb = "Rename" if rename else ("Edit" if old_name else "Add")
+        self._cmd_stack._do_push_no_apply(ParamCommand(
+            before_items, h.params.to_list(), rename,
+            f"{verb} parameter '{param.name}'"))
+        self._replay_params(before_vals)
+        return None
+
+    def param_remove(self, name: str) -> str | None:
+        from cad.params import ParamError
+        from viewer.history_commands import ParamCommand
+        h = self.history
+        before_items = h.params.to_list()
+        try:
+            h.remove_param(name)
+        except ParamError as ex:
+            return str(ex)
+        self._cmd_stack._do_push_no_apply(ParamCommand(
+            before_items, h.params.to_list(), None,
+            f"Remove parameter '{name}'"))
+        self.history_changed.emit()
+        return None
+
+    def _replay_params(self, before_vals: dict):
+        ok, err, mutated = self.history._replay_for_params(before_vals)
+        if not ok:
+            print(f"[Params] Replay error: {err}")
+        self._rebuild_bodies(mutated)
+        self.history_changed.emit()

@@ -58,7 +58,8 @@ class DivideTool(BaseTool):
             return False
 
         sketch.push_undo_snapshot()
-        entities[target_idx:target_idx + 1] = pieces
+        from cad.sketch import splice_entities
+        splice_entities(sketch, target_idx, target_idx + 1, pieces)
         return True
 
     def cancel(self) -> None:

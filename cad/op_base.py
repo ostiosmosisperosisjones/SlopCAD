@@ -5,6 +5,7 @@ Base Op class and shared _push_result() commit helper.
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -153,14 +154,17 @@ def _match_face_by_centroid(target, all_faces: list, all_regions: list,
     all_regions : regions returned by SketchEntry.build_faces()[1]
     op_name     : operation name to embed in the error message
     """
-    import numpy as np
+    return all_faces[_match_face_index_by_centroid(target, all_regions,
+                                                   op_name, tol)]
+
+
+def _match_face_index_by_centroid(target, all_regions: list, op_name: str,
+                                  tol: float = _FACE_CENTROID_MATCH_TOL) -> int:
     if not all_regions:
         raise RuntimeError(f"{op_name}: sketch has no regions to match against")
     best_i, best_d = -1, float('inf')
     for i, region in enumerate(all_regions):
-        outer_uvs = region[0]
-        c = np.array(outer_uvs).mean(axis=0)
-        d = float(np.linalg.norm(c - target))
+        d = _region_centroid_dist(region, target)
         if d < best_d:
             best_d, best_i = d, i
     if best_d > tol:
@@ -168,7 +172,60 @@ def _match_face_by_centroid(target, all_faces: list, all_regions: list,
             f"{op_name}: stored sketch face no longer exists "
             f"(nearest region centroid is {best_d:.3f}mm from stored "
             f"target, threshold is {tol}mm)")
-    return all_faces[best_i]
+    return best_i
+
+
+def _match_sketch_faces(se, all_faces: list, all_regions: list,
+                        centroids, boundaries, op_name: str, lost: list | None = None):
+    """
+    Resolve an op's stored sketch regions to current faces.
+
+    A region whose stored boundary (uids of the entities bounding it, see
+    SketchEntry.build_face_boundaries) still exists is matched by that,
+    nearest centroid among equal boundaries, with no distance limit.  That
+    makes parameter changes and solver re-solves safe, however far the
+    centroid moves.  Anything else (no stored boundary, sketch edited
+    so the boundary changed) falls back to the centroid tolerance.
+
+    Returns (faces, boundaries) — boundaries as matched now, sorted lists,
+    so callers can backfill ops saved before boundaries existed.  A region
+    whose stored boundary no longer exists (the profile changed shape — e.g.
+    an include moved across free chain points) is appended to `lost`: the
+    centroid guess may be a different region, so the caller warns.
+    """
+    import numpy as np
+    current = se.build_face_boundaries()
+    faces, bounds = [], []
+    for k, target in enumerate(np.asarray(centroids, dtype=float)):
+        want = boundaries[k] if boundaries and k < len(boundaries) else None
+        idx = None
+        if want:
+            want = frozenset(want)
+            cands = [i for i, b in enumerate(current) if b == want]
+            if cands:
+                idx = min(cands, key=lambda i: _region_centroid_dist(
+                    all_regions[i], target))
+        if idx is None:
+            if want and lost is not None:
+                lost.append(k)
+            idx = _match_face_index_by_centroid(target, all_regions, op_name)
+        faces.append(all_faces[idx])
+        bounds.append(sorted(current[idx]) if idx < len(current) else [])
+    return faces, bounds
+
+
+def _lost_region_warning(history, entry_index: int, lost: list) -> None:
+    if lost and 0 <= entry_index < len(history._entries):
+        e = history._entries[entry_index]
+        e.warning = (f"{len(lost)} profile region(s) changed shape after an upstream "
+                     f"edit; used the nearest region instead — check the sketch "
+                     f"(free geometry may now cross itself)")
+        print(f"[Op] Entry {entry_index}: {e.warning}")
+
+
+def _region_centroid_dist(region, target) -> float:
+    import numpy as np
+    return float(np.linalg.norm(np.array(region[0]).mean(axis=0) - target))
 
 
 def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
@@ -224,6 +281,7 @@ def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
         body_id=body_id, face_ref=face_ref,
         shape_before=shape_before, shape_after=parent_shape)
 
+    new_ids = []
     if is_split:
         # New solids produced — add import entries for extras.
         from cad.op_types import ImportOp
@@ -231,8 +289,9 @@ def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
         for i, solid in enumerate(extra_solids):
             ws   = viewport.workspace
             name = ws.next_part_name()
-            new_body = ws.add_body(name, Compound(solid.wrapped))
+            new_body = ws.add_body(name, as_compound(solid))
             new_body.created_at_entry_id = parent_entry.entry_id
+            new_ids.append(new_body.id)
             # Fingerprint the child's solid so replay re-derives it from the
             # parent's full result by geometry, not fragile solid-iteration
             # order (the baked shape isn't persisted across save/load).
@@ -248,9 +307,11 @@ def _push_result(viewport, op_str: str, op_params: dict, body_id: str,
             viewport.history.push(
                 label=f"import  {name}", operation="import",
                 params=imp_params, body_id=new_body.id, face_ref=None,
-                shape_before=None, shape_after=Compound(solid.wrapped))
+                shape_before=None, shape_after=as_compound(solid))
 
     viewport._post_push_cascade(body_id)
+    if new_ids:
+        viewport._rebuild_bodies(set(new_ids))    # split children need meshes too
     print(f"[{op_str.capitalize()}] body='{viewport.workspace.bodies[body_id].name}' "
           f"({len(solids)} solid(s))")
     viewport.history_changed.emit()

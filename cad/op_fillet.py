@@ -50,14 +50,20 @@ class FaceFilletOp(Op):
                 result.append(mesh.topo_edges_occ[ei])
         return result
 
-    def _resolve_edge_refs(self, shape) -> list:
-        """Re-find edges via EdgeRef geometry fingerprints (replay-safe)."""
+    def _resolve_edge_refs(self, shape, history=None) -> list:
+        """Re-find edges via EdgeRef provenance/fingerprints (replay-safe)."""
         if not self.edge_refs:
             return []
         out = []
         for ref in self.edge_refs:
-            _, occ, _ = ref.find_in(shape)
+            occ = ref.resolve(history, shape)
             if occ is None:
+                if history is not None and ref.origin is not None \
+                        and ref.origin.faces_apart(history, shape):
+                    raise RuntimeError(
+                        "FaceFilletOp: a selected edge no longer exists — an upstream "
+                        "change removed it (e.g. an earlier fillet now runs over "
+                        "it); edit the fillet and reselect")
                 raise RuntimeError(
                     f"FaceFilletOp: could not relocate edge "
                     f"(midpoint={ref.midpoint}, length={ref.length:.3f})")
@@ -75,7 +81,7 @@ class FaceFilletOp(Op):
         # edge_indices are commit-time mesh handles; replay uses edge_refs
         # (geometry fingerprints) to relocate the same edges after upstream
         # edits perturb the topology.
-        edge_occs = self._resolve_edge_refs(shape)
+        edge_occs = self._resolve_edge_refs(shape, history)
         # Run in a killable child process: an OCCT fillet hang here would
         # otherwise freeze replay (e.g. on file open). FilletTimeout surfaces as
         # a normal per-entry error the replay loop already handles. edge_radii
@@ -119,8 +125,10 @@ class FaceFilletOp(Op):
         # matching fails after an upstream edit (e.g. draft applied to extrude).
         # Skip any edge that can't be fingerprinted (returns None).
         parent_occ = shape_before.wrapped
+        hist = viewport.history
         self.edge_refs = [
-            r for r in (EdgeRef.from_occ_edge(e, parent_shape=parent_occ)
+            r for r in (EdgeRef.for_edge(hist, self.source_body_id, e, parent_occ,
+                                         hist.cursor + 1)
                         for e in edge_occs)
             if r is not None
         ]
@@ -174,13 +182,7 @@ class FaceFilletOp(Op):
             "radius":         self.radius,
         }
         if self.edge_refs:
-            p["edge_refs"] = [
-                {"midpoint":  list(r.midpoint),
-                 "length":    r.length,
-                 "tangent":   list(r.tangent),
-                 "face_sigs": list(r.face_sigs)}
-                for r in self.edge_refs
-            ]
+            p["edge_refs"] = [r.to_dict() for r in self.edge_refs]
         if self.edge_radii and any(r is not None for r in self.edge_radii):
             # Tapers are stored as [r1, r2] lists; constants as floats; None
             # means "use the global radius".
@@ -195,13 +197,7 @@ class FaceFilletOp(Op):
             face_indices = list(params["face_indices"])
         else:
             face_indices = [int(params.get("face_idx", 0))]
-        edge_refs = [
-            EdgeRef(midpoint=tuple(r["midpoint"]),
-                    length=float(r["length"]),
-                    tangent=tuple(r["tangent"]),
-                    face_sigs=list(r.get("face_sigs", [])))
-            for r in params.get("edge_refs", [])
-        ]
+        edge_refs = [EdgeRef.from_dict(r) for r in params.get("edge_refs", [])]
         return cls(
             source_body_id = params.get("source_body_id", ""),
             face_indices   = face_indices,

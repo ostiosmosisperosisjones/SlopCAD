@@ -117,6 +117,40 @@ class DeleteCommand(HistoryCommand):
 
 
 # ---------------------------------------------------------------------------
+# ParamCommand  — add / edit / rename / remove a global parameter
+# ---------------------------------------------------------------------------
+
+class ParamCommand(HistoryCommand):
+    """Snapshot of the parameter table before/after an edit.  A rename also
+    rewrote expressions in history entries, so it's re-applied/undone via
+    History.rename_param before the table swap."""
+
+    def __init__(self, before: list, after: list,
+                 rename: tuple[str, str] | None = None, what: str = ""):
+        self.before = before
+        self.after  = after
+        self.rename = rename
+        self.what   = what
+
+    def _swap(self, vp, items, rename) -> None:
+        if rename:
+            vp.history.rename_param(*rename)
+        _, _, mutated = vp.history.replace_params(items)
+        vp._rebuild_bodies(mutated)
+        vp.history_changed.emit()
+
+    def apply(self, vp) -> None:
+        self._swap(vp, self.after, self.rename)
+
+    def revert(self, vp) -> None:
+        self._swap(vp, self.before,
+                   (self.rename[1], self.rename[0]) if self.rename else None)
+
+    def describe(self) -> str:
+        return self.what or "Edit parameter"
+
+
+# ---------------------------------------------------------------------------
 # CommandStack  — thin wrapper used by the viewport mixin
 # ---------------------------------------------------------------------------
 

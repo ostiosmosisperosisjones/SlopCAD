@@ -1,3 +1,4 @@
+from cad.solid_ref import as_compound
 from build123d import Compound
 from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Skin
 from OCP.GeomAbs import GeomAbs_Arc
@@ -46,7 +47,7 @@ def thicken_body_preview(body_occ, face_occ, thickness: float) -> Compound:
     op.Build()
     if not op.IsDone():
         raise RuntimeError("Thicken preview failed")
-    return Compound(op.Shape())
+    return as_compound(op.Shape())
 
 
 def thicken_face(body_occ, face_occ, thickness: float) -> Compound:
@@ -85,7 +86,7 @@ def thicken_face(body_occ, face_occ, thickness: float) -> Compound:
         op.Build()
         if not op.IsDone():
             raise RuntimeError("Thicken fuse failed")
-        result = Compound(op.Shape())
+        result = as_compound(op.Shape())
         log("Thicken", f"fuse result: {shape_stats(result)}")
         dump_brep("thicken_fuse_result", result)
         if not list(result.solids()):
@@ -102,7 +103,7 @@ def thicken_face(body_occ, face_occ, thickness: float) -> Compound:
         op.Build()
         if not op.IsDone():
             raise RuntimeError("Thicken cut failed")
-        result = Compound(op.Shape())
+        result = as_compound(op.Shape())
         log("Thicken", f"cut result : {shape_stats(result)}")
         dump_brep("thicken_cut_result", result)
         if not list(result.solids()):

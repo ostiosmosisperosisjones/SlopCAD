@@ -56,11 +56,21 @@ class SketchTool(Enum):
 # ---------------------------------------------------------------------------
 # Entity types
 # ---------------------------------------------------------------------------
+#
+# Every entity carries a `uid`: persisted, kept by copy.deepcopy (edit
+# snapshots), fresh for anything newly constructed (trim/divide pieces get
+# new ones).  Used for region identity — see SketchEntry.build_face_boundaries.
+
+def _new_uid() -> str:
+    import uuid
+    return uuid.uuid4().hex[:12]
+
 
 class LineEntity:
     """A 2-D line segment in sketch (u, v) coordinates (world mm)."""
     def __init__(self, p0: tuple[float, float], p1: tuple[float, float],
                  construction: bool = False):
+        self.uid = _new_uid()
         self.p0 = np.array(p0, dtype=np.float64)
         self.p1 = np.array(p1, dtype=np.float64)
         # Snap metadata: (entity_idx, SnapType) if endpoint was snapped to a
@@ -77,6 +87,7 @@ class LineEntity:
 class PointEntity:
     """A 2-D construction point in sketch (u, v) coordinates."""
     def __init__(self, pos: tuple[float, float]):
+        self.uid = _new_uid()
         self.pos = np.array(pos, dtype=np.float64)
 
     @property
@@ -99,6 +110,7 @@ class ArcEntity:
     def __init__(self, center: tuple[float, float], radius: float,
                  start_angle: float, end_angle: float,
                  construction: bool = False):
+        self.uid         = _new_uid()
         self.center      = np.array(center, dtype=np.float64)
         self.radius      = float(radius)
         self.start_angle = float(start_angle)
@@ -150,6 +162,7 @@ class SplineEntity:
     """
     def __init__(self, points, closed: bool = False,
                  construction: bool = False):
+        self.uid    = _new_uid()
         self.points = [np.array(p, dtype=np.float64) for p in points]
         self.closed = bool(closed)
         self.construction = bool(construction)
@@ -218,6 +231,7 @@ class ReferenceEntity:
     """
     def __init__(self, points: list[np.ndarray], source_type: str = 'edge',
                  occ_edges=None, source=None):
+        self.uid         = _new_uid()
         self.points      = [np.array(p, dtype=np.float64) for p in points]
         self.source_type = source_type
         self.occ_edges   = occ_edges
@@ -230,6 +244,7 @@ class ReferenceEntity:
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
+        result.uid         = self.uid
         result.points      = copy.deepcopy(self.points, memo)
         result.source_type = self.source_type
         result.occ_edges   = self.occ_edges   # shared reference, not copied
@@ -511,15 +526,341 @@ class SketchConstraint:
                    for 'diameter'  — radial offset of label beyond circle edge (mm)
     label_angle  : for 'diameter' only — angle (radians) of the diameter chord
                    measured from the +U axis.  None = default (0 = horizontal).
+    expr         : parameter expression driving *value* ("width/2"), or None.
+                   value stays the baked result; replay recomputes it.
+    expr_unit    : unit bare numbers in expr are read in (see cad/params.py).
     """
     def __init__(self, type: str, indices: tuple, value: float,
                  label_offset: float | None = None,
-                 label_angle:  float | None = None):
+                 label_angle:  float | None = None,
+                 expr: str | None = None, expr_unit: str = "mm"):
         self.type         = type
         self.indices      = tuple(indices)
         self.value        = float(value)
         self.label_offset: float | None = label_offset
         self.label_angle:  float | None = label_angle
+        self.expr:         str | None   = expr
+        self.expr_unit:    str          = expr_unit
+
+
+# Constraints that pin a line's *length*. Meaningless once the line is split
+# into pieces, so splice_entities drops them rather than forcing one piece
+# back to the original length.
+# ---------------------------------------------------------------------------
+# Included geometry follow-up
+# ---------------------------------------------------------------------------
+#
+# Includes (ReferenceEntity) enter the solver as FIXED geometry (solver
+# group 1, never solved for): user constraints may reference them
+# (parallel / perpendicular / equal / symmetric axis on a straight include),
+# and drawn points touching them are held there by hard coincidences.
+#
+# Touching is inferred, not stored: include_attachments() reads where each
+# drawn point sits on an include.  While editing, that's the current
+# coordinates.  On replay the includes move first, so replay infers before
+# re-projecting and hands the result to the solve (attachment_targets gives
+# the new spots, used as solver start points).  Needs no new metadata, so
+# files saved before this existed get the same behaviour.
+
+_ATTACH_TOL = 1e-3
+
+
+def _drawn_points(entities):
+    for i, ent in enumerate(entities):
+        if isinstance(ent, LineEntity):
+            yield (i, 'p0'), ent.p0
+            yield (i, 'p1'), ent.p1
+        elif isinstance(ent, ArcEntity):
+            yield (i, 'center'), ent.center
+            yield (i, 'p0'), ent.p0
+            yield (i, 'p1'), ent.p1
+
+
+def _fit_circle(pts: np.ndarray):
+    """(center, radius) if pts lie on a circle (tessellated circle include),
+    else None.  Algebraic least-squares fit, then a residual check."""
+    if len(pts) < 5:
+        return None
+    A = np.column_stack([pts[:, 0], pts[:, 1], np.ones(len(pts))])
+    b = (pts ** 2).sum(axis=1)
+    try:
+        (a, c, d), *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    center = np.array([a / 2, c / 2])
+    r2 = d + center @ center
+    if r2 <= 0:
+        return None
+    r = float(np.sqrt(r2))
+    if np.abs(np.linalg.norm(pts - center, axis=1) - r).max() > 1e-6 * max(r, 1.0):
+        return None
+    return center, r
+
+
+def _ref_circle(se, ref):
+    """(center_uv, radius) of a circular include, or None.  Arc/circle
+    includes keep only their endpoints in `points`; the curve is in
+    occ_edges (projected with se's current plane).  Tessellated circles
+    (no single OCC circle) are fitted from the polyline."""
+    edges = [e for e in (ref.occ_edges or []) if e is not None]
+    if len(edges) == 1:
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GeomAbs import GeomAbs_Circle
+        a = BRepAdaptor_Curve(edges[0])
+        if a.GetType() == GeomAbs_Circle:
+            circ = a.Circle()
+            ax = circ.Axis().Direction()
+            if abs(abs(float(np.dot([ax.X(), ax.Y(), ax.Z()], se.plane_normal))) - 1) > 1e-6:
+                return None                  # tilted: projects to an ellipse
+            loc = circ.Location()
+            d = np.array([loc.X(), loc.Y(), loc.Z()]) - se.plane_origin
+            return (np.array([d @ se.plane_x_axis, d @ se.plane_y_axis]),
+                    float(circ.Radius()))
+    return _fit_circle(np.asarray(ref.points, dtype=np.float64))
+
+
+def include_attachments(se) -> list:
+    """Drawn points lying on include geometry, as
+    [(key, ref_idx, kind, data, n_points)] with kind:
+      'v' vertex k of the include polyline          data = k
+      's' on segment k..k+1 at fraction t           data = (k, t)
+      'c' centre of a circular include              data = None
+      'a' on a circular include                     data = UV angle
+    """
+    refs = [(ri, r) for ri, r in enumerate(se.entities)
+            if isinstance(r, ReferenceEntity) and len(r.points) >= 1]
+    if not refs:
+        return []
+    circles = {}
+    out = []
+    for key, pt in _drawn_points(se.entities):
+        for ri, ref in refs:
+            pts = np.asarray(ref.points, dtype=np.float64)
+            # Circular includes attach by centre / angle only: their
+            # tessellation seam moves when OCC rebuilds the edge, so a
+            # vertex index would land somewhere else after replay.
+            if ri not in circles:
+                circles[ri] = _ref_circle(se, ref) if len(pts) >= 2 else None
+            if circles[ri] is not None:
+                hit = _attach_on_circle(pt, circles[ri])
+            else:
+                hit = _attach_on_polyline(pt, pts)
+            if hit is not None:
+                out.append((key, ri, *hit, len(pts)))
+                break
+    return out
+
+
+def _attach_on_circle(pt, circ):
+    if circ is None:
+        return None
+    center, r = circ
+    d = float(np.linalg.norm(pt - center))
+    if d < _ATTACH_TOL:
+        return 'c', None
+    if abs(d - r) < _ATTACH_TOL:
+        return 'a', float(np.arctan2(pt[1] - center[1], pt[0] - center[0]))
+    return None
+
+
+def _attach_on_polyline(pt, pts):
+    tol = _ATTACH_TOL
+    d = np.linalg.norm(pts - pt, axis=1)
+    k = int(d.argmin())
+    if d[k] < tol:
+        return 'v', k
+    if len(pts) >= 2:
+        a, b = pts[:-1], pts[1:]
+        ab = b - a
+        L2 = (ab ** 2).sum(axis=1)
+        t = np.where(L2 > 1e-24, ((pt - a) * ab).sum(axis=1) / np.maximum(L2, 1e-24), 0.0)
+        t = t.clip(0.0, 1.0)
+        dist = np.linalg.norm(a + t[:, None] * ab - pt, axis=1)
+        k = int(dist.argmin())
+        if dist[k] < tol:
+            return 's', (k, float(t[k]))
+    return None
+
+
+def attachment_targets(se, attachments) -> dict:
+    """{key: new uv} for each attachment, against the re-projected includes.
+    Attachments whose include changed point count (different tessellation)
+    or stopped being a circle are dropped — no follow-up, as before."""
+    targets = {}
+    circles = {}
+    for key, ri, kind, data, n_old in attachments:
+        ref = se.entities[ri]
+        pts = np.asarray(ref.points, dtype=np.float64)
+        if kind in ('v', 's'):
+            if len(pts) != n_old:
+                continue
+            if kind == 'v':
+                new = pts[data]
+            else:
+                k, t = data
+                new = pts[k] + t * (pts[k + 1] - pts[k])
+        else:
+            if ri not in circles:
+                circles[ri] = _ref_circle(se, ref)
+            if circles[ri] is None:
+                continue
+            center, r = circles[ri]
+            new = center if kind == 'c' else \
+                center + r * np.array([np.cos(data), np.sin(data)])
+        targets[key] = np.asarray(new, dtype=np.float64)
+    return targets
+
+
+_SPLIT_FUZZ = 1e-4      # mm; build_faces gap tolerance (see _build_faces_impl)
+
+
+def ref_line(ent):
+    """(first, last) point of a straight include, else None.  These become a
+    solver line that constraints can reference.  Body-edge includes are
+    tessellated (a straight edge can carry dozens of points), so
+    straightness comes from the OCC edge, or collinearity without one."""
+    if not isinstance(ent, ReferenceEntity) or len(ent.points) < 2:
+        return None
+    edges = [e for e in (ent.occ_edges or []) if e is not None]
+    if edges:
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GeomAbs import GeomAbs_Line
+        if len(edges) != 1 or BRepAdaptor_Curve(edges[0]).GetType() != GeomAbs_Line:
+            return None          # arc include: points are just its endpoints
+    else:
+        a, b = ent.points[0], ent.points[-1]
+        n = float(np.linalg.norm(b - a))
+        if n < 1e-9 or any(_dist_to_line(p, a, b) > 1e-6 * max(1.0, n)
+                           for p in ent.points[1:-1]):
+            return None
+    return ent.points[0], ent.points[-1]
+
+
+def line_ends(ent):
+    """(p0, p1) of a drawn line or straight include, else None."""
+    if isinstance(ent, LineEntity):
+        return ent.p0, ent.p1
+    return ref_line(ent)
+
+
+_LENGTH_CONSTRAINTS = ('distance', 'equal')
+
+# Constraints with no value: safe to drop when SolveSpace calls them
+# redundant, provided they still hold afterwards (see apply_constraints).
+_GEOMETRIC_CONSTRAINTS = ('horizontal', 'vertical', 'parallel',
+                          'perpendicular', 'equal')
+
+
+_OVERHEAD_DOF: int | None = None
+
+
+def _solver_overhead_dof() -> int:
+    """DOF of an empty system as _build_solver_system starts one (workplane
+    + the 3-D normal arcs need) — not user freedom.  Was hard-coded as 6,
+    missing the normal's 3, so no sketch ever read as fully constrained."""
+    global _OVERHEAD_DOF
+    if _OVERHEAD_DOF is None:
+        from python_solvespace import SolverSystem
+        s = SolverSystem()
+        s.create_2d_base()
+        s.add_normal_3d(1.0, 0.0, 0.0, 0.0)
+        s.solve()
+        _OVERHEAD_DOF = s.dof()
+    return _OVERHEAD_DOF
+
+
+def _dist_to_line(p, a, b) -> float:
+    d = b - a
+    n = float(np.linalg.norm(d))
+    if n < 1e-12:
+        return float(np.linalg.norm(p - a))
+    return abs(float(d[0] * (p - a)[1] - d[1] * (p - a)[0])) / n
+
+
+def splice_entities(sketch, start: int, stop: int, replacement: list) -> None:
+    """
+    Replace sketch.entities[start:stop] with *replacement* and keep every
+    index reference valid: constraint indices and line p0_snap/p1_snap.
+
+    Constraints and snaps are positional, so any tool that inserts, removes
+    or splits entities must go through here — otherwise they silently point
+    at whatever slid into the old slot.
+
+    Refs to a replaced entity are carried to the replacement piece nearest
+    the referenced geometry (constraints: the piece sharing the old p0, else
+    the first piece); length constraints on split entities are dropped; refs
+    with no surviving piece are dropped.
+    """
+    ents  = sketch.entities
+    old   = ents[start:stop]
+    delta = len(replacement) - (stop - start)
+
+    def _piece_near(old_ent, pt):
+        """Index (into replacement) of the piece nearest pt, or None."""
+        best, best_d = None, None
+        for k, p in enumerate(replacement):
+            if not hasattr(p, 'p0'):
+                continue
+            d = min(float(np.linalg.norm(p.p0 - pt)),
+                    float(np.linalg.norm(p.p1 - pt)))
+            if best_d is None or d < best_d:
+                best, best_d = k, d
+        return best
+
+    def _remap(j, pt=None):
+        if j < start:
+            return j
+        if j >= stop:
+            return j + delta
+        old_ent = old[j - start]
+        if pt is None:
+            pt = getattr(old_ent, 'p0', None)
+        k = _piece_near(old_ent, pt) if pt is not None else None
+        return None if k is None else start + k
+
+    # Pieces of a split line inherit the snap on whichever original endpoint
+    # they still sit on.
+    for o in old:
+        if not isinstance(o, LineEntity):
+            continue
+        for p in replacement:
+            if not isinstance(p, LineEntity):
+                continue
+            if o.p0_snap and p.p0_snap is None and np.allclose(p.p0, o.p0):
+                p.p0_snap = o.p0_snap
+            if o.p1_snap and p.p1_snap is None and np.allclose(p.p1, o.p1):
+                p.p1_snap = o.p1_snap
+
+    ents[start:stop] = replacement
+
+    new_cons = []
+    for con in getattr(sketch, 'constraints', []):
+        touched = any(start <= j < stop for j in con.indices)
+        if touched and con.type in _LENGTH_CONSTRAINTS and \
+                (len(replacement) != 1 or stop - start != 1):
+            continue
+        idx = tuple(_remap(j) for j in con.indices)
+        if None in idx:
+            continue
+        con.indices = idx
+        new_cons.append(con)
+    if hasattr(sketch, 'constraints'):
+        sketch.constraints[:] = new_cons
+
+    for ent in ents:
+        if not isinstance(ent, LineEntity):
+            continue
+        for which in ('p0', 'p1'):
+            snap = getattr(ent, f'{which}_snap')
+            if snap is None:
+                continue
+            split = start <= snap[0] < stop and len(replacement) > 1
+            if split and getattr(snap[1], 'name', '') == 'MIDPOINT':
+                # Midpoint of the *original* line no longer exists.
+                setattr(ent, f'{which}_snap', None)
+                continue
+            j = _remap(snap[0], getattr(ent, which))
+            setattr(ent, f'{which}_snap', None if j is None else (j, snap[1]))
 
 
 # ---------------------------------------------------------------------------
@@ -573,12 +914,17 @@ class SketchEntry:
     # Solver helpers
     # ------------------------------------------------------------------
 
-    def _build_solver_system(self):
+    def _build_solver_system(self, pins: dict | None = None):
         """
         Build and return a populated SolverSystem with all entities registered.
 
+        pins: {(entity_idx, which): uv} — the canonical point of each key
+        starts at uv instead of its stored position (callers drag it there;
+        see apply_constraints).
+
         Returns (sys, wp, nm3d, canon_map, slvs_pts, slvs_lines, slvs_arcs,
-                 arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents)
+                 arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents,
+                 ref_geo)
         or None if python-solvespace is unavailable.
 
         canon_map  : (entity_idx, 'p0'|'p1'|'center') → canonical key
@@ -591,6 +937,8 @@ class SketchEntry:
         arc_end_pts    : arc idx → solver point for arc end
         arc_dist_ents  : arc idx → solver distance entity (radius param) — only
                          for full circles (start_angle==0, end_angle==2π).
+        ref_geo    : include idx → {'verts': [pt], 'segs': [line],
+                     'center': pt|None, 'circle': circle|None}, all fixed.
         """
         try:
             from python_solvespace import SolverSystem
@@ -638,6 +986,12 @@ class SketchEntry:
                 _register_pt((i, 'p0'), ent.p0)
                 _register_pt((i, 'p1'), ent.p1)
 
+        start_at = {}
+        for key, uv in (pins or {}).items():
+            ck = canon_map.get(key)
+            if ck is not None:
+                start_at.setdefault(ck, uv)
+
         # Add solver points for each canonical key.
         slvs_pts: dict[tuple, object] = {}
         for i, ent in enumerate(self.entities):
@@ -652,6 +1006,7 @@ class SketchEntry:
             for key, pt in keys_pts:
                 ck = canon_map[key]
                 if ck not in slvs_pts:
+                    pt = start_at.get(ck, pt)
                     slvs_pts[ck] = slvs.add_point_2d(float(pt[0]), float(pt[1]), wp)
 
         def _pt(ei, which):
@@ -689,9 +1044,37 @@ class SketchEntry:
             else:
                 slvs_arcs[i] = slvs.add_arc(nm3d, cp, sp, ep, wp)
 
+        # Includes: fixed geometry in group 1 — the solver only solves the
+        # current group (0), so their params are constants.  A straight
+        # include (ref_line) also gets a first→last line in slvs_lines so
+        # parallel / perpendicular / equal / symmetric constraints can name it.
+        ref_geo: dict[int, dict] = {}
+        slvs.set_group(1)
+        for i, ent in enumerate(self.entities):
+            if not isinstance(ent, ReferenceEntity) or not ent.points:
+                continue
+            g = {'verts': [slvs.add_point_2d(float(p[0]), float(p[1]), wp)
+                           for p in ent.points],
+                 'segs': [], 'center': None, 'circle': None}
+            circ = _ref_circle(self, ent) if len(ent.points) >= 2 else None
+            if circ is not None:
+                c, r = circ
+                g['center'] = slvs.add_point_2d(float(c[0]), float(c[1]), wp)
+                g['circle'] = slvs.add_circle(
+                    nm3d, g['center'], slvs.add_distance(float(r), wp), wp)
+            else:
+                g['segs'] = [slvs.add_line_2d(a, b, wp)
+                             for a, b in zip(g['verts'], g['verts'][1:])]
+                if ref_line(ent) is not None:
+                    slvs_lines[i] = (g['segs'][0] if len(g['segs']) == 1 else
+                                     slvs.add_line_2d(g['verts'][0], g['verts'][-1], wp))
+            ref_geo[i] = g
+        slvs.set_group(0)
+
         return (slvs, wp, nm3d, canon_map, slvs_pts,
                 slvs_lines, slvs_arcs,
-                arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents)
+                arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents,
+                ref_geo)
 
     def _apply_constraints_to_solver(self, slvs, wp, canon_map,
                                      slvs_pts, slvs_lines, slvs_arcs,
@@ -771,32 +1154,45 @@ class SketchEntry:
         if not has_geometry:
             return ('none', -1)
 
-        built = self._build_solver_system()
-        if built is None:
+        def _solve(with_attachments: bool):
+            built = self._build_solver_system()
+            if built is None:
+                return None, None
+            slvs, wp, nm3d, canon_map, slvs_pts, slvs_lines, slvs_arcs, \
+                arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents, \
+                ref_geo = built
+            # Measure unconstrained DOF before adding any constraints.
+            if slvs.solve() != 0:
+                return None, None
+            if with_attachments:
+                self._emit_attachments(slvs, wp, canon_map, slvs_pts, ref_geo,
+                                       include_attachments(self))
+            self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
+                                              slvs_lines, slvs_arcs,
+                                              arc_dist_ents, self.constraints)
+            return slvs.solve(), slvs
+
+        result, slvs = _solve(with_attachments=True)
+        if result is None:
             return ('none', -1)
-        slvs, wp, nm3d, canon_map, slvs_pts, slvs_lines, slvs_arcs, \
-            arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents = built
-
-        # Measure unconstrained DOF before adding any constraints.
-        if slvs.solve() != 0:
-            return ('none', -1)
-        baseline_dof = slvs.dof()
-
-        self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
-                                          slvs_lines, slvs_arcs,
-                                          arc_dist_ents, self.constraints)
-
-        if slvs.solve() != 0:
+        if result != 0:
+            # Points held by includes can be redundant with user constraints
+            # (apply_constraints copes by dropping one); don't report that as
+            # over-constrained — judge the user's constraints alone.
+            result, slvs = _solve(with_attachments=False)
+            if result is None:
+                return ('none', -1)
+        if result != 0:
             return ('over', -1)
 
-        user_dof = slvs.dof() - 6  # subtract workplane overhead (always 6)
+        user_dof = slvs.dof() - _solver_overhead_dof()
         if user_dof <= 0:
             return ('fully', 0)
         return ('under', user_dof)
 
     def _add_snap_coincidences(self, slvs, wp, slvs_pts, slvs_lines,
                                slvs_arcs, canon_map, user_constraints=None,
-                               implicit_lengths=True):
+                               implicit_lengths=True, pinned=frozenset()):
         """Add geometric constraints for non-endpoint snap anchors.
 
         MIDPOINT snap on a line  → midpoint(ep, line)
@@ -808,6 +1204,10 @@ class SketchEntry:
         implicit_lengths: if False, skip adding distance() for line length
           preservation. Use False when re-solving a fully-established sketch
           (no_pin=True) to avoid redundant distance constraints.
+
+        pinned: (entity_idx, which) keys the caller pins to a new target
+          (include follow-up, see apply_constraints) — skip the stored-
+          coordinate fallback for those or the two pins fight.
 
         Returns a set of canonical keys that have coincident(point, circle)
         constraints — these must NOT be pinned with dragged() in the caller.
@@ -892,7 +1292,7 @@ class SketchEntry:
                             slvs.coincident(ep_sp, slvs_arcs[src_idx], wp)
                             circle_coincident_cks.add(ck)
                             _add_implicit_length()
-                        else:
+                        elif (i, which) not in pinned:
                             # Partial arc — pin to stored coordinate (fallback).
                             ref_uv = (ent.p0 if which == 'p0' else ent.p1).copy()
                             ref_sp = slvs.add_point_2d(float(ref_uv[0]),
@@ -901,7 +1301,8 @@ class SketchEntry:
                             slvs.distance(ep_sp, ref_sp, 0.0, wp)
 
                 elif snap_type in (SnapType.CENTER, SnapType.NEAREST,
-                                   SnapType.TANGENT, SnapType.MIDPOINT):
+                                   SnapType.TANGENT, SnapType.MIDPOINT) \
+                        and (i, which) not in pinned:
                     # Reference entity or unregistered arc — pin coordinate.
                     ref_uv = (ent.p0 if which == 'p0' else ent.p1).copy()
                     ref_sp = slvs.add_point_2d(float(ref_uv[0]),
@@ -915,11 +1316,12 @@ class SketchEntry:
         """Solve all constraints with no pinning. Alias for apply_all_constraints."""
         return self.apply_all_constraints()
 
-    def apply_all_constraints(self) -> bool:
-        """Solve all constraints simultaneously with no pinning."""
-        if not self.constraints:
-            return True
-        return self.apply_constraints(free_for_last=False, no_pin=True)
+    def apply_all_constraints(self, pins: dict | None = None,
+                              attachments: list | None = None) -> bool:
+        """Solve all constraints simultaneously with no pinning.
+        pins / attachments: see apply_constraints."""
+        return self.apply_constraints(free_for_last=False, no_pin=True,
+                                      pins=pins, attachments=attachments)
 
     def _free_cks_for_constraint(self, con, canon_map) -> set:
         """Return canonical keys that must be FREE when applying constraint `con`."""
@@ -942,151 +1344,282 @@ class SketchEntry:
                 free.add(canon_map[(i, 'p1')])
         return free
 
+    def _free_cks_for_last(self, canon_map) -> set:
+        """Canonical keys free to move for free_for_last: what the last
+        constraint needs, plus whatever earlier constraints and arc snaps
+        tie to those."""
+        free_cks = self._free_cks_for_constraint(self.constraints[-1], canon_map)
+
+        for con in self.constraints[:-1]:
+            if con.type == 'distance':
+                i = con.indices[0]
+                if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
+                    free_cks.add(canon_map[(i, 'p1')])
+
+        # Propagate freedom through geometric constraints.
+        changed = True
+        while changed:
+            changed = False
+            for con in self.constraints[:-1]:
+                if con.type in ('parallel', 'perpendicular', 'equal'):
+                    ref, mov = con.indices
+                    involved = {canon_map.get((ref, 'p0')), canon_map.get((ref, 'p1')),
+                                canon_map.get((mov, 'p0')), canon_map.get((mov, 'p1'))} - {None}
+                    if involved & free_cks:
+                        before = len(free_cks)
+                        free_cks |= involved
+                        changed = changed or len(free_cks) > before
+                elif con.type in ('horizontal', 'vertical'):
+                    i = con.indices[0]
+                    p0 = canon_map.get((i, 'p0'))
+                    p1 = canon_map.get((i, 'p1'))
+                    if p0 in free_cks or p1 in free_cks:
+                        before = len(free_cks)
+                        free_cks |= {p0, p1} - {None}
+                        changed = changed or len(free_cks) > before
+
+        # Propagate freedom to arc centers: if any line endpoint that is
+        # snap-connected to an arc is free, the arc center must also be
+        # free so the arc can move with the line system instead of being
+        # pinned in place by dragged(center_sp).
+        for i, ent in enumerate(self.entities):
+            if not isinstance(ent, LineEntity):
+                continue
+            for which, snap_meta in (('p0', getattr(ent, 'p0_snap', None)),
+                                     ('p1', getattr(ent, 'p1_snap', None))):
+                if snap_meta is None:
+                    continue
+                src_idx, _snap_type = snap_meta
+                if src_idx >= len(self.entities):
+                    continue
+                if not isinstance(self.entities[src_idx], ArcEntity):
+                    continue
+                ep_ck = canon_map.get((i, which))
+                center_ck = canon_map.get((src_idx, 'center'))
+                if ep_ck in free_cks and center_ck is not None:
+                    free_cks.add(center_ck)
+        return free_cks
+
+    def _emit_attachments(self, slvs, wp, canon_map, slvs_pts, ref_geo,
+                          attachments, drop=frozenset(), pinned=frozenset()):
+        """Hard-constrain drawn points to the include geometry they sit on.
+
+        A point on a segment or circle would be free to slide along it; when
+        replay moved the include (key in *pinned*, the point starts at its
+        old fraction / angle) it is held there with dragged() instead, so
+        it keeps its relative position.
+
+        Returns ({attachment idx: check(slvs) -> bool}, attached canonical
+        keys).  Attachments whose include changed point count or stopped
+        being a circle are skipped (nothing to hold them to)."""
+        checks, attached, seen, dragged = {}, set(), set(), set()
+
+        def _uv(sp):
+            return np.array(slvs.params(sp.params)[:2], dtype=np.float64)
+
+        for n, (key, ri, kind, data, n_pts) in enumerate(attachments):
+            g, ck = ref_geo.get(ri), canon_map.get(key)
+            if g is None or ck is None or ck not in slvs_pts:
+                continue
+            pt, target, check = slvs_pts[ck], None, None
+            if kind == 'v' and len(g['verts']) == n_pts and data < n_pts:
+                target = g['verts'][data]
+                check = (lambda s, p=pt, t=target:
+                         np.linalg.norm(_uv(p) - _uv(t)) < 1e-6)
+            elif kind == 's' and len(g['verts']) == n_pts and data[0] < len(g['segs']):
+                k = data[0]
+                target = g['segs'][k]
+                a, b = g['verts'][k], g['verts'][k + 1]
+                check = (lambda s, p=pt, a=a, b=b:
+                         _dist_to_line(_uv(p), _uv(a), _uv(b)) < 1e-6)
+            elif kind == 'c' and g['center'] is not None:
+                target = g['center']
+                check = (lambda s, p=pt, t=target:
+                         np.linalg.norm(_uv(p) - _uv(t)) < 1e-6)
+            elif kind == 'a' and g['circle'] is not None:
+                target = g['circle']
+                r = _ref_circle(self, self.entities[ri])[1]
+                check = (lambda s, p=pt, c=g['center'], r=r:
+                         abs(np.linalg.norm(_uv(p) - _uv(c)) - r) < 1e-6)
+            if target is None:
+                continue
+            attached.add(ck)
+            if (ck, id(target)) in seen or n in drop:
+                continue
+            seen.add((ck, id(target)))
+            if kind in ('s', 'a') and key in pinned:
+                if ck in dragged:
+                    continue
+                dragged.add(ck)
+                slvs.dragged(pt, wp)
+            else:
+                slvs.coincident(pt, target, wp)
+            checks[n] = check
+        return checks, attached
+
+    def _constraint_holds(self, con, slvs, canon_map, slvs_pts, ref_geo) -> bool:
+        """Whether a geometric constraint is satisfied by the solved points."""
+        def ends(i):
+            if i in ref_geo:
+                if ref_line(self.entities[i]) is None:
+                    return None
+                sps = [ref_geo[i]['verts'][0], ref_geo[i]['verts'][-1]]
+            elif (i, 'p0') in canon_map:
+                sps = [slvs_pts[canon_map[(i, 'p0')]], slvs_pts[canon_map[(i, 'p1')]]]
+            else:
+                return None
+            return [np.array(slvs.params(sp.params)[:2]) for sp in sps]
+
+        lines = [ends(i) for i in con.indices]
+        if any(l is None for l in lines):
+            return True               # not a line constraint the solver saw
+        d = [b - a for a, b in lines]
+        n = [np.linalg.norm(v) for v in d]
+        if min(n) < 1e-9:
+            return True
+        u = [v / m for v, m in zip(d, n)]
+        tol = 1e-6
+        if con.type == 'horizontal':
+            return abs(u[0][1]) < tol
+        if con.type == 'vertical':
+            return abs(u[0][0]) < tol
+        if con.type == 'parallel':
+            return abs(u[0][0] * u[1][1] - u[0][1] * u[1][0]) < tol
+        if con.type == 'perpendicular':
+            return abs(float(u[0] @ u[1])) < tol
+        if con.type == 'equal':
+            return abs(n[0] - n[1]) < tol * max(1.0, n[0])
+        return True
+
     def apply_constraints(self, free_for_last: bool = False,
-                          no_pin: bool = False) -> bool:
+                          no_pin: bool = False, pins: dict | None = None,
+                          attachments: list | None = None) -> bool:
         """
         Run the SolveSpace solver over all entities + constraints.
         Updates entity coordinates in-place.  Returns True on success.
 
         free_for_last: pin everything except what the last constraint needs to move.
         no_pin: skip all pinning — solver finds minimum motion (use when editing).
+        pins: {(entity_idx, which): uv} start positions for points attached
+              to moved includes (replay).
+        attachments: include_attachments() result; inferred from the current
+              coordinates when None.  Replay passes the ones it measured
+              before re-projecting the includes.
         """
-        if not self.constraints:
+        if attachments is None:
+            attachments = include_attachments(self)
+        if not self.constraints and not pins and not attachments:
             return True
+        pins = pins or {}
 
-        def _build_and_pin(implicit_lengths: bool):
-            built = self._build_solver_system()
+        def _attempt(implicit_lengths: bool, drop_att=frozenset(),
+                     drop_con=frozenset()):
+            """Build, constrain and solve once.  Returns (result, state)."""
+            built = self._build_solver_system(pins)
             if built is None:
-                return None, None, None
+                return None, None
             slvs, wp, nm3d, canon_map, slvs_pts, slvs_lines, slvs_arcs, \
-                arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents = built
+                arc_center_pts, arc_start_pts, arc_end_pts, arc_dist_ents, \
+                ref_geo = built
+            att_checks, attached_cks = self._emit_attachments(
+                slvs, wp, canon_map, slvs_pts, ref_geo, attachments, drop_att,
+                pinned=frozenset(pins))
+            # Points held by an include are fully or partly determined by
+            # it; a stored-coordinate pin or dragged() on top is redundant,
+            # which SolveSpace rejects.
             circ_cks = self._add_snap_coincidences(
                 slvs, wp, slvs_pts, slvs_lines, slvs_arcs, canon_map,
-                self.constraints, implicit_lengths=implicit_lengths)
-            return slvs, (wp, canon_map, slvs_pts, slvs_lines, slvs_arcs,
-                          arc_dist_ents), circ_cks
+                self.constraints, implicit_lengths=implicit_lengths,
+                pinned=frozenset(pins) | {k for k, *_ in attachments})
+            no_drag = set(attached_cks)
+            # Pinned points without a hard attachment: dragged() keeps them
+            # at their start (the target) when it can.
+            for key in pins:
+                ck = canon_map.get(key)
+                if ck is None or ck not in slvs_pts or ck in no_drag:
+                    continue
+                slvs.dragged(slvs_pts[ck], wp)
+                no_drag.add(ck)
 
-        slvs, extras, circle_coincident_cks = _build_and_pin(implicit_lengths=True)
-        if slvs is None:
-            return False
-        wp, canon_map, slvs_pts, slvs_lines, slvs_arcs, arc_dist_ents = extras
-
-        if free_for_last and self.constraints:
-            free_cks = self._free_cks_for_constraint(self.constraints[-1], canon_map)
-
-            for con in self.constraints[:-1]:
-                if con.type == 'distance':
-                    i = con.indices[0]
-                    if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
-                        free_cks.add(canon_map[(i, 'p1')])
-
-            # Propagate freedom through geometric constraints.
-            changed = True
-            while changed:
-                changed = False
-                for con in self.constraints[:-1]:
-                    if con.type in ('parallel', 'perpendicular', 'equal'):
-                        ref, mov = con.indices
-                        involved = {canon_map.get((ref, 'p0')), canon_map.get((ref, 'p1')),
-                                    canon_map.get((mov, 'p0')), canon_map.get((mov, 'p1'))} - {None}
-                        if involved & free_cks:
-                            before = len(free_cks)
-                            free_cks |= involved
-                            changed = changed or len(free_cks) > before
-                    elif con.type in ('horizontal', 'vertical'):
+            if free_for_last and self.constraints:
+                free_cks = self._free_cks_for_last(canon_map)
+                for ck, sp in slvs_pts.items():
+                    if ck not in free_cks and ck not in circ_cks and ck not in no_drag:
+                        slvs.dragged(sp, wp)
+            elif no_pin:
+                # Arcs have no implicit anchor — pin arc centers so the
+                # solver doesn't drift circles away from their snap-connected
+                # line endpoints.  coincident(point, circle) constraints still
+                # let endpoints slide along the circle.  Concentric circles
+                # share one canonical center; dragging it twice makes
+                # SolveSpace return result=1, so dedupe.
+                for i, ent in enumerate(self.entities):
+                    if not isinstance(ent, ArcEntity):
+                        continue
+                    ck = canon_map.get((i, 'center'))
+                    if ck and ck in slvs_pts and ck not in no_drag:
+                        slvs.dragged(slvs_pts[ck], wp)
+                        no_drag.add(ck)
+            else:
+                for con in self.constraints:
+                    if con.type == 'distance':
                         i = con.indices[0]
-                        p0 = canon_map.get((i, 'p0'))
-                        p1 = canon_map.get((i, 'p1'))
-                        if p0 in free_cks or p1 in free_cks:
-                            before = len(free_cks)
-                            free_cks |= {p0, p1} - {None}
-                            changed = changed or len(free_cks) > before
+                        if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
+                            ck = canon_map[(i, 'p0')]
+                            if ck not in no_drag:
+                                slvs.dragged(slvs_pts[ck], wp)
+                                no_drag.add(ck)
 
-            # Propagate freedom to arc centers: if any line endpoint that is
-            # snap-connected to an arc is free, the arc center must also be
-            # free so the arc can move with the line system instead of being
-            # pinned in place by dragged(center_sp).
-            from cad.sketch_tools.snap import SnapType
-            for i, ent in enumerate(self.entities):
-                if not isinstance(ent, LineEntity):
-                    continue
-                for which, snap_meta in (('p0', getattr(ent, 'p0_snap', None)),
-                                         ('p1', getattr(ent, 'p1_snap', None))):
-                    if snap_meta is None:
-                        continue
-                    src_idx, snap_type = snap_meta
-                    if src_idx >= len(self.entities):
-                        continue
-                    src = self.entities[src_idx]
-                    if not isinstance(src, ArcEntity):
-                        continue
-                    ep_ck = canon_map.get((i, which))
-                    center_ck = canon_map.get((src_idx, 'center'))
-                    if ep_ck in free_cks and center_ck is not None:
-                        free_cks.add(center_ck)
+            cons = [c for k, c in enumerate(self.constraints) if k not in drop_con]
+            self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
+                                              slvs_lines, slvs_arcs,
+                                              arc_dist_ents, cons)
+            result = slvs.solve()
+            state = (slvs, wp, canon_map, slvs_pts, slvs_lines, slvs_arcs,
+                     arc_dist_ents, ref_geo, att_checks)
+            return result, state
 
-            for ck, sp in slvs_pts.items():
-                if ck not in free_cks and ck not in circle_coincident_cks:
-                    slvs.dragged(sp, wp)
-        elif no_pin:
-            # no_pin=True: solver is free for all lines, but arcs have no
-            # implicit anchor — pin arc centers so the solver doesn't drift
-            # circles away from their snap-connected line endpoints.
-            # The coincident(point, circle) constraints still let endpoints
-            # slide freely along the circle surface.
-            # Concentric circles share one canonical center point (deduped by
-            # canon_map); pinning it once per circle drags the SAME point twice,
-            # which makes SolveSpace return result=1. Dedupe the drags.
-            dragged_cks: set = set()
-            for i, ent in enumerate(self.entities):
-                if not isinstance(ent, ArcEntity):
-                    continue
-                center_ck = canon_map.get((i, 'center'))
-                if center_ck and center_ck in slvs_pts and center_ck not in dragged_cks:
-                    slvs.dragged(slvs_pts[center_ck], wp)
-                    dragged_cks.add(center_ck)
-        else:
-            dragged_cks = set()
-            for con in self.constraints:
-                if con.type == 'distance':
-                    i = con.indices[0]
-                    if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
-                        ck = canon_map[(i, 'p0')]
-                        if ck not in dragged_cks:
-                            slvs.dragged(slvs_pts[ck], wp)
-                            dragged_cks.add(ck)
+        def _dropped_hold(state, drop_att, drop_con) -> bool:
+            """A constraint dropped as redundant must still hold after the
+            solve — otherwise it was a real conflict, not a redundancy."""
+            slvs, _, canon_map, slvs_pts, _, _, _, ref_geo, att_checks = state
+            ok = all(chk(slvs) for k, chk in att_checks.items() if k in drop_att)
+            for k in drop_con:
+                ok = ok and self._constraint_holds(
+                    self.constraints[k], slvs, canon_map, slvs_pts, ref_geo)
+            return ok
 
-        self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
-                                          slvs_lines, slvs_arcs,
-                                          arc_dist_ents, self.constraints)
-
-        result = slvs.solve()
+        result, state = _attempt(implicit_lengths=True)
+        if result is None:
+            return False
         if result != 0 and no_pin:
             # Implicit length constraints may be redundant when re-solving a
             # fully-constrained sketch (e.g., after re-entering). Retry without
             # them — the starting positions already satisfy the snap topology so
             # minimum-motion will preserve it without explicit length enforcement.
-            slvs2, extras2, circle_coincident_cks = _build_and_pin(
-                implicit_lengths=False)
-            if slvs2 is not None:
-                wp2, canon_map2, slvs_pts2, slvs_lines2, slvs_arcs2, arc_dist_ents2 = extras2
-                dragged_cks2: set = set()
-                for i, ent in enumerate(self.entities):
-                    if not isinstance(ent, ArcEntity):
-                        continue
-                    center_ck = canon_map2.get((i, 'center'))
-                    if center_ck and center_ck in slvs_pts2 and center_ck not in dragged_cks2:
-                        slvs2.dragged(slvs_pts2[center_ck], wp2)
-                        dragged_cks2.add(center_ck)
-                self._apply_constraints_to_solver(slvs2, wp2, canon_map2, slvs_pts2,
-                                                  slvs_lines2, slvs_arcs2,
-                                                  arc_dist_ents2, self.constraints)
-                result2 = slvs2.solve()
-                if result2 == 0:
-                    slvs, wp, canon_map, slvs_pts, slvs_lines, slvs_arcs, arc_dist_ents = \
-                        slvs2, wp2, canon_map2, slvs_pts2, slvs_lines2, slvs_arcs2, arc_dist_ents2
-                    result = 0
+            r2, s2 = _attempt(implicit_lengths=False)
+            if r2 == 0:
+                result, state = r2, s2
+        if result != 0 and attachments:
+            # Include attachments are often redundant with the user's own
+            # constraints (a line between two include vertices that is also
+            # marked horizontal) and SolveSpace rejects redundancy.  Drop one
+            # attachment or geometric constraint at a time; accept the first
+            # solve in which the dropped one still holds.
+            implicit = not no_pin
+            cands = [('a', k) for k in sorted(state[-1], reverse=True)] + \
+                    [('c', k) for k, c in enumerate(self.constraints)
+                     if c.type in _GEOMETRIC_CONSTRAINTS]
+            for kind, k in cands:
+                da = frozenset([k]) if kind == 'a' else frozenset()
+                dc = frozenset([k]) if kind == 'c' else frozenset()
+                r3, s3 = _attempt(implicit, da, dc)
+                if r3 == 0 and _dropped_hold(s3, da, dc):
+                    result, state = r3, s3
+                    break
 
+        slvs, wp, canon_map, slvs_pts, slvs_lines, slvs_arcs, arc_dist_ents, \
+            _ref_geo, _att_checks = state
         if result != 0:
             print(f"[Solver] FAILED result={result} dof={slvs.dof()} "
                   f"constraints={[c.type for c in self.constraints]} "
@@ -1557,16 +2090,43 @@ class SketchEntry:
         every history mutation, plus each extrude/revolve/loft replay), so
         results are memoized module-wide keyed by geometry fingerprint.
         """
+        faces, regions, _ = self._build_faces_cached(tol)
+        return list(faces), list(regions)
+
+    def build_face_boundaries(self, tol: float = 1e-3) -> list[frozenset]:
+        """Per face from build_faces(): the uids of the entities bounding it.
+
+        This is a region's identity across parameter changes and solver
+        re-solves, where centroids drift.  Ops store it next to
+        face_centroids (see op_base._match_sketch_faces).
+        """
+        _, _, bounds = self._build_faces_cached(tol)
+        profile = self._profile_entities()
+        return [frozenset(profile[k].uid for k in b) for b in bounds]
+
+    def _profile_entities(self) -> list:
+        """The entities _profile_fingerprint() hashes, in its order."""
+        return [e for e in self.entities
+                if isinstance(e, (LineEntity, ArcEntity, SplineEntity, ReferenceEntity))
+                and not getattr(e, "construction", False)]
+
+    def _build_faces_cached(self, tol: float):
         key = (self._profile_fingerprint(), float(tol))
         hit = _FACE_BUILD_CACHE.get(key)
         if hit is not None:
             _FACE_BUILD_CACHE.move_to_end(key)
-            return list(hit[0]), list(hit[1])
-        faces, regions = self._build_faces_impl(tol)
-        _FACE_BUILD_CACHE[key] = (faces, regions)
+            return hit
+        faces, regions, bounds = self._build_faces_impl(tol)
+        # Cache boundaries as positions among the fingerprinted entities, not
+        # raw indices: points/construction aren't in the key, so two sketches
+        # sharing a cache entry can number their entities differently.
+        ordinal = {id(e): k for k, e in enumerate(self._profile_entities())}
+        bounds = [tuple(ordinal[id(self.entities[i])] for i in b) for b in bounds]
+        hit = (faces, regions, bounds)
+        _FACE_BUILD_CACHE[key] = hit
         while len(_FACE_BUILD_CACHE) > _FACE_BUILD_CACHE_MAX:
             _FACE_BUILD_CACHE.popitem(last=False)
-        return list(faces), list(regions)
+        return hit
 
     def _build_faces_impl(self, tol: float = 1e-3) -> list:
         """
@@ -1578,8 +2138,9 @@ class SketchEntry:
         loops are also added as wire tools.  The largest output face (the
         unbounded remainder of the big plane) is discarded; all others are kept.
 
-        Returns (faces, regions) where regions[k] = (outer_uvs, [hole_uvs])
-        parallel to faces[k].
+        Returns (faces, regions, bounds) where regions[k] = (outer_uvs,
+        [hole_uvs]) and bounds[k] = sorted indices into self.entities of the
+        entities whose edges bound faces[k], all parallel to faces[k].
         """
         import math as _math
         from build123d import Face
@@ -1618,22 +2179,29 @@ class SketchEntry:
                             + float(u) * self.plane_x_axis
                             + float(v) * self.plane_y_axis).tolist())
 
-        def _single_edge_wire(edge):
+        # (tool edge, entity index) — lets each output face report which
+        # entities bound it (see build_face_boundaries).
+        tool_edges: list = []
+
+        def _single_edge_wire(edge, ei):
             wm = BRepBuilderAPI_MakeWire()
             wm.Add(edge)
-            return wm.Wire() if wm.IsDone() else None
+            if not wm.IsDone():
+                return None
+            tool_edges.append((edge, ei))
+            return wm.Wire()
 
         tools_list = TopTools_ListOfShape()
 
         # ── Drawn LineEntity edges — each edge is its own wire tool ──────
-        for ent in self.entities:
+        for ei, ent in enumerate(self.entities):
             # Construction geometry is reference-only — never part of a profile.
             if getattr(ent, "construction", False):
                 continue
             if isinstance(ent, LineEntity):
                 e = BRepBuilderAPI_MakeEdge(_uv3d(ent.p0[0], ent.p0[1]),
                                             _uv3d(ent.p1[0], ent.p1[1])).Edge()
-                w = _single_edge_wire(e)
+                w = _single_edge_wire(e, ei)
                 if w is not None:
                     tools_list.Append(w)
 
@@ -1659,7 +2227,7 @@ class SketchEntry:
                     else:
                         arc_edge = BRepBuilderAPI_MakeEdge(
                             geom_circ, ent.start_angle, ent.end_angle).Edge()
-                    w = _single_edge_wire(arc_edge)
+                    w = _single_edge_wire(arc_edge, ei)
                     if w is not None:
                         tools_list.Append(w)
                 except Exception as ex:
@@ -1678,7 +2246,7 @@ class SketchEntry:
                             arr.SetValue(i, _uv3d(p[0], p[1]))
                         curve = GeomAPI_PointsToBSpline(arr).Curve()
                         sp_edge = BRepBuilderAPI_MakeEdge(curve).Edge()
-                        w = _single_edge_wire(sp_edge)
+                        w = _single_edge_wire(sp_edge, ei)
                         if w is not None:
                             tools_list.Append(w)
                 except Exception as ex:
@@ -1760,7 +2328,7 @@ class SketchEntry:
                 return BRepBuilderAPI_MakeEdge(new_circ, u1, u2).Edge()
             return None
 
-        for ref in self.entities:
+        for ei, ref in enumerate(self.entities):
             if not isinstance(ref, ReferenceEntity):
                 continue
             valid_occ = [e for e in (ref.occ_edges or []) if e is not None]
@@ -1768,7 +2336,7 @@ class SketchEntry:
                 for occ_edge in valid_occ:
                     projected = _project_ref_edge(occ_edge)
                     if projected is not None:
-                        w = _single_edge_wire(projected)
+                        w = _single_edge_wire(projected, ei)
                         if w is not None:
                             tools_list.Append(w)
                     else:
@@ -1786,7 +2354,7 @@ class SketchEntry:
                             for j in range(len(pts_3d) - 1):
                                 em = BRepBuilderAPI_MakeEdge(pts_3d[j], pts_3d[j+1])
                                 if em.IsDone():
-                                    w = _single_edge_wire(em.Edge())
+                                    w = _single_edge_wire(em.Edge(), ei)
                                     if w is not None:
                                         tools_list.Append(w)
                         except Exception:
@@ -1798,12 +2366,12 @@ class SketchEntry:
                     em = BRepBuilderAPI_MakeEdge(_uv3d(pts[j][0], pts[j][1]),
                                                  _uv3d(pts[j+1][0], pts[j+1][1]))
                     if em.IsDone():
-                        w = _single_edge_wire(em.Edge())
+                        w = _single_edge_wire(em.Edge(), ei)
                         if w is not None:
                             tools_list.Append(w)
 
         if tools_list.IsEmpty():
-            return [], []
+            return [], [], []
 
         # ── Splitter: big face cut by all edge-wires ──────────────────────
         args_list = TopTools_ListOfShape()
@@ -1811,11 +2379,36 @@ class SketchEntry:
         splitter = BRepAlgoAPI_Splitter()
         splitter.SetArguments(args_list)
         splitter.SetTools(tools_list)
+        # Drawn ends meet includes only to solver precision (~1e-7, or ~1e-5
+        # for includes snapped to float32 mesh points in older files); an
+        # exact splitter leaves those gaps open and the region vanishes.
+        splitter.SetFuzzyValue(_SPLIT_FUZZ)
         splitter.Build()
 
         if not splitter.IsDone():
             print("[Sketch] build_faces: Splitter failed")
-            return [], []
+            return [], [], []
+
+        # Every output edge → the entity whose tool edge it came from.
+        from OCP.TopTools import TopTools_IndexedMapOfShape
+        from OCP.TopAbs import TopAbs_EDGE
+        edge_map = TopTools_IndexedMapOfShape()
+        edge_owner: list[int] = []
+        for tool_edge, ei in tool_edges:
+            pieces = splitter.Modified(tool_edge)
+            for piece in (pieces if pieces.Size() else [tool_edge]):
+                if edge_map.Add(piece) > len(edge_owner):
+                    edge_owner.append(ei)
+
+        def _face_entities(occ_face):
+            out = set()
+            ex = TopExp_Explorer(occ_face, TopAbs_EDGE)
+            while ex.More():
+                k = edge_map.FindIndex(ex.Current())
+                if k:
+                    out.add(edge_owner[k - 1])
+                ex.Next()
+            return tuple(sorted(out))
 
         # ── Extract faces, discard the unbounded remainder ────────────────
         def _wire_uv_pts(wire):
@@ -1870,7 +2463,7 @@ class SketchEntry:
             exp.Next()
 
         if not raw_faces:
-            return [], []
+            return [], [], []
 
         # Discard the largest face (unbounded big-plane remainder)
         raw_faces.sort(key=lambda x: x[1], reverse=True)
@@ -1878,6 +2471,7 @@ class SketchEntry:
 
         faces   = []
         regions = []
+        bounds  = []
         for occ_face, _ in bounded_faces:
             try:
                 wire_uvs = []
@@ -1892,10 +2486,11 @@ class SketchEntry:
                 wire_uvs.sort(key=_uv_area, reverse=True)
                 faces.append(Face(occ_face))
                 regions.append((wire_uvs[0], wire_uvs[1:]))
+                bounds.append(_face_entities(occ_face))
             except Exception as ex:
                 print(f"[Sketch] build_faces: region extraction error — {ex}")
 
-        return faces, regions
+        return faces, regions, bounds
 
 
 # ---------------------------------------------------------------------------

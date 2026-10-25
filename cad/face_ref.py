@@ -40,7 +40,9 @@ def _occ_face_props(occ_face):
 def _occ_face_normal(occ_face):
     """
     Return unit normal for a planar OCC face, or None if not planar.
-    Normal direction follows the face orientation in the shape.
+    This is the raw surface normal: it does NOT flip for a REVERSED face
+    (FaceRefs are saved with it, so don't change it — see
+    face_origin._outward_normal).
     """
     try:
         surf = BRepAdaptor_Surface(occ_face)
@@ -250,7 +252,60 @@ class FaceRef:
                 best_along_dist = along_dist
                 best_area_dist  = area_dist
 
+        if best_idx is None:
+            return self._find_moved_in(shape, normal_tol, area_cap)
         return best_idx, best_face
+
+    def _find_moved_in(self, shape, normal_tol: float, area_cap: float):
+        """Second pass for a face an upstream edit moved in its own plane
+        (a polygon side lengthened: its side face grows and its centroid
+        slides).  Same-direction normal, area within the cap, moved at most
+        half the face's size — and only when unambiguous: the runner-up
+        must be clearly farther, else (None, None) as before."""
+        ref_normal = np.array(self.normal)
+        ref_c = np.array(self.centroid_perp) + self.centroid_along * ref_normal
+        reach = 0.5 * np.sqrt(max(self.area, 0.0))
+        scored = []
+        for idx, face in enumerate(shape.faces()):
+            n = _occ_face_normal(face.wrapped)
+            if n is None or float(np.dot(n, ref_normal)) < 1.0 - normal_tol:
+                continue
+            centroid, area = _occ_face_props(face.wrapped)
+            if abs(area - self.area) > area_cap:
+                continue
+            d = float(np.linalg.norm(centroid - ref_c))
+            if d <= reach:
+                scored.append((d, idx, face))
+        scored.sort(key=lambda t: t[0])
+        if not scored or (len(scored) > 1 and scored[1][0] < 2 * scored[0][0] + 0.1):
+            return None, None
+        return scored[0][1], scored[0][2]
+
+    def find_coplanar_in(self, shape, normal_tol: float = 0.001,
+                         along_tol: float = 0.1) -> tuple[int, object] | tuple[None, None]:
+        """Looser fallback for find_in(): the same-direction face lying on the
+        ref's plane, nearest by perp centroid, ignoring area.
+
+        A side wall of an extrude keeps its plane when the depth changes but
+        its area and in-plane centroid move, so find_in() loses it.  Only
+        sketch planes use this.  Any face on that plane gives the right
+        plane, but a wrong pick would hurt more for op face refs.
+        """
+        ref_normal = np.array(self.normal)
+        ref_perp   = np.array(self.centroid_perp)
+        best = (None, None, float("inf"))
+        for idx, face in enumerate(shape.faces()):
+            n = _occ_face_normal(face.wrapped)
+            if n is None or float(np.dot(n, ref_normal)) < 1.0 - normal_tol:
+                continue
+            centroid, _ = _occ_face_props(face.wrapped)
+            along = float(np.dot(centroid, n))
+            if abs(along - self.centroid_along) > along_tol:
+                continue
+            perp_dist = float(np.linalg.norm(centroid - along * n - ref_perp))
+            if perp_dist < best[2]:
+                best = (idx, face, perp_dist)
+        return best[0], best[1]
 
     def explain_no_match(self, shape,
                          normal_tol: float = 0.001,

@@ -39,6 +39,49 @@ class EdgeRef:
     length:    float    # arc length mm
     tangent:   tuple    # (tx, ty, tz) unit vector, canonicalised
     face_sigs: list = field(default_factory=list)   # optional adjacency hint
+    # EdgeOrigin (cad.face_origin): the edge named through the sketch lines
+    # that made its faces — follows edits that move or turn it.
+    origin:    object = None
+
+    @classmethod
+    def for_edge(cls, history, body_id, occ_edge, parent_shape, before_index):
+        """from_occ_edge plus provenance (see resolve)."""
+        ref = cls.from_occ_edge(occ_edge, parent_shape=parent_shape)
+        if ref is not None:
+            from cad.face_origin import edge_origin
+            try:
+                ref.origin = edge_origin(history, body_id, parent_shape,
+                                         occ_edge, before_index)
+            except Exception as ex:
+                print(f"[EdgeRef] no provenance: {ex}")
+        return ref
+
+    def to_dict(self) -> dict:
+        d = {"midpoint": list(self.midpoint), "length": self.length,
+             "tangent": list(self.tangent), "face_sigs": list(self.face_sigs)}
+        if self.origin is not None:
+            d["origin"] = self.origin.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "EdgeRef":
+        from cad.face_origin import EdgeOrigin
+        return cls(midpoint=tuple(d["midpoint"]), length=float(d["length"]),
+                   tangent=tuple(d["tangent"]),
+                   face_sigs=list(d.get("face_sigs", [])),
+                   origin=EdgeOrigin.from_dict(d.get("origin")))
+
+    def resolve(self, history, shape):
+        """The TopoDS_Edge this names in shape now, or None. Provenance
+        first; with provenance the fuzzy face_sigs fallback is skipped — it
+        matches centroids/areas, not direction, and after an edit picked a
+        3mm edge 5mm away for a 1.9mm one (walker seed 14). No edge beats
+        the wrong edge."""
+        if self.origin is not None and history is not None:
+            occ = self.origin.find_in(history, shape)
+            if occ is not None:
+                return occ
+        return self.find_in(shape, use_face_sigs=self.origin is None)[1]
 
     # ------------------------------------------------------------------
     # Construction
@@ -99,6 +142,7 @@ class EdgeRef:
                 mid_tol: float = 0.1,
                 len_tol: float = 0.5,
                 tan_tol: float = 0.02,
+                use_face_sigs: bool = True,
                 ) -> tuple[int, object, list] | tuple[None, None, None]:
         """
         Find the matching edge in a build123d shape.
@@ -117,9 +161,7 @@ class EdgeRef:
 
         ref_mid = np.array(self.midpoint)
         ref_tan = np.array(self.tangent)
-        best_dist = float("inf")
-        best = (None, None, None)
-
+        cands = []                       # (dist, |dlen|, idx, occ, adaptor) — tangent matches
         for idx, edge in enumerate(shape.edges()):
             occ = edge.wrapped
             try:
@@ -131,12 +173,6 @@ class EdgeRef:
                 p   = adaptor.Value(umid)
                 mid = np.array([p.X(), p.Y(), p.Z()])
                 dist = float(np.linalg.norm(mid - ref_mid))
-                if dist > mid_tol:
-                    continue
-
-                length = GCPnts_AbscissaPoint.Length_s(adaptor, u0, u1, 1e-6)
-                if abs(length - self.length) > len_tol:
-                    continue
 
                 tv = adaptor.DN(umid, 1)
                 t  = np.array([tv.X(), tv.Y(), tv.Z()])
@@ -151,23 +187,44 @@ class EdgeRef:
                     if float(np.linalg.norm(t - ref_tan)) > tan_tol:
                         continue
 
-                if dist < best_dist:
-                    best_dist = dist
-                    best = (idx, occ, _sample_edge(adaptor, u0, u1))
-
+                length = GCPnts_AbscissaPoint.Length_s(adaptor, u0, u1, 1e-6)
+                cands.append((dist, abs(length - self.length), idx, occ, adaptor))
             except Exception:
                 continue
 
-        if best[0] is not None:
-            return best
+        def _hit(c):
+            a = c[4]
+            return c[2], c[3], _sample_edge(a, a.FirstParameter(), a.LastParameter())
+
+        strict = [c for c in cands if c[0] <= mid_tol and c[1] <= len_tol]
+        if strict:
+            return _hit(min(strict, key=lambda c: c[0]))
 
         # Geometric match missed — fall back to face-pair adjacency if we have
         # face signatures recorded. Survives upstream edits that move the edge
         # past mid_tol/len_tol but preserve the adjacent face roles.
-        if len(self.face_sigs) >= 2:
-            return _find_edge_via_face_sigs(shape, self.face_sigs[0], self.face_sigs[1])
+        if use_face_sigs and len(self.face_sigs) >= 2:
+            hit = _find_edge_via_face_sigs(shape, self.face_sigs[0], self.face_sigs[1])
+            if hit[0] is not None:
+                return hit
 
-        return best
+        # An upstream edit moved the edge (a body slid when the sketch under
+        # it changed).  Same direction, similar length, moved at most half
+        # its length — and only when unambiguous, like FaceRef._find_moved_in.
+        moved = sorted((c for c in cands
+                        if c[1] <= max(len_tol, 0.2 * self.length)
+                        and c[0] <= 0.5 * self.length),
+                       key=lambda c: c[0])
+        if moved and (len(moved) == 1 or moved[1][0] >= 2 * moved[0][0] + 0.1):
+            return _hit(moved[0])
+        return None, None, None
+
+
+def sample_occ_edge(occ_edge, n: int = 32) -> list:
+    """The world points replay re-projects an included edge from."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    adaptor = BRepAdaptor_Curve(occ_edge)
+    return _sample_edge(adaptor, adaptor.FirstParameter(), adaptor.LastParameter(), n)
 
 
 def _sample_edge(adaptor, u0: float, u1: float, n: int = 32) -> list:
@@ -312,11 +369,14 @@ class EdgeSource(ABC):
 # ---------------------------------------------------------------------------
 
 class BodyEdgeSource(EdgeSource):
-    """An edge on a specific body, re-found each replay via EdgeRef matching."""
+    """An edge on a specific body, re-found each replay — through the faces
+    it bounds when they have provenance (origin; follows rotation), else via
+    EdgeRef matching."""
 
-    def __init__(self, body_id: str, edge_ref: EdgeRef):
+    def __init__(self, body_id: str, edge_ref: EdgeRef, origin=None):
         self.body_id  = body_id
         self.edge_ref = edge_ref
+        self.origin   = origin             # cad.face_origin.EdgeOrigin | None
 
     def resolve(self, history, before_index: int) -> tuple[list, list | None]:
         shape = history._shape_for_body_at(self.body_id, before_index)
@@ -324,6 +384,10 @@ class BodyEdgeSource(EdgeSource):
             raise RuntimeError(
                 f"BodyEdgeSource: no shape for body '{self.body_id}' "
                 f"before history index {before_index}")
+        if self.origin is not None:
+            occ = self.origin.find_in(history, shape)
+            if occ is not None:
+                return sample_occ_edge(occ), [occ]
         _, occ_edge, world_pts = self.edge_ref.find_in(shape)
         if occ_edge is None:
             raise RuntimeError(

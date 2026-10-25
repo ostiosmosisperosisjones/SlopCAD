@@ -105,6 +105,27 @@ class SolidRef:
         return best_idx, best_solid
 
 
+def as_compound(shape):
+    """A build123d Compound holding *shape* (build123d or raw TopoDS).
+
+    Compound(solid.wrapped) is NOT this: it gives a Compound object whose
+    wrapped shape is still a bare TopoDS_Solid, and build123d's child
+    iteration on it is wrong — .volume reads 0 (found by the stress walker:
+    split/new-body children reloaded with zero volume)."""
+    from build123d import Compound
+    from OCP.BRep import BRep_Builder
+    from OCP.TopAbs import TopAbs_COMPOUND
+    from OCP.TopoDS import TopoDS_Compound
+    occ = getattr(shape, "wrapped", shape)
+    if occ.ShapeType() == TopAbs_COMPOUND:
+        return Compound(occ)
+    comp = TopoDS_Compound()
+    builder = BRep_Builder()
+    builder.MakeCompound(comp)
+    builder.Add(comp, occ)
+    return Compound(comp)
+
+
 def assign_solids_to_children(result, child_body_ids, child_solid_refs,
                               workspace, history=None, entry_index=None):
     """Distribute the solids of *result* among *child_body_ids* and set each
@@ -149,7 +170,7 @@ def assign_solids_to_children(result, child_body_ids, child_solid_refs,
                               None)
         if chosen is not None:
             used.add(chosen)
-            assigned[i] = Compound(solids[chosen].wrapped)
+            assigned[i] = as_compound(solids[chosen])
 
     if workspace is not None:
         for i, bid in enumerate(child_body_ids):

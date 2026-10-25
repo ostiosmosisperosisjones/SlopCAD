@@ -11,6 +11,7 @@ Preview computes the boolean live and swaps the result in for the first body.
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 
 
 _TOUCH_TOL = 1e-6  # mm — shapes within this distance are considered touching
@@ -91,7 +92,7 @@ def _shapes_share_volume(a, b) -> bool:
         op.Build()
         if not op.IsDone():
             return True   # OCC couldn't decide — don't flag the user
-        common = Compound(op.Shape())
+        common = as_compound(op.Shape())
         return any(s.volume > 1e-6 for s in common.solids())
     except Exception:
         return True
@@ -337,7 +338,7 @@ class BooleanMixin:
                 self.update()
                 return
 
-            result = Compound(bool_op.Shape())
+            result = as_compound(bool_op.Shape())
             from viewer.mesh import Mesh
             preview_mesh = Mesh(result)
             self.makeCurrent()

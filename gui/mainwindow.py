@@ -492,6 +492,17 @@ class MainWindow(QMainWindow):
         fidelity_act.triggered.connect(self._open_fidelity)
         view_menu.addAction(fidelity_act)
 
+        # Parameters live in the sidebar table; these make them reachable
+        # from the keyboard (and discoverable at all).
+        params_menu = menubar.addMenu("Parameters")
+        self._new_param_action = QAction("New parameter", self)
+        self._new_param_action.triggered.connect(self._new_parameter)
+        params_menu.addAction(self._new_param_action)
+        self._edit_params_action = QAction("Edit parameters", self)
+        self._edit_params_action.triggered.connect(self._edit_parameters)
+        params_menu.addAction(self._edit_params_action)
+        self._apply_menu_shortcuts()
+
         ops_menu = menubar.addMenu("Operations")
 
         extrude_act = QAction(
@@ -513,6 +524,35 @@ class MainWindow(QMainWindow):
             lambda: self._viewport and self._viewport.handle_redo())
         ops_menu.addAction(redo_act)
 
+    def _apply_menu_shortcuts(self):
+        self._new_param_action.setShortcut(prefs.key("new_parameter"))
+        self._edit_params_action.setShortcut(prefs.key("edit_parameters"))
+
+    def _show_params_panel(self):
+        """Make sure the sidebar's Parameters section has room, return it."""
+        sb = self._sidebar
+        if sb is None:
+            return None
+        sizes = sb.sizes()
+        if sizes[1] < 90:
+            take = 110 - sizes[1]
+            sizes[2] = max(60, sizes[2] - take)
+            sizes[1] = 110
+            sb.setSizes(sizes)
+        return sb.params_panel
+
+    def _new_parameter(self):
+        panel = self._show_params_panel()
+        if panel is not None:
+            panel._add()
+
+    def _edit_parameters(self):
+        panel = self._show_params_panel()
+        if panel is not None:
+            panel._table.setFocus()
+            if panel._table.rowCount():
+                panel._table.setCurrentCell(0, 1)
+
     def _open_prefs(self):
         from gui.prefs_dialog import PrefsDialog
         dlg = PrefsDialog(self)
@@ -528,6 +568,7 @@ class MainWindow(QMainWindow):
             self._sidebar.history_panel.refresh()
             # Rebuild op tooltips so a changed keybinding shows right away
             self._ops_toolbar.refresh_tooltips()
+            self._apply_menu_shortcuts()
 
     def _open_fidelity(self):
         if not self._viewport:
@@ -654,26 +695,9 @@ class MainWindow(QMainWindow):
             workspace = self._viewport.workspace
             history   = self._viewport.history
 
-        solids = list(compound.solids())
-        if not solids:
-            solids = [compound]
-
-        basename = os.path.splitext(os.path.basename(path))[0]
-
-        for i, solid in enumerate(solids):
-            name = (f"{basename}" if len(solids) == 1
-                    else f"{basename}  [{i+1}]")
-            body = workspace.add_body(name, solid)
-            history.push(
-                label        = f"Import  {name}",
-                operation    = "import",
-                params       = {"path": path, "solid_index": i},
-                body_id      = body.id,
-                face_ref     = None,
-                shape_before = None,
-                shape_after  = solid,
-            )
-            print(f"  Body '{name}' — {len(list(solid.faces()))} faces")
+        from cad.importer import push_step_import
+        for body, solid in push_step_import(workspace, history, compound, path):
+            print(f"  Body '{body.name}' — {len(list(solid.faces()))} faces")
 
         self._viewport.build_meshes()
         self._viewport.fit_camera_to_scene()
@@ -688,6 +712,9 @@ class MainWindow(QMainWindow):
         self._sync_proj_menu(vp.camera.ortho)
 
         sidebar = Sidebar(workspace, history)
+        sidebar.params_panel.controller = vp
+        from gui.expr_spinbox import ExprSpinBox
+        ExprSpinBox.param_source = vp.history.param_values
         sidebar.seek_requested.connect(vp.seek_history)
         sidebar.replay_requested.connect(vp.do_replay)
         sidebar.body_visibility_changed.connect(vp.set_body_visible)

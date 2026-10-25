@@ -72,8 +72,11 @@ def _plane_source_to_dict(ps) -> dict | None:
     # Recurse manually instead of using ps.to_dict() so we can attach face_ref
     # at every nested FacePlaneSource node, not just the top-level one.
     if isinstance(ps, FacePlaneSource):
-        return {"type": "face", "body_id": ps.body_id,
-                "face_ref": _face_ref_to_dict(ps.face_ref)}
+        d = {"type": "face", "body_id": ps.body_id,
+             "face_ref": _face_ref_to_dict(ps.face_ref)}
+        if getattr(ps, "origin", None) is not None:
+            d["origin"] = ps.origin.to_dict()
+        return d
     if isinstance(ps, OffsetPlaneSource):
         return {"type": "offset",
                 "distance": ps.distance,
@@ -91,9 +94,11 @@ def _plane_source_from_dict(d: dict | None):
         return WorldPlaneSource(d["axis"])
     if t == "face":
         from cad.plane_ref import FacePlaneSource
+        from cad.face_origin import face_origin_from_dict
         return FacePlaneSource(
             body_id  = d["body_id"],
             face_ref = _face_ref_from_dict(d.get("face_ref")),
+            origin   = face_origin_from_dict(d.get("origin")),
         )
     if t == "offset":
         from cad.plane_ref import OffsetPlaneSource
@@ -120,6 +125,10 @@ def _edge_source_to_dict(es) -> dict | None:
             "length":   er.length,
             "tangent":  _tup(er.tangent),
         }
+        if er.face_sigs:
+            d["edge_ref"]["face_sigs"] = list(er.face_sigs)
+        if es.origin is not None:
+            d["origin"] = es.origin.to_dict()
     return d
 
 
@@ -134,8 +143,11 @@ def _edge_source_from_dict(d: dict | None):
             midpoint = tuple(er_d["midpoint"]),
             length   = float(er_d["length"]),
             tangent  = tuple(er_d["tangent"]),
+            face_sigs = list(er_d.get("face_sigs", [])),
         )
-        return BodyEdgeSource(body_id=d["body_id"], edge_ref=er)
+        from cad.face_origin import EdgeOrigin
+        return BodyEdgeSource(body_id=d["body_id"], edge_ref=er,
+                              origin=EdgeOrigin.from_dict(d.get("origin")))
     if t == "sketch_edge":
         from cad.edge_ref import SketchEdgeSource
         if "source_entry_id" in d:
@@ -156,6 +168,20 @@ def _edge_source_from_dict(d: dict | None):
 # ---------------------------------------------------------------------------
 
 def _entity_to_dict(ent) -> dict:
+    d = _entity_to_dict_body(ent)
+    uid = getattr(ent, "uid", None)
+    if not uid:
+        # A uid lost in memory (a bug) mustn't make the project unsaveable.
+        # A fresh one only costs region identity, which falls back to
+        # centroid matching on the next replay.
+        from cad.sketch import _new_uid
+        uid = ent.uid = _new_uid()
+        print(f"[save] {type(ent).__name__} had no uid — assigned {uid}")
+    d["uid"] = uid
+    return d
+
+
+def _entity_to_dict_body(ent) -> dict:
     from cad.sketch import LineEntity, ArcEntity, PointEntity, ReferenceEntity, SplineEntity
     if isinstance(ent, LineEntity):
         d: dict[str, Any] = {
@@ -204,6 +230,13 @@ def _entity_to_dict(ent) -> dict:
 
 
 def _entity_from_dict(d: dict):
+    ent = _entity_from_dict_body(d)
+    if d.get("uid"):            # older files: keep the fresh one
+        ent.uid = d["uid"]
+    return ent
+
+
+def _entity_from_dict_body(d: dict):
     from cad.sketch import LineEntity, ArcEntity, PointEntity, ReferenceEntity, SplineEntity
     t = d["type"]
     if t == "line":
@@ -252,6 +285,9 @@ def _constraint_to_dict(c) -> dict:
         d["label_offset"] = c.label_offset
     if getattr(c, 'label_angle', None) is not None:
         d["label_angle"] = c.label_angle
+    if getattr(c, 'expr', None):
+        d["expr"]      = c.expr
+        d["expr_unit"] = c.expr_unit
     return d
 
 
@@ -263,6 +299,8 @@ def _constraint_from_dict(d: dict):
         value        = float(d["value"]),
         label_offset = d.get("label_offset"),
         label_angle  = d.get("label_angle"),
+        expr         = d.get("expr"),
+        expr_unit    = d.get("expr_unit", "mm"),
     )
 
 
@@ -366,6 +404,21 @@ def save(workspace, history, camera=None) -> bytes:
             "consumed_at_entry_id": body.consumed_at_entry_id,
         }
 
+    # Imported STEP files travel inside the .vc.  Imports saved before this
+    # (path only) get embedded now if the original is still on disk.
+    from cad.importer import embed_step
+    embeds = set()
+    for e in history._entries:
+        if e.operation != "import" or not e.params.get("path"):
+            continue
+        name = e.params.get("embed")
+        if name not in history.embedded:
+            name = embed_step(history, e.params["path"])
+            if name is None:
+                continue
+            e.params["embed"] = name
+        embeds.add(name)
+
     entries = []
     for e in history._entries:
         entries.append({
@@ -380,13 +433,14 @@ def save(workspace, history, camera=None) -> bytes:
         })
 
     doc: dict[str, Any] = {
-        "version":             2,
+        "version":             3,   # v3: "parameters" + bindings
         "bodies":              bodies,
         "active_body_id":      workspace._active_body_id,
         "part_counter":        workspace._part_counter,
         "world_plane_visible": workspace.world_plane_visible,
         "history_cursor":      history._cursor,
         "entries":             entries,
+        "parameters":          history.params.to_list(),
     }
 
     if camera is not None:
@@ -402,6 +456,8 @@ def save(workspace, history, camera=None) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("project.json", json_bytes)
+        for name in sorted(embeds):
+            zf.writestr(name, history.embedded[name])
     return buf.getvalue()
 
 
@@ -416,6 +472,8 @@ def load(data: bytes):
     buf = io.BytesIO(data)
     with zipfile.ZipFile(buf, "r") as zf:
         doc = json.loads(zf.read("project.json").decode("utf-8"))
+        embedded = {n: zf.read(n) for n in zf.namelist()
+                    if n.startswith("imports/")}
 
     from cad.workspace import Workspace, Body
     from cad.history import History
@@ -478,10 +536,20 @@ def load(data: bytes):
 
     history._cursor = int(doc.get("history_cursor", len(history._entries) - 1))
 
+    from cad.params import ParamTable
+    history.params = ParamTable.from_list(doc.get("parameters"))
+    history.embedded = embedded
+
     # v1 → v2 migration: SketchEdgeSource used to be keyed by an integer
     # history_idx.  Convert any deferred-legacy sources to their entry_id
     # now that all entries (with their UUIDs) are loaded.
     _migrate_legacy_sketch_edge_sources(history)
+
+    # Saved before SketchExtrudeOp.along_normal: the file's sketch planes are
+    # the ones its extrudes were authored against, so bind now, pre-replay.
+    from cad.op_extrude import bind_along_normal
+    for e in history._entries:
+        bind_along_normal(history, e)
 
     camera_dict = doc.get("camera")
     return workspace, history, camera_dict
@@ -524,12 +592,12 @@ def replay_all(workspace, history) -> list[str]:
 
     Returns a list of warning strings (non-fatal issues).
     """
-    from cad.importer import load_step
-    from build123d import Compound
+    from cad.importer import load_import_source, pick_import_solid
 
     warnings = []
 
     # Step 1: resolve import entries — load STEP files and set shape_after
+    compounds = {}      # one load per source file, not per solid
     for entry in history._entries:
         if entry.operation != "import":
             continue
@@ -538,13 +606,11 @@ def replay_all(workspace, history) -> list[str]:
         if path is None:
             # Split-body import — shape_after is set by parent op replay; skip
             continue
-        solid_index = int(params.get("solid_index", 0))
         try:
-            compound = load_step(path)
-            solids = list(compound.solids())
-            if not solids:
-                solids = [compound]
-            solid = solids[solid_index] if solid_index < len(solids) else solids[0]
+            key = params.get("embed") or path
+            if key not in compounds:
+                compounds[key] = load_import_source(history, params)
+            solid = pick_import_solid(compounds[key], params)
             entry.shape_after = solid
             # Also set source_shape on the body
             body = workspace.bodies.get(entry.body_id)

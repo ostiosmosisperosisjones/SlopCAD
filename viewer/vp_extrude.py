@@ -12,6 +12,7 @@ Expects self to have:
 """
 
 from __future__ import annotations
+from cad.solid_ref import as_compound
 
 from cad.units import format_op_label as _make_label
 
@@ -794,6 +795,7 @@ class ExtrudeMixin:
         start_off     = (panel._start_offset.mm_value() or 0.0) if panel else 0.0
         end_off       = (panel._end_offset.mm_value()   or 0.0) if panel else 0.0
         draft_angle   = panel.draft_angle_deg() if panel else 0.0
+        exprs         = _panel_bindings(panel, target_vertex is None)
 
         editing_idx = getattr(self, '_editing_history_idx', None)
         if editing_idx is not None:
@@ -814,6 +816,8 @@ class ExtrudeMixin:
             extra['end_offset'] = end_off
         if draft_angle != 0.0:
             extra['draft_angle'] = draft_angle
+        if exprs:
+            extra['exprs'] = exprs
 
         if editing_idx is not None:
             self._editing_history_idx = editing_idx  # restore for _commit
@@ -967,7 +971,7 @@ class ExtrudeMixin:
                     fu.SetArguments(lst_a); fu.SetTools(lst_b)
                     fu.SetRunParallel(True); fu.Build()
                     if fu.IsDone():
-                        tool_solid = Compound(fu.Shape())
+                        tool_solid = as_compound(fu.Shape())
         except Exception as ex:
             print(f"[Cut] Tool construction failed: {ex}"); return
 
@@ -1168,3 +1172,15 @@ def _extrude_distance_dialog(parent) -> float | None:
     if dlg.exec() != QDialog.DialogCode.Accepted:
         return None
     return spinbox.mm_value()
+
+
+def _panel_bindings(panel, distance_from_field: bool) -> dict:
+    """Parameter bindings from the extrude panel's fields → params["exprs"].
+    Distance is only bound when it came from the field (not a picked vertex)."""
+    if panel is None:
+        return {}
+    fields = {"start_offset": panel._start_offset,
+              "end_offset":   panel._end_offset}
+    if distance_from_field:
+        fields["distance"] = panel._spinbox
+    return {k: b for k, w in fields.items() if (b := w.binding())}
