@@ -391,18 +391,25 @@ class AnyFaceRef:
     used as a topology-aware fallback when strict centroid/area matching
     fails after upstream edits (e.g. draft turning a cylinder into a cone
     keeps its centroid roughly fixed but changes area by hundreds of mm²).
+
+    normal (optional, planar faces) — the fallback only accepts planes with
+    the same axis; without it a grown top face loses to a same-area face
+    pointing elsewhere.
     """
     centroid: tuple   # (x, y, z) world coords
     area:     float
     category: str = ""   # 'plane' | 'curved' | '' (legacy: unknown)
+    normal:   tuple | None = None   # raw plane normal (legacy/curved: None)
 
     @classmethod
     def from_occ_face(cls, occ_face) -> "AnyFaceRef":
         centroid, area = _occ_face_props(occ_face)
+        n = _occ_face_normal(occ_face)
         return cls(
             centroid = tuple(np.round(centroid, 6)),
             area     = round(float(area), 6),
             category = _surface_category(occ_face),
+            normal   = None if n is None else tuple(round(float(v), 6) for v in n),
         )
 
     def find_in(self, shape,
@@ -471,6 +478,11 @@ def _find_face_by_category_score(shape, ref: "AnyFaceRef"):
     for idx, face in enumerate(shape.faces()):
         if _surface_category(face.wrapped) != ref.category:
             continue
+        if ref.normal is not None:
+            # abs(): only the axis has to match — a replay may flip a face.
+            n = _occ_face_normal(face.wrapped)
+            if n is None or abs(float(np.dot(n, ref.normal))) < 0.99:
+                continue
         centroid, area = _occ_face_props(face.wrapped)
         cdist = float(np.linalg.norm(centroid - ref_c))
         adiff = abs(area - ref.area) / max(ref.area, 1.0)

@@ -190,12 +190,8 @@ class RevolveMixin:
         """Build the preview mesh in the background (one worker at a time,
         latest params win — see viewer/preview_job.py)."""
         def _compute():
-            from cad.operations.revolve import _do_revolve_solid
-            from viewer.preview_job import preview_mesh_data
-            meshes = [preview_mesh_data(
-                          _do_revolve_solid(f, axis_pt, axis_d, angle).wrapped, 1.0)
-                      for f in faces]
-            return [m[0] for m in meshes], [m[1] for m in meshes]
+            from viewer.preview_job import revolve_preview_meshes
+            return revolve_preview_meshes(faces, axis_pt, axis_d, angle)
         self._revolve_job().submit(_compute)
 
     def _on_revolve_mesh_done(self, result, error):
@@ -261,11 +257,9 @@ class RevolveMixin:
         self._revolve_arrow_dir    = tan_rot
 
     def _draw_revolve_preview(self):
-        from OpenGL.GL import (glDisable, glEnable, glColor4f, glBegin, glEnd,
-                               glVertex3f, glLineWidth, glBlendFunc,
+        from OpenGL.GL import (glDisable, glEnable, glBlendFunc,
                                GL_LIGHTING, GL_DEPTH_TEST, GL_CULL_FACE,
-                               GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-                               GL_TRIANGLES, GL_LINE_STRIP)
+                               GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         from cad.prefs import prefs as _prefs
         r, g, b = _prefs.op_preview_color
         op = _prefs.op_preview_opacity
@@ -279,23 +273,8 @@ class RevolveMixin:
 
         mesh_data = getattr(self, '_revolve_preview_mesh', None)
         if mesh_data:
-            tris_list, edges_list = mesh_data
-            glColor4f(r, g, b, op)
-            for tris in tris_list:
-                if tris:
-                    glBegin(GL_TRIANGLES)
-                    for (x, y, z) in tris:
-                        glVertex3f(x, y, z)
-                    glEnd()
-            glColor4f(*edge_color)
-            glLineWidth(1.4)
-            for edges in edges_list:
-                for pts in edges:
-                    glBegin(GL_LINE_STRIP)
-                    for (x, y, z) in pts:
-                        glVertex3f(x, y, z)
-                    glEnd()
-            glLineWidth(1.0)
+            from viewer.preview_job import draw_preview
+            draw_preview(mesh_data, (r, g, b, op), edge_color)
         else:
             self._draw_revolve_cage(edge_color)
 
@@ -633,9 +612,22 @@ class RevolveMixin:
         # Cut paths --------------------------------------------------------
         if is_cut:
             if sketch_idx is None:
-                # Face-driven revolve cuts not yet supported (would need
-                # CrossBodyRevolveCutOp to accept a body face profile).
-                print("[Revolve cut] Face-driven revolve cuts not supported yet.")
+                if not face_pairs:
+                    print("[Revolve cut] No profile selected.")
+                    return
+                body_id, face_idx = face_pairs[0]
+                if merge_body_id in (None, "__new_body__"):
+                    self._do_revolve_face_cut_all_intersecting(
+                        angle, axis_pt, axis_d, body_id, face_idx)
+                    return
+                CrossBodyRevolveCutOp(
+                    cut_body_id     = merge_body_id,
+                    source_body_id  = body_id,
+                    source_face_idx = face_idx,
+                    angle_deg       = angle,
+                    axis_point      = axis_pt,
+                    axis_dir        = axis_d,
+                ).commit(self, self._revolve_commit_extra)
                 return
             entries = self.history.entries
             if sketch_idx >= len(entries):
@@ -707,7 +699,7 @@ class RevolveMixin:
         from cad.cut_all import fan_out_cut
         from build123d import Compound
         from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 
         # Resolve sketch profile faces from the cache
         sketch_idx = self.history.id_to_index(sketch_id)
@@ -761,6 +753,41 @@ class RevolveMixin:
                     getattr(self, '_revolve_commit_extra', None),
                     op_label="Revolve cut")
 
+    def _do_revolve_face_cut_all_intersecting(self, angle_deg, axis_pt, axis_d,
+                                               body_id, face_idx):
+        """No-target face-driven revolve cut: one CrossBodyRevolveCutOp per
+        body the revolved face intersects. The source body goes last — cutting
+        it first would renumber the face the later ops revolve."""
+        import numpy as np
+        from cad.op_types import CrossBodyRevolveCutOp
+        from cad.operations.revolve import _do_revolve_solid
+        from cad.cut_all import fan_out_cut
+
+        src_shape = self.workspace.current_shape(body_id)
+        all_faces = list(src_shape.faces()) if src_shape is not None else []
+        if face_idx is None or face_idx >= len(all_faces):
+            print("[Revolve cut] Source face missing."); return
+        try:
+            tool_solid = _do_revolve_solid(
+                all_faces[face_idx], np.asarray(axis_pt, dtype=float),
+                np.asarray(axis_d, dtype=float), angle_deg)
+        except Exception as ex:
+            print(f"[Revolve cut] Tool construction failed: {ex}"); return
+
+        def build_op(bid: str):
+            return CrossBodyRevolveCutOp(
+                cut_body_id     = bid,
+                source_body_id  = body_id,
+                source_face_idx = face_idx,
+                angle_deg       = angle_deg,
+                axis_point      = list(axis_pt),
+                axis_dir        = list(axis_d),
+            )
+
+        fan_out_cut(self, tool_solid, build_op,
+                    getattr(self, '_revolve_commit_extra', None),
+                    op_label="Revolve cut", last=body_id)
+
     def _commit_revolve_edit_from_panel(self, editing_idx, angle, axis_pt,
                                          axis_d, merge_body_id, is_cut,
                                          sketch_idx, face_pairs):
@@ -777,19 +804,25 @@ class RevolveMixin:
         # instead of producing a single new_op.
         if is_cut and merge_body_id in (None, "__new_body__"):
             if sketch_idx is None:
-                print("[Revolve cut] Face-driven revolve cuts not supported yet.")
-                return
-            entries = self.history.entries
-            if sketch_idx >= len(entries):
-                return
-            sketch_id = entries[sketch_idx].entry_id
-            se = entries[sketch_idx].params.get("sketch_entry")
-            src_body_id = se.body_id if se else None
+                if not face_pairs:
+                    return
+                body_id, face_idx = face_pairs[0]
+                self._editing_history_idx = None
+                self._delete_revolve_edit_group(editing_idx)
+                self._do_revolve_face_cut_all_intersecting(
+                    angle, axis_pt, axis_d, body_id, face_idx)
+            else:
+                entries = self.history.entries
+                if sketch_idx >= len(entries):
+                    return
+                sketch_id = entries[sketch_idx].entry_id
+                se = entries[sketch_idx].params.get("sketch_entry")
+                src_body_id = se.body_id if se else None
 
-            self._editing_history_idx = None
-            self._delete_revolve_edit_group(editing_idx)
-            self._do_revolve_cut_all_intersecting(
-                angle, axis_pt, axis_d, sketch_id, src_body_id)
+                self._editing_history_idx = None
+                self._delete_revolve_edit_group(editing_idx)
+                self._do_revolve_cut_all_intersecting(
+                    angle, axis_pt, axis_d, sketch_id, src_body_id)
             new_idx = self.history.cursor
             ok, err, _ = self.history.replay_all_from(new_idx + 1)
             if not ok:
@@ -803,7 +836,17 @@ class RevolveMixin:
         # Cross-body cut with a specific target
         if is_cut:
             if sketch_idx is None:
-                print("[Revolve cut] Face-driven revolve cuts not supported yet.")
+                if not face_pairs:
+                    return
+                body_id, face_idx = face_pairs[0]
+                self._commit_revolve_edit(editing_idx, CrossBodyRevolveCutOp(
+                    cut_body_id     = merge_body_id,
+                    source_body_id  = body_id,
+                    source_face_idx = face_idx,
+                    angle_deg       = angle,
+                    axis_point      = axis_pt,
+                    axis_dir        = axis_d,
+                ))
                 return
             entries = self.history.entries
             sketch_id = entries[sketch_idx].entry_id
@@ -853,13 +896,14 @@ class RevolveMixin:
 
         self._commit_revolve_edit(editing_idx, new_op)
 
-    def _delete_revolve_edit_group(self, idx: int):
+    def _delete_revolve_edit_group(self, idx: int) -> list:
         """Seek to idx-1, delete the group, remove created bodies (shared
         bookkeeping used by both _commit_revolve_edit and the no-target cut
-        edit path)."""
+        edit path).  Returns the removed child body ids in child order, for
+        the re-commit to reuse (see _add_child_bodies)."""
         entries = self.history.entries
         if idx >= len(entries):
-            return
+            return []
         entry = entries[idx]
         entry.editing = False
 
@@ -886,13 +930,19 @@ class RevolveMixin:
         for bid in removable:
             if bid in self.workspace.bodies:
                 self.workspace.remove_body(bid)
+        return [bid for bid in child_body_ids if bid in removable]
 
     def _commit_revolve_edit(self, idx: int, new_op):
         self._editing_history_idx = None
         self._editing_body_id = None
-        self._delete_revolve_edit_group(idx)
+        preserved = self._delete_revolve_edit_group(idx)
 
-        new_op.commit(self, getattr(self, '_revolve_commit_extra', None))
+        # Re-commit into the same child body ids: downstream entries (a
+        # subtract using this revolve as its tool) reference them by id.
+        extra = dict(getattr(self, '_revolve_commit_extra', None) or {})
+        if preserved:
+            extra["_preserved_body_ids"] = preserved
+        new_op.commit(self, extra or None)
 
         new_idx = self.history.cursor
         ok, err, _ = self.history.replay_all_from(new_idx + 1)
@@ -923,7 +973,7 @@ def _extract_face_wires(faces) -> list:
     for face in faces:
         exp = TopExp_Explorer(face.wrapped, TopAbs_EDGE)
         while exp.More():
-            edge = TopoDS.Edge_s(exp.Current())
+            edge = TopoDS.Edge(exp.Current())
             try:
                 adp  = BRepAdaptor_Curve(edge)
                 disc = GCPnts_UniformAbscissa()

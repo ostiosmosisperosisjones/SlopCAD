@@ -11,6 +11,7 @@ from_sketch_ids defines the loft sweep direction.
 
 from __future__ import annotations
 from cad.solid_ref import as_compound
+from cad.kernel_pool import offload
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
@@ -65,28 +66,8 @@ class SketchLoftOp(Op):
             self.continuity = self._CONTINUITY_DEFAULT
 
     def _build_loft(self, faces: list):
-        """Build a solid via OCCT BRepOffsetAPI_ThruSections so we control
-        continuity + ruled at the OCCT level.  Returns a build123d Solid."""
-        from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
-        from OCP.GeomAbs import GeomAbs_Shape
-        from build123d import Solid
-
-        _CONT_MAP = {
-            "C0": GeomAbs_Shape.GeomAbs_C0,
-            "C1": GeomAbs_Shape.GeomAbs_C1,
-            "C2": GeomAbs_Shape.GeomAbs_C2,
-        }
-        cont = _CONT_MAP.get(self.continuity, GeomAbs_Shape.GeomAbs_C1)
-        is_solid = True
-
-        ts = BRepOffsetAPI_ThruSections(is_solid, bool(self.ruled))
-        ts.SetContinuity(cont)
-        for face in faces:
-            ts.AddWire(face.outer_wire().wrapped)
-        ts.Build()
-        if not ts.IsDone():
-            raise RuntimeError("BRepOffsetAPI_ThruSections failed to build")
-        return Solid(ts.Shape())
+        """The loft solid through `faces` (built in a kernel worker)."""
+        return _loft_task(faces, self.ruled, self.continuity)
 
     @property
     def from_sketch_ids(self) -> list[str]:
@@ -159,17 +140,7 @@ class SketchLoftOp(Op):
     # ------------------------------------------------------------------
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
-        from build123d import Compound
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
-        from OCP.TopTools import TopTools_ListOfShape
-
         faces = self._resolve_profile_faces(history, entry_index)
-        try:
-            loft_part = self._build_loft(faces)
-        except Exception as ex:
-            raise RuntimeError(f"SketchLoftOp: loft failed: {ex}")
-
-        loft_solid = as_compound(loft_part)
 
         # ---- Cut path ----
         if self.cut_body_id is not None:
@@ -177,14 +148,11 @@ class SketchLoftOp(Op):
             if target is None:
                 raise RuntimeError(
                     f"SketchLoftOp: no shape for cut target '{self.cut_body_id}'")
-            lst_a = TopTools_ListOfShape(); lst_a.Append(target.wrapped)
-            lst_b = TopTools_ListOfShape(); lst_b.Append(loft_solid.wrapped)
-            op = BRepAlgoAPI_Cut()
-            op.SetArguments(lst_a); op.SetTools(lst_b)
-            op.SetRunParallel(True); op.Build()
-            if not op.IsDone():
-                raise RuntimeError("SketchLoftOp: boolean cut failed")
-            return as_compound(op.Shape())
+            try:
+                return _loft_task(faces, self.ruled, self.continuity,
+                                  target, "cut")
+            except RuntimeError as ex:
+                raise RuntimeError(f"SketchLoftOp: {ex}")
 
         # ---- Merge path ----
         if self.merge_body_id is not None and not self.force_new_body:
@@ -192,16 +160,17 @@ class SketchLoftOp(Op):
             if target is None:
                 raise RuntimeError(
                     f"SketchLoftOp: no shape for merge target '{self.merge_body_id}'")
-            lst_a = TopTools_ListOfShape(); lst_a.Append(target.wrapped)
-            lst_b = TopTools_ListOfShape(); lst_b.Append(loft_solid.wrapped)
-            op = BRepAlgoAPI_Fuse()
-            op.SetArguments(lst_a); op.SetTools(lst_b)
-            op.SetRunParallel(True); op.Build()
-            if not op.IsDone():
-                raise RuntimeError("SketchLoftOp: boolean fuse failed")
-            return as_compound(op.Shape())
+            try:
+                return _loft_task(faces, self.ruled, self.continuity,
+                                  target, "fuse")
+            except RuntimeError as ex:
+                raise RuntimeError(f"SketchLoftOp: {ex}")
 
         # ---- New body ----
+        try:
+            loft_solid = as_compound(self._build_loft(faces))
+        except Exception as ex:
+            raise RuntimeError(f"SketchLoftOp: loft failed: {ex}")
         solids = list(loft_solid.solids())
         if not solids:
             raise RuntimeError("SketchLoftOp: result contains no solids")
@@ -253,10 +222,6 @@ class SketchLoftOp(Op):
         return shape_after
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
-        from build123d import Compound
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
-        from OCP.TopTools import TopTools_ListOfShape
-
         # Resolve profiles up-front so the panel-side error message is precise.
         faces = self._resolve_profile_faces(viewport.history,
                                             viewport.history.cursor + 1)
@@ -264,7 +229,7 @@ class SketchLoftOp(Op):
         op_params = self.to_params()
         if extra_params:
             op_params.update(extra_params)
-        build_loft = self._build_loft   # capture method ref for closures
+        ruled, continuity = self.ruled, self.continuity
 
         # ---- Cut path ----
         if self.cut_body_id is not None:
@@ -272,20 +237,11 @@ class SketchLoftOp(Op):
             if target_shape is None:
                 raise RuntimeError(
                     f"[Loft] No shape for cut target '{self.cut_body_id}'")
-            target_occ           = target_shape.wrapped
             original_solid_count = len(list(target_shape.solids()))
             cut_body_id          = self.cut_body_id
 
             def compute():
-                loft_part = build_loft(faces)
-                lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
-                lst_b = TopTools_ListOfShape(); lst_b.Append(loft_part.wrapped)
-                op = BRepAlgoAPI_Cut()
-                op.SetArguments(lst_a); op.SetTools(lst_b)
-                op.SetRunParallel(True); op.Build()
-                if not op.IsDone():
-                    raise RuntimeError("Boolean cut failed")
-                return as_compound(op.Shape())
+                return _loft_task(faces, ruled, continuity, target_shape, "cut")
 
             def finalize(result):
                 _push_result(viewport, "loft_cut", op_params, cut_body_id,
@@ -301,20 +257,11 @@ class SketchLoftOp(Op):
             target_shape = viewport.workspace.current_shape(self.merge_body_id)
             if target_shape is None:
                 raise RuntimeError("[Loft] Merge target has no shape.")
-            target_occ           = target_shape.wrapped
             original_solid_count = len(list(target_shape.solids()))
             merge_body_id        = self.merge_body_id
 
             def compute():
-                loft_part = build_loft(faces)
-                lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
-                lst_b = TopTools_ListOfShape(); lst_b.Append(loft_part.wrapped)
-                op = BRepAlgoAPI_Fuse()
-                op.SetArguments(lst_a); op.SetTools(lst_b)
-                op.SetRunParallel(True); op.Build()
-                if not op.IsDone():
-                    raise RuntimeError("Boolean fuse failed")
-                return as_compound(op.Shape())
+                return _loft_task(faces, ruled, continuity, target_shape, "fuse")
 
             def finalize(merged):
                 _push_result(viewport, "loft", op_params, merge_body_id,
@@ -328,8 +275,7 @@ class SketchLoftOp(Op):
         first_sketch_id = self.from_profiles[0][0]
 
         def compute():
-            loft_part = build_loft(faces)
-            return as_compound(loft_part)
+            return as_compound(_loft_task(faces, ruled, continuity))
 
         preserved_body_ids = list((extra_params or {}).get("_preserved_body_ids", []))
         if extra_params:
@@ -407,3 +353,46 @@ class SketchLoftOp(Op):
             continuity     = params.get("continuity", cls._CONTINUITY_DEFAULT),
             merged_from    = params.get("merged_from"),
         )
+
+
+def build_loft_solid(faces: list, ruled: bool, continuity: str):
+    """Build a solid via OCCT BRepOffsetAPI_ThruSections so we control
+    continuity + ruled at the OCCT level.  Returns a build123d Solid."""
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
+    from OCP.GeomAbs import GeomAbs_Shape
+    from build123d import Solid
+
+    _CONT_MAP = {
+        "C0": GeomAbs_Shape.GeomAbs_C0,
+        "C1": GeomAbs_Shape.GeomAbs_C1,
+        "C2": GeomAbs_Shape.GeomAbs_C2,
+    }
+    cont = _CONT_MAP.get(continuity, GeomAbs_Shape.GeomAbs_C1)
+    is_solid = True
+
+    ts = BRepOffsetAPI_ThruSections(is_solid, bool(ruled))
+    ts.SetContinuity(cont)
+    for face in faces:
+        ts.AddWire(face.outer_wire().wrapped)
+    ts.Build()
+    if not ts.IsDone():
+        raise RuntimeError("BRepOffsetAPI_ThruSections failed to build")
+    return Solid(ts.Shape())
+
+
+@offload()
+def _loft_task(faces, ruled, continuity, target=None, mode=None):
+    """The loft solid, or (mode "cut" / "fuse") target with it cut / fused."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
+    from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
+    loft_part = build_loft_solid(faces, ruled, continuity)
+    if mode is None:
+        return loft_part
+    lst_a = TopTools_ListOfShape(); lst_a.Append(target.wrapped)
+    lst_b = TopTools_ListOfShape(); lst_b.Append(loft_part.wrapped)
+    op = BRepAlgoAPI_Cut() if mode == "cut" else BRepAlgoAPI_Fuse()
+    op.SetArguments(lst_a); op.SetTools(lst_b)
+    op.SetRunParallel(True); op.Build()
+    if not op.IsDone():
+        raise RuntimeError(f"Boolean {mode} failed")
+    return as_compound(op.Shape())

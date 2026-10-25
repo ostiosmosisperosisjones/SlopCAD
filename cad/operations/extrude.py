@@ -2,6 +2,7 @@
 cad/operations/extrude.py
 """
 
+from cad.kernel_pool import offload
 from cad.solid_ref import as_compound
 import numpy as np
 from build123d import extrude, Plane, Face, Compound
@@ -40,6 +41,7 @@ def extrude_face(shape, face_idx: int, distance: float,
                                draft_angle=draft_angle)
 
 
+@offload()
 def extrude_face_direct(body_shape, face: Face, distance: float,
                         direction: np.ndarray | None = None,
                         start_offset: float = 0.0,
@@ -128,7 +130,24 @@ def _do_extrude_solid(face: Face, distance: float,
     vec = Vector(float(d[0] * effective_dist),
                  float(d[1] * effective_dist),
                  float(d[2] * effective_dist))
-    return b3d_extrude(face, amount=effective_dist, dir=vec, taper=float(draft_angle))
+    try:
+        return b3d_extrude(face, amount=effective_dist, dir=vec, taper=float(draft_angle))
+    except Exception:
+        if not draft_angle:
+            raise
+        # build123d 0.13 casts LocOpe_DPrism's result with TopoDS.Solid, but
+        # for BSpline-edged profiles DPrism returns a compound holding the
+        # solid → Standard_TypeMismatch.  Same call, take the solid out.
+        from math import cos, radians
+        from OCP.LocOpe import LocOpe_DPrism
+        from build123d import Compound as B3dCompound
+        prism = LocOpe_DPrism(face.wrapped,
+                              effective_dist / cos(radians(draft_angle)),
+                              radians(draft_angle))
+        solids = B3dCompound(prism.Shape()).solids()
+        if len(solids) != 1:
+            raise
+        return solids[0]
 
 
 def _do_extrude_boolean(shape, face: Face, distance: float,
@@ -204,7 +223,7 @@ def _do_extrude_boolean(shape, face: Face, distance: float,
 
 
 def _to_list(occ_shape):
-    from OCP.TopTools import TopTools_ListOfShape
+    from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
     lst = TopTools_ListOfShape()
     lst.Append(occ_shape)
     return lst

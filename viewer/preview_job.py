@@ -29,6 +29,8 @@ from typing import Callable
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from cad.kernel_pool import offload
+
 
 class PreviewJob(QObject):
     _finished = pyqtSignal(int, object, object)     # gen, result, error
@@ -95,6 +97,87 @@ def job_for(owner, attr: str, on_done: Callable, name: str,
     return job
 
 
+# The revolve / thicken / loft preview builds run whole in a kernel worker: OCCT
+# plus the triangle loops below hold the GIL, and on a PreviewJob thread that
+# starves the UI thread (GIL convoy).
+
+@offload()
+def revolve_preview_meshes(faces, axis_pt, axis_d, angle):
+    """Packed preview (see pack_preview) of every face revolved."""
+    from cad.operations.revolve import _do_revolve_solid
+    meshes = [preview_mesh_data(
+                  _do_revolve_solid(f, axis_pt, axis_d, angle).wrapped, 1.0)
+              for f in faces]
+    return pack_preview([m[0] for m in meshes], [m[1] for m in meshes])
+
+
+@offload()
+def thicken_preview_meshes(face_occs, thickness: float):
+    """(packed preview, [error str | None]) — one error slot per face."""
+    from cad.operations.thicken import thicken_face_preview
+    tris_list, edges_list, errors = [], [], []
+    for fo in face_occs:
+        try:
+            tris, edges = preview_mesh_data(
+                thicken_face_preview(fo, thickness).wrapped, 0.15)
+            tris_list.append(tris)
+            edges_list.append(edges)
+            errors.append(None)
+        except Exception as ex:
+            errors.append(str(ex))
+    return pack_preview(tris_list, edges_list), errors
+
+
+@offload()
+def loft_preview_meshes(faces, ruled: bool, continuity: str):
+    """Packed preview of the loft through `faces`."""
+    from cad.op_loft import build_loft_solid
+    tris, edges = preview_mesh_data(
+        build_loft_solid(faces, ruled, continuity).wrapped, 0.15, 24)
+    return pack_preview([tris], [edges])
+
+
+def pack_preview(tris_list, edges_list):
+    """(tri verts, line-segment verts) as float32 Nx3 arrays, ready for
+    draw_preview; None when there is nothing to draw."""
+    import numpy as np
+    tris = [t for t in tris_list if t]
+    if not tris:
+        return None
+    tri_arr = np.ascontiguousarray(np.concatenate(
+        [np.asarray(t, dtype=np.float32) for t in tris]))
+    segs = []
+    for edges in edges_list:
+        for pts in edges:
+            a = np.asarray(pts, dtype=np.float32)
+            if len(a) >= 2:
+                segs.append(np.stack([a[:-1], a[1:]], axis=1).reshape(-1, 3))
+    line_arr = (np.ascontiguousarray(np.concatenate(segs)) if segs
+                else np.zeros((0, 3), np.float32))
+    return tri_arr, line_arr
+
+
+def draw_preview(packed, fill_color, edge_color):
+    """Draw a pack_preview result (blend/depth state is the caller's)."""
+    from OpenGL.GL import (glColor4f, glLineWidth, glEnableClientState,
+                           glDisableClientState, glVertexPointer, glDrawArrays,
+                           GL_VERTEX_ARRAY, GL_FLOAT, GL_TRIANGLES, GL_LINES)
+    tri_arr, line_arr = packed
+    glEnableClientState(GL_VERTEX_ARRAY)
+    try:
+        glColor4f(*fill_color)
+        glVertexPointer(3, GL_FLOAT, 0, tri_arr)
+        glDrawArrays(GL_TRIANGLES, 0, len(tri_arr))
+        if len(line_arr):
+            glColor4f(*edge_color)
+            glLineWidth(1.4)
+            glVertexPointer(3, GL_FLOAT, 0, line_arr)
+            glDrawArrays(GL_LINES, 0, len(line_arr))
+            glLineWidth(1.0)
+    finally:
+        glDisableClientState(GL_VERTEX_ARRAY)
+
+
 def preview_mesh_data(wrapped, deflection: float, edge_samples: int = 16):
     """(tris, edges) for a TopoDS_Shape: tris is a flat list of xyz triples
     (3 per triangle), edges a list of sampled polylines."""
@@ -112,7 +195,7 @@ def preview_mesh_data(wrapped, deflection: float, edge_samples: int = 16):
     tris = []
     exp = TopExp_Explorer(wrapped, TopAbs_FACE)
     while exp.More():
-        tri = BRep_Tool.Triangulation_s(TopoDS.Face_s(exp.Current()), identity)
+        tri = BRep_Tool.Triangulation_s(TopoDS.Face(exp.Current()), identity)
         if tri is not None:
             for j in range(1, tri.NbTriangles() + 1):
                 for ni in tri.Triangle(j).Get():
@@ -124,7 +207,7 @@ def preview_mesh_data(wrapped, deflection: float, edge_samples: int = 16):
     exp = TopExp_Explorer(wrapped, TopAbs_EDGE)
     while exp.More():
         try:
-            adp  = BRepAdaptor_Curve(TopoDS.Edge_s(exp.Current()))
+            adp  = BRepAdaptor_Curve(TopoDS.Edge(exp.Current()))
             disc = GCPnts_UniformAbscissa()
             disc.Initialize(adp, edge_samples)
             if disc.IsDone() and disc.NbPoints() >= 2:

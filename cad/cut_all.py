@@ -30,7 +30,8 @@ def bboxes_overlap(a, b, tol: float = 0.0) -> bool:
 
 
 def fan_out_cut(viewport, tool_solid, build_op: Callable[[str], Any],
-                extra: dict | None, op_label: str = "Cut") -> int:
+                extra: dict | None, op_label: str = "Cut",
+                last: str | None = None) -> int:
     """
     Fan out a "no-target cut" across every body whose bbox overlaps the tool.
 
@@ -39,6 +40,7 @@ def fan_out_cut(viewport, tool_solid, build_op: Callable[[str], Any],
     build_op   : callable (body_id) → Op that cuts that body
     extra      : extra params forwarded to op.commit()
     op_label   : tag used in console output ("Cut" / "Revolve cut" / …)
+    last       : body to cut after all others (a face-driven tool's source)
 
     Returns the number of bodies that were actually cut (i.e. their
     volume changed).  Entries pushed for bodies that didn't change
@@ -55,6 +57,10 @@ def fan_out_cut(viewport, tool_solid, build_op: Callable[[str], Any],
                 candidates.append(bid)
         except Exception:
             candidates.append(bid)   # bbox failed — let the cut decide
+
+    if last in candidates:
+        candidates.remove(last)
+        candidates.append(last)
 
     if not candidates:
         print(f"[{op_label}] No-target: tool doesn't intersect any body.")

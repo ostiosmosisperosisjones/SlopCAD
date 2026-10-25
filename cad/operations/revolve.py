@@ -2,6 +2,7 @@
 cad/operations/revolve.py
 """
 
+from cad.kernel_pool import offload
 from cad.solid_ref import as_compound
 import numpy as np
 from build123d import revolve, Plane, Face, Compound, Axis, Vector, Location
@@ -9,6 +10,7 @@ from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut
 from OCP.gp import gp_Ax1, gp_Pnt, gp_Dir
 
 
+@offload()
 def revolve_face_direct(body_shape, face: Face, axis_point: np.ndarray,
                          axis_dir: np.ndarray, angle_deg: float):
     """
@@ -73,7 +75,7 @@ def _do_revolve_boolean(shape, revolved_solid, angle_deg: float):
 
 
 def _to_list(occ_shape):
-    from OCP.TopTools import TopTools_ListOfShape
+    from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
     lst = TopTools_ListOfShape()
     lst.Append(occ_shape)
     return lst

@@ -6,6 +6,8 @@ Vertices are exactly as OCCT/build123d gives them (millimeters).
 The camera fits itself to the scene bounding box instead.
 """
 
+import threading
+
 import numpy as np
 from ocp_tessellate.tessellator import tessellate
 from OCP.BRep import BRep_Tool
@@ -13,97 +15,58 @@ from OCP.TopLoc import TopLoc_Location
 from OpenGL.GL import *
 
 
+# Draft meshes are never finer than the default fidelity (cad/prefs.py).
+_DRAFT_KNOBS = (0.0005, 0.02, 0.15)
+
+
+def fidelity_knobs(draft: bool = False) -> tuple:
+    """(deviation scale, deviation floor, angular tol) from the live prefs;
+    draft=True coarsens each to at most the default fidelity."""
+    from cad.prefs import prefs
+    knobs = (float(prefs.mesh_deviation_scale),
+             float(prefs.mesh_deviation_floor),
+             float(prefs.mesh_angular_tol))
+    if draft:
+        knobs = tuple(max(k, d) for k, d in zip(knobs, _DRAFT_KNOBS))
+    return knobs
+
+
 class Mesh:
-    def __init__(self, shape, deviation: float | None = None):
-        # Use a stable cache key based on the shape's OCCT hash so the
-        # tessellator can reuse cached results for identical shapes (e.g. undo/redo).
-        cache_key = f"mesh_{hash(shape.wrapped)}"
-        self.occt_faces = list(shape.faces())
-        self.shape      = shape
-
-        # Tessellation deviation is a CHORDAL tolerance in millimetres, so a
-        # fixed absolute value (e.g. 0.01) demands a fraction-of-a-percent
-        # relative precision on a large part — which explodes the triangle
-        # count and tessellation time (a ~1.9 m part hit 800k triangles / 25 s
-        # at deviation=0.01). Scale the deviation to the part's bounding-box
-        # diagonal so quality is roughly constant regardless of size, with an
-        # absolute floor so small parts stay crisp and an angular tolerance
-        # that keeps curves smooth either way.
-        from cad.prefs import prefs
-        diag = _bbox_diagonal(shape)
-        # Fidelity knobs (live-tunable via prefs). Deviation scales with part
-        # size so quality is roughly size-independent, with an absolute floor so
-        # small parts stay crisp. Angular tolerance drives normal smoothness on
-        # curves — the dominant "faceted" factor for shading.
-        dev_scale = max(1e-5, float(prefs.mesh_deviation_scale))
-        dev_floor = max(1e-4, float(prefs.mesh_deviation_floor))
-        ang_tol   = max(0.02, float(prefs.mesh_angular_tol))
-        base = max(dev_floor, diag * dev_scale)
-        # Retry with progressively looser tolerances if the tessellator returns
-        # a face count that doesn't match shape.faces() (ocp_tessellate bug).
-        # A caller-supplied deviation skips to that quality tier immediately.
-        _attempts = [
-            dict(deviation=base,       quality=base,       angular_tolerance=ang_tol),
-            dict(deviation=base * 3,   quality=base * 3,   angular_tolerance=ang_tol * 1.7),
-            dict(deviation=base * 8,   quality=base * 8,   angular_tolerance=ang_tol * 2.7),
-        ]
-        if deviation is not None:
-            _attempts = [dict(deviation=deviation, quality=deviation,
-                              angular_tolerance=deviation * 5)] + _attempts
+    def __init__(self, shape, deviation: float | None = None,
+                 draft: bool = False):
+        # Tessellation is CPU-heavy OCCT + Python that holds the GIL; run on a
+        # thread it starves the UI thread's GL calls (GIL convoy → multi-second
+        # frames).  So it runs in a kernel worker and only arrays come back.
+        # Fidelity knobs are read here: the worker's prefs aren't the live ones.
+        #
+        # draft=True: at a fidelity finer than the default (20-30x the cost on
+        # curved bodies) build a default-fidelity mesh now; is_draft tells the
+        # viewport to refine it in the background (Viewport._schedule_refine).
+        from cad import kernel_pool as kp
+        knobs = fidelity_knobs()
+        self.is_draft = False
+        if draft and deviation is None and _cached_data(shape.wrapped, None, knobs) is None:
+            draft_knobs = fidelity_knobs(draft=True)
+            if draft_knobs != knobs:
+                knobs = draft_knobs
+                self.is_draft = True
         from cad.profiler import profiler
-        tess = None
-        for attempt in _attempts:
-            with profiler.section("mesh.tessellate"):
-                t = tessellate(shape.wrapped, cache_key=cache_key, **attempt)
-            tri_per_face = np.array(t['triangles_per_face'], dtype=np.int32)
-            if len(tri_per_face) == len(self.occt_faces):
-                tess = t
-                self.triangles_per_face = tri_per_face
-                break
-            # bust the cache key so next attempt re-tessellates
-            cache_key = cache_key + "_r"
+        d = _cached_data(shape.wrapped, deviation, knobs)
+        if d is None:
+            with profiler.section("mesh.build"):
+                if kp.enabled():
+                    d = kp.pool().call(_mesh_data, shape, deviation, knobs)
+                else:
+                    d = _mesh_data(shape, deviation, knobs)
+            _remember_data(shape.wrapped, deviation, knobs, d)
 
-        if tess is None:
-            # The tessellator silently drops faces it can't triangulate — most
-            # often zero-area sliver faces imported from a STEP file (e.g. a
-            # cylinder with a ~1e-12 UV span). It emits triangles for the
-            # remaining faces *in shape.faces() order*, so its dense
-            # triangles_per_face list is missing exactly one entry per dropped
-            # face. Rather than abort the whole load, re-expand the list to full
-            # length by inserting 0 for each face that has no triangulation.
-            # This keeps triangles_per_face aligned with occt_faces (which the
-            # whole app indexes in build123d order), so face picking stays
-            # correct and the dropped slivers simply render/pick as empty.
-            tess = t  # last (loosest) attempt
-            full = np.zeros(len(self.occt_faces), dtype=np.int32)
-            dense = tri_per_face
-            di = 0
-            dropped = []
-            for fi, face in enumerate(self.occt_faces):
-                loc = TopLoc_Location()
-                has_tri = BRep_Tool.Triangulation_s(face.wrapped, loc) is not None
-                if has_tri and di < len(dense):
-                    full[fi] = dense[di]
-                    di += 1
-                elif not has_tri:
-                    dropped.append(fi)
-            if di != len(dense):
-                # Skip-detection didn't line up with the dense count — the
-                # positional splice would be wrong, so fail loudly rather than
-                # silently corrupt face picking.
-                raise RuntimeError(
-                    f"Face count mismatch: tessellator gave {len(dense)} faces "
-                    f"but shape.faces() gave {len(self.occt_faces)}; could not "
-                    f"reconcile ({di} triangulated faces matched)."
-                )
-            self.triangles_per_face = full
-            print(f"  [mesh] {len(dropped)} un-meshable face(s) skipped "
-                  f"(indices {dropped}); rendering the rest.")
-
-        self.verts   = np.array(tess['vertices'], dtype=np.float32).reshape(-1, 3)
-        self.tris    = np.array(tess['triangles'], dtype=np.uint32).reshape(-1, 3)
-        self.normals = np.array(tess['normals'],   dtype=np.float32).reshape(-1, 3)
-        self.edges   = np.array(tess['edges'],     dtype=np.float32).reshape(-1, 3)
+        self.shape      = shape
+        self.occt_faces = list(shape.faces())
+        self.triangles_per_face = d["triangles_per_face"]
+        self.verts   = d["verts"]
+        self.tris    = d["tris"]
+        self.normals = d["normals"]
+        self.edges   = d["edges"]
         self.tri_count = len(self.tris) * 3
 
         # World-space bounding box
@@ -111,17 +74,16 @@ class Mesh:
         self.bbox_max = self.verts.max(axis=0)
 
         # True topological vertices — actual CAD corners where edges meet.
-        with profiler.section("mesh.topo_verts"):
-            self.topo_verts = _extract_topo_verts(shape)
+        self.topo_verts = d["topo_verts"]
 
         # True topological edges — each is a (N,3) polyline in world mm.
         # topo_edges_occ is the parallel list of raw TopoDS_Edge objects,
         # used when projecting reference geometry to preserve true curve type.
-        # Discretise at the SAME tolerances the mesh used so a highlighted edge
-        # traces the wireframe/part edge 1:1 instead of looking coarser.
-        with profiler.section("mesh.topo_edges"):
-            self.topo_edges, self.topo_edges_occ, self.topo_edge_face_normals = \
-                _extract_topo_edges(shape, angular_tol=ang_tol, chordal_tol=base)
+        # The worker reports which explorer positions it kept; the explorer
+        # walks this shape in the same order (BREP round trip keeps topology).
+        self.topo_edges             = d["topo_edges"]
+        self.topo_edge_face_normals = d["topo_edge_face_normals"]
+        self.topo_edges_occ         = _edges_at(shape, d["edge_pos"])
 
         # Legacy compatibility
         self.center = np.array([0.0, 0.0, 0.0])
@@ -183,6 +145,157 @@ class Mesh:
         return start, count
 
 
+def _mesh_data(shape, deviation, knobs):
+    """Tessellate *shape*: everything Mesh needs except OCC handles (those
+    can't leave a worker).  knobs = (deviation scale, deviation floor,
+    angular tol) from the live prefs."""
+    # Use a stable cache key based on the shape's OCCT hash so the
+    # tessellator can reuse cached results for identical shapes (e.g. undo/redo).
+    cache_key = f"mesh_{hash(shape.wrapped)}"
+    occt_faces = list(shape.faces())
+
+    # Tessellation deviation is a CHORDAL tolerance in millimetres, so a
+    # fixed absolute value (e.g. 0.01) demands a fraction-of-a-percent
+    # relative precision on a large part — which explodes the triangle
+    # count and tessellation time (a ~1.9 m part hit 800k triangles / 25 s
+    # at deviation=0.01). Scale the deviation to the part's bounding-box
+    # diagonal so quality is roughly constant regardless of size, with an
+    # absolute floor so small parts stay crisp and an angular tolerance
+    # that keeps curves smooth either way.
+    diag = _bbox_diagonal(shape)
+    # Fidelity knobs (live-tunable via prefs). Deviation scales with part
+    # size so quality is roughly size-independent, with an absolute floor so
+    # small parts stay crisp. Angular tolerance drives normal smoothness on
+    # curves — the dominant "faceted" factor for shading.
+    dev_scale = max(1e-5, knobs[0])
+    dev_floor = max(1e-4, knobs[1])
+    ang_tol   = max(0.02, knobs[2])
+    base = max(dev_floor, diag * dev_scale)
+    # Retry with progressively looser tolerances if the tessellator returns
+    # a face count that doesn't match shape.faces() (ocp_tessellate bug).
+    # A caller-supplied deviation skips to that quality tier immediately.
+    _attempts = [
+        dict(deviation=base,       quality=base,       angular_tolerance=ang_tol),
+        dict(deviation=base * 3,   quality=base * 3,   angular_tolerance=ang_tol * 1.7),
+        dict(deviation=base * 8,   quality=base * 8,   angular_tolerance=ang_tol * 2.7),
+    ]
+    if deviation is not None:
+        _attempts = [dict(deviation=deviation, quality=deviation,
+                          angular_tolerance=deviation * 5)] + _attempts
+    from cad.profiler import profiler
+    tess = None
+    for attempt in _attempts:
+        with profiler.section("mesh.tessellate"):
+            t = tessellate(shape.wrapped, cache_key=cache_key, **attempt)
+        tri_per_face = np.array(t['triangles_per_face'], dtype=np.int32)
+        if len(tri_per_face) == len(occt_faces):
+            tess = t
+            triangles_per_face = tri_per_face
+            break
+        # bust the cache key so next attempt re-tessellates
+        cache_key = cache_key + "_r"
+
+    if tess is None:
+        # The tessellator silently drops faces it can't triangulate — most
+        # often zero-area sliver faces imported from a STEP file (e.g. a
+        # cylinder with a ~1e-12 UV span). It emits triangles for the
+        # remaining faces *in shape.faces() order*, so its dense
+        # triangles_per_face list is missing exactly one entry per dropped
+        # face. Rather than abort the whole load, re-expand the list to full
+        # length by inserting 0 for each face that has no triangulation.
+        # This keeps triangles_per_face aligned with occt_faces (which the
+        # whole app indexes in build123d order), so face picking stays
+        # correct and the dropped slivers simply render/pick as empty.
+        tess = t  # last (loosest) attempt
+        full = np.zeros(len(occt_faces), dtype=np.int32)
+        dense = tri_per_face
+        di = 0
+        dropped = []
+        for fi, face in enumerate(occt_faces):
+            loc = TopLoc_Location()
+            has_tri = BRep_Tool.Triangulation_s(face.wrapped, loc) is not None
+            if has_tri and di < len(dense):
+                full[fi] = dense[di]
+                di += 1
+            elif not has_tri:
+                dropped.append(fi)
+        if di != len(dense):
+            # Skip-detection didn't line up with the dense count — the
+            # positional splice would be wrong, so fail loudly rather than
+            # silently corrupt face picking.
+            raise RuntimeError(
+                f"Face count mismatch: tessellator gave {len(dense)} faces "
+                f"but shape.faces() gave {len(occt_faces)}; could not "
+                f"reconcile ({di} triangulated faces matched)."
+            )
+        triangles_per_face = full
+        print(f"  [mesh] {len(dropped)} un-meshable face(s) skipped "
+              f"(indices {dropped}); rendering the rest.")
+
+    verts = np.array(tess['vertices'], dtype=np.float32).reshape(-1, 3)
+    with profiler.section("mesh.topo_verts"):
+        topo_verts = _extract_topo_verts(shape)
+    # Discretise at the SAME tolerances the mesh used so a highlighted edge
+    # traces the wireframe/part edge 1:1 instead of looking coarser.
+    with profiler.section("mesh.topo_edges"):
+        topo_edges, edge_pos, edge_normals = \
+            _extract_topo_edges(shape, angular_tol=ang_tol, chordal_tol=base,
+                                positions=True)
+    return {
+        "triangles_per_face": triangles_per_face,
+        "verts":   verts,
+        "tris":    np.array(tess['triangles'], dtype=np.uint32).reshape(-1, 3),
+        "normals": np.array(tess['normals'],   dtype=np.float32).reshape(-1, 3),
+        "edges":   np.array(tess['edges'],     dtype=np.float32).reshape(-1, 3),
+        "topo_verts": topo_verts,
+        "topo_edges": topo_edges,
+        "edge_pos":   edge_pos,
+        "topo_edge_face_normals": edge_normals,
+    }
+
+
+# The last few tessellations, so meshing the same TopoDS shape twice is free —
+# e.g. a fillet commit reuses the preview's solid, then meshes it again.
+# Entries: (shape, deviation, knobs, data); IsEqual = same TShape, location
+# and orientation.  The arrays are shared between Mesh objects, never mutated.
+_DATA_CACHE: list = []
+_DATA_CACHE_MAX = 4
+_DATA_LOCK = threading.Lock()
+
+
+def _cached_data(occ, deviation, knobs):
+    with _DATA_LOCK:
+        for s, dev, kn, d in _DATA_CACHE:
+            if dev == deviation and kn == knobs and s.IsEqual(occ):
+                return d
+    return None
+
+
+def _remember_data(occ, deviation, knobs, d):
+    with _DATA_LOCK:
+        _DATA_CACHE.append((occ, deviation, knobs, d))
+        del _DATA_CACHE[:-_DATA_CACHE_MAX]
+
+
+def _edges_at(shape, positions):
+    """The TopoDS_Edges at the given TopExp_Explorer positions of shape."""
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopoDS import TopoDS
+    want = iter(positions)
+    nxt = next(want, None)
+    out = []
+    explorer = TopExp_Explorer(shape.wrapped, TopAbs_EDGE)
+    i = 0
+    while explorer.More() and nxt is not None:
+        if i == nxt:
+            out.append(TopoDS.Edge(explorer.Current()))
+            nxt = next(want, None)
+        i += 1
+        explorer.Next()
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -214,7 +327,7 @@ def _extract_topo_verts(shape) -> np.ndarray:
 
     explorer = TopExp_Explorer(shape.wrapped, TopAbs_VERTEX)
     while explorer.More():
-        vert = TopoDS.Vertex_s(explorer.Current())
+        vert = TopoDS.Vertex(explorer.Current())
         pnt  = BRep_Tool.Pnt_s(vert)
         key  = (round(pnt.X(), 4), round(pnt.Y(), 4), round(pnt.Z(), 4))
         if key not in seen:
@@ -228,7 +341,8 @@ def _extract_topo_verts(shape) -> np.ndarray:
 
 
 def _extract_topo_edges(shape, angular_tol: float = 0.2,
-                        chordal_tol: float = 0.05) -> tuple[list[np.ndarray], list, list]:
+                        chordal_tol: float = 0.05,
+                        positions: bool = False) -> tuple[list[np.ndarray], list, list]:
     """
     Extract topological edges from a build123d shape via OCCT.
 
@@ -244,13 +358,18 @@ def _extract_topo_edges(shape, angular_tol: float = 0.2,
     topo_edges_occ        : list of TopoDS_Edge — the raw OCCT edge, parallel to above
     topo_edge_face_normals: list of (M, 3) float32 arrays — world normals of the
                             faces adjacent to each edge (M is 1 or 2 normally)
+
+    positions=True returns each kept edge's TopExp_Explorer position instead of
+    the TopoDS_Edge (picklable; see Mesh / _edges_at).
     """
     from OCP.TopExp import TopExp_Explorer, TopExp
     from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_REVERSED
     from OCP.TopoDS import TopoDS
     from OCP.GCPnts import GCPnts_TangentialDeflection
     from OCP.BRepAdaptor import BRepAdaptor_Curve
-    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    from OCP.collections import (
+        IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher
+        as TopTools_IndexedDataMapOfShapeListOfShape)
 
     # Build edge→faces map, iterating it directly (avoids shape-identity
     # lookup issues with Contains() on oriented explorer edges).
@@ -263,7 +382,7 @@ def _extract_topo_edges(shape, angular_tol: float = 0.2,
     # by walking the map directly (map keys are canonical/unoriented shapes).
     midpt_to_normals: dict[tuple, list] = {}
     for map_idx in range(1, edge_face_map.Extent() + 1):
-        map_edge = TopoDS.Edge_s(edge_face_map.FindKey(map_idx))
+        map_edge = TopoDS.Edge(edge_face_map.FindKey(map_idx))
         try:
             adp = BRepAdaptor_Curve(map_edge)
             mid_param = (adp.FirstParameter() + adp.LastParameter()) * 0.5
@@ -275,7 +394,7 @@ def _extract_topo_edges(shape, angular_tol: float = 0.2,
         normals = []
         face_list = edge_face_map.FindFromIndex(map_idx)
         for face_shape in face_list:
-            face = TopoDS.Face_s(face_shape)
+            face = TopoDS.Face(face_shape)
             try:
                 # Planar fast path → Plane(face).z_dir; falls back to a
                 # surface-derivative normal sampled at the face's UV center
@@ -300,8 +419,10 @@ def _extract_topo_edges(shape, angular_tol: float = 0.2,
     seen         = set()
 
     explorer = TopExp_Explorer(shape.wrapped, TopAbs_EDGE)
+    pos = -1
     while explorer.More():
-        edge = TopoDS.Edge_s(explorer.Current())
+        pos += 1
+        edge = TopoDS.Edge(explorer.Current())
 
         try:
             adaptor = BRepAdaptor_Curve(edge)
@@ -342,7 +463,7 @@ def _extract_topo_edges(shape, angular_tol: float = 0.2,
                 continue
             seen.add(key)
             edges.append(arr)
-            edges_occ.append(edge)
+            edges_occ.append(pos if positions else edge)
 
             # Look up face normals via the pre-built midpoint dict
             mid_param = (first + last) * 0.5

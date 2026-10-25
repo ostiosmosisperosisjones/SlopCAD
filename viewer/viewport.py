@@ -15,7 +15,7 @@ Viewport — the main GL widget.  Thin coordinator; logic lives in:
 from __future__ import annotations
 import numpy as np
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QMetaObject, Q_ARG
 from OpenGL.GL import *
 from OpenGL.GLU import *
 
@@ -277,10 +277,14 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
     # ------------------------------------------------------------------
 
     def build_meshes(self):
+        # Tessellate before makeCurrent: Mesh() may pump UI events while it
+        # waits on a kernel worker (see kernel_pool.ui_idle), and a paint in
+        # there would leave a different context current.
+        meshes = [(body_id, Mesh(shape, draft=True))
+                  for body_id, shape in self.workspace.all_current_shapes()]
         self.makeCurrent()
         gl_ready = self.context() is not None and self.context().isValid()
-        for body_id, shape in self.workspace.all_current_shapes():
-            mesh = Mesh(shape)
+        for body_id, mesh in meshes:
             if gl_ready:
                 mesh.upload()
             self._meshes[body_id] = mesh
@@ -288,6 +292,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             self._body_visible.setdefault(
                 body_id, body.visible if body is not None else True)
         self.doneCurrent()
+        self._schedule_refine()
 
     def set_body_visible(self, body_id: str, visible: bool):
         self._body_visible[body_id] = visible
@@ -364,7 +369,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             body_id, _body.visible if _body is not None else True)
         if shape is not None:
             try:
-                mesh = Mesh(shape)   # tessellate off-GL (pure CPU)
+                mesh = Mesh(shape, draft=True)   # tessellate off-GL
             except Exception as ex:
                 print(f"[Mesh] Could not tessellate body {body_id}: {ex}")
                 mesh = None
@@ -392,6 +397,54 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.doneCurrent()
         self._rebuild_sketch_faces()
         self.selection_changed.emit()
+        self._schedule_refine()
+        self.update()
+
+    # Background refinement of draft meshes (see Mesh(draft=True)): one at a
+    # time, so at most one kernel worker is busy and ops keep a warm one.
+    def _schedule_refine(self):
+        from concurrent.futures import ThreadPoolExecutor
+        ex = getattr(self, '_refine_exec', None)
+        if ex is None:
+            ex = self._refine_exec = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mesh-refine")
+            self._refine_queued = set()
+        for bid, mesh in self._meshes.items():
+            if getattr(mesh, 'is_draft', False) and id(mesh) not in self._refine_queued:
+                self._refine_queued.add(id(mesh))
+                ex.submit(self._refine_job, bid, mesh)
+
+    def _refine_job(self, body_id, draft):
+        try:
+            if self._meshes.get(body_id) is not draft:
+                fine = None                       # superseded while queued
+            else:
+                fine = Mesh(draft.shape)
+        except Exception as ex:
+            print(f"[Mesh] refine failed for {body_id}: {ex}")
+            fine = None
+        try:
+            QMetaObject.invokeMethod(self, "_refine_done",
+                                     Qt.ConnectionType.QueuedConnection,
+                                     Q_ARG(object, body_id), Q_ARG(object, draft),
+                                     Q_ARG(object, fine))
+        except RuntimeError:
+            pass                                  # viewport already deleted
+
+    @pyqtSlot(object, object, object)
+    def _refine_done(self, body_id, draft, fine):
+        self._refine_queued.discard(id(draft))
+        if fine is None or self._meshes.get(body_id) is not draft:
+            return
+        # Same shape, so face/edge indices (selection, hover) stay valid; the
+        # hover and GPU-pick caches key on id(mesh) and rebuild themselves.
+        self.makeCurrent()
+        fine.upload()
+        self._meshes[body_id] = fine
+        for buf in (draft.vbo_verts, draft.vbo_normals, draft.vbo_edges, draft.ebo):
+            if buf is not None:
+                glDeleteBuffers(1, [buf])
+        self.doneCurrent()
         self.update()
 
     def _rebuild_all_meshes(self):
@@ -415,6 +468,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self.doneCurrent()
         self._rebuild_sketch_faces()
         self.selection_changed.emit()
+        self._schedule_refine()
         self.update()
 
     # ------------------------------------------------------------------
@@ -1901,6 +1955,13 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         return None
 
     def mousePressEvent(self, e):
+        from viewer import busy
+        if busy.active():               # op/replay running: navigation only
+            if e.button() == Qt.MouseButton.RightButton:
+                self.camera.begin_orbit(e.position(), self.width(), self.height())
+            elif e.button() == Qt.MouseButton.MiddleButton:
+                self.camera.begin_pan(e.position())
+            return
         self.setFocus()
         if e.button() == Qt.MouseButton.LeftButton:
             mx, my = int(e.position().x()), int(e.position().y())
@@ -2196,6 +2257,13 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
     def mouseMoveEvent(self, e):
         buttons = e.buttons()
+        from viewer import busy
+        if busy.active():               # no hover/drag while an op runs
+            if buttons & Qt.MouseButton.RightButton:
+                self.camera.orbit(e.position()); self._begin_interaction(); self.update()
+            elif buttons & Qt.MouseButton.MiddleButton:
+                self.camera.pan(e.position());   self._begin_interaction(); self.update()
+            return
 
         # Extrude arrow drag.
         if (buttons & Qt.MouseButton.LeftButton) and self._drag_arrow_active:
@@ -2282,6 +2350,13 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             self.update()
 
     def mouseReleaseEvent(self, e):
+        from viewer import busy
+        if busy.active():
+            if e.button() == Qt.MouseButton.RightButton:
+                self.camera.end_orbit()
+            elif e.button() == Qt.MouseButton.MiddleButton:
+                self.camera.end_pan()
+            return
         if e.button() == Qt.MouseButton.LeftButton and self._drag_arrow_active:
             was_revolve  = (self._drag_arrow_op == 'revolve')
             was_thicken  = (self._drag_arrow_op == 'thicken')
@@ -2520,7 +2595,7 @@ def _tessellate_one(args):
     """Tessellate a single body — runs in a worker thread (no GL calls)."""
     body_id, shape = args
     try:
-        return body_id, Mesh(shape)
+        return body_id, Mesh(shape, draft=True)
     except Exception as ex:
         print(f"[Mesh] Could not tessellate body {body_id}: {ex}")
         return body_id, None
@@ -2538,9 +2613,15 @@ def _tessellate_parallel(bodies: list) -> dict:
         return results
     # Use min(len(bodies), cpu_count) threads — no point spinning more than needed
     import os
+    from concurrent.futures import wait
+    from cad.kernel_pool import ui_idle
     workers = min(len(bodies), os.cpu_count() or 4)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for body_id, mesh in pool.map(_tessellate_one, bodies):
+        futs = [pool.submit(_tessellate_one, b) for b in bodies]
+        while wait(futs, timeout=0.01).not_done:
+            ui_idle()       # keep painting while the kernel workers mesh
+        for f in futs:
+            body_id, mesh = f.result()
             if mesh is not None:
                 results[body_id] = mesh
     return results

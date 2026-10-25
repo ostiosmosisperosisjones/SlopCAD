@@ -1,5 +1,13 @@
 import os
 import sys
+import multiprocessing
+
+# Kernel worker processes (cad/kernel_pool.py) are spawned from this
+# executable.  In a frozen build the child re-runs main.py; freeze_support()
+# turns it into the worker and never returns.  Must come before the log tee
+# below, or every worker would truncate slopcad.log.
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
 
 # In a frozen build (PyInstaller AppImage/exe) there is no console, so any
 # startup crash or our diagnostic prints (e.g. the GPU-pick CPU fallback) vanish
@@ -161,6 +169,29 @@ def main():
 
     window = MainWindow()
     window.show()
+    # Start all kernel workers now (non-blocking): parallel re-meshing after
+    # an op uses several at once, and a cold spawn + import costs ~2 s.
+    from cad.kernel_pool import pool, set_ui_idle_hook, set_activity_hook
+    pool().warm()
+    app.aboutToQuit.connect(pool().shutdown)
+    # Replays and re-meshes run on the main thread and wait on kernel workers;
+    # keep the app live while they wait, with navigation-only input (only the
+    # viewport's orbit/pan/zoom gets through — see viewer/busy.py).
+    from viewer import busy
+    app._nav_only_filter = busy.NavOnlyFilter()
+    app.installEventFilter(app._nav_only_filter)
+
+    def _ui_idle():
+        with busy.nav_only():
+            app.processEvents()
+    set_ui_idle_hook(_ui_idle)
+    # Status-bar spinner while any kernel worker is busy (previews included).
+    # The controller only exists once a document is open.
+    def _activity(delta, name):
+        pc = getattr(window, "progress", None)
+        if pc is not None:
+            pc.background(delta, name)
+    set_activity_hook(_activity)
     sys.exit(app.exec())
 
 

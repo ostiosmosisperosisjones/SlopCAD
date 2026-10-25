@@ -768,6 +768,9 @@ class MainWindow(QMainWindow):
 
         # Program-wide progress indicator for heavy OCCT ops + checks. Handed to
         # the viewport so any op can report phases / offer cancel through it.
-        from gui.progress import ProgressController
-        self.progress = ProgressController(self)
+        # One per window: it owns status-bar widgets (and kernel_pool's
+        # activity hook reports to it), so don't rebuild it per document.
+        if getattr(self, "progress", None) is None:
+            from gui.progress import ProgressController
+            self.progress = ProgressController(self)
         vp.progress = self.progress

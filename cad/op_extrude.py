@@ -29,7 +29,7 @@ def _extrude_faces_to_tool(faces, distance, direction,
     from cad.operations.extrude import _do_extrude_solid
     from build123d import Compound
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-    from OCP.TopTools import TopTools_ListOfShape
+    from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 
     tool = None
     for face in faces:
@@ -54,7 +54,7 @@ def _fuse_tool_into_target(tool, target_occ):
     Compound."""
     from build123d import Compound
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-    from OCP.TopTools import TopTools_ListOfShape
+    from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 
     lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
     lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
@@ -176,7 +176,7 @@ class FaceExtrudeOp(Op):
 
         if self.force_new_body:
             from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-            from OCP.TopTools import TopTools_ListOfShape
+            from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 
             result_solid = None
             refs = self.face_refs if self.face_refs else []
@@ -217,8 +217,11 @@ class FaceExtrudeOp(Op):
                 from cad.solid_ref import (assign_solids_to_children,
                                            solid_refs_from_dicts)
                 refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
-                assign_solids_to_children(result, child_body_ids, refs,
-                                          history._workspace, history, entry_index)
+                assigned = assign_solids_to_children(result, child_body_ids, refs,
+                                                     history._workspace, history,
+                                                     entry_index)
+                from cad.op_revolve_thicken import _own_child_shape
+                return _own_child_shape(entry, child_body_ids, assigned, shape)
             return shape  # source body (shape) is unchanged
 
         current = shape
@@ -349,7 +352,7 @@ class FaceExtrudeOp(Op):
 
             def compute():
                 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-                from OCP.TopTools import TopTools_ListOfShape
+                from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
                 result_occ = None
                 for fo in face_objs:
                     extruded = _do_extrude_solid(fo, distance, direction,
@@ -620,8 +623,8 @@ class CrossBodyCutOp(Op):
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         import numpy as np
         from build123d import Compound, Plane
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
-        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
         from cad.operations.extrude import _do_extrude_solid
 
         # stored direction IS the tool direction (matches preview convention).
@@ -715,14 +718,11 @@ class CrossBodyCutOp(Op):
                 if fuse.IsDone():
                     tool_solid = as_compound(fuse.Shape())
 
-        lst_a = TopTools_ListOfShape(); lst_a.Append(shape.wrapped)
-        lst_b = TopTools_ListOfShape(); lst_b.Append(tool_solid.wrapped)
-        op = BRepAlgoAPI_Cut()
-        op.SetArguments(lst_a); op.SetTools(lst_b)
-        op.SetRunParallel(True); op.Build()
-        if not op.IsDone():
+        from cad.operations.boolean import bool_op
+        result = bool_op("cut", [shape], [tool_solid])
+        if result is None:
             raise RuntimeError("CrossBodyCutOp: boolean cut failed")
-        return as_compound(op.Shape())
+        return result
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
@@ -748,8 +748,8 @@ class CrossBodyCutOp(Op):
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
         import numpy as np
         from build123d import Compound, Plane
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
-        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
         from cad.operations.extrude import _do_extrude_solid
 
         direction = (np.array(self.direction, dtype=float)
@@ -829,14 +829,11 @@ class CrossBodyCutOp(Op):
                     fuse.SetRunParallel(True); fuse.Build()
                     if fuse.IsDone():
                         tool_solid = as_compound(fuse.Shape())
-            lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
-            lst_b = TopTools_ListOfShape(); lst_b.Append(tool_solid.wrapped)
-            op = BRepAlgoAPI_Cut()
-            op.SetArguments(lst_a); op.SetTools(lst_b)
-            op.SetRunParallel(True); op.Build()
-            if not op.IsDone():
+            from cad.operations.boolean import bool_op
+            result = bool_op("cut", [target_occ], [tool_solid])
+            if result is None:
                 raise RuntimeError("Boolean cut failed")
-            return as_compound(op.Shape())
+            return result
 
         def finalize(result):
             _push_result(viewport, "cut", op_params, self.cut_body_id,
@@ -1172,7 +1169,7 @@ class SketchExtrudeOp(Op):
         from cad.operations.extrude import extrude_face_direct, _do_extrude_solid
         from build123d import Compound
         from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
         from cad.face_ref import FaceRef
 
         entries    = viewport.history.entries

@@ -1,5 +1,6 @@
-build123d==0.10.0
-ocp-tessellate==3.2.2
+build123d==0.13.0
+cadquery-ocp-novtk==8.0.1.1.0
+ocp-tessellate==3.6.3
 python-solvespace==3.0.8
 PyQt6==6.11.0
 PyOpenGL==3.1.10

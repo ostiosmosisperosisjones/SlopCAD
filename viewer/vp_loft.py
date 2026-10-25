@@ -32,7 +32,7 @@ class LoftMixin:
         self._loft_panel               = panel
         self._loft_profile_pick_active = False
         self._loft_body_pick_active    = False
-        self._loft_preview_mesh        = None   # Solid | None
+        self._loft_preview_mesh        = None   # pack_preview() result | None
         self._loft_preview_is_cut      = False
         self._position_loft_panel()
         panel.show()
@@ -53,6 +53,7 @@ class LoftMixin:
         self._loft_panel               = None
         self._loft_profile_pick_active = False
         self._loft_body_pick_active    = False
+        self._loft_job().cancel()          # discard any in-flight preview
         self._loft_preview_mesh        = None
         self._loft_preview_is_cut      = False
         # If the panel was closed without an OK (e.g. Cancel/Esc) while editing,
@@ -209,19 +210,10 @@ class LoftMixin:
             return
 
         from OpenGL.GL import (
-            glDisable, glEnable, glColor4f, glLineWidth, glBegin, glEnd,
-            glVertex3f, glBlendFunc,
+            glDisable, glEnable, glBlendFunc,
             GL_LIGHTING, GL_BLEND, GL_DEPTH_TEST, GL_CULL_FACE,
             GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-            GL_TRIANGLES, GL_LINE_STRIP,
         )
-        from OCP.BRep import BRep_Tool
-        from OCP.BRepMesh import BRepMesh_IncrementalMesh
-        from OCP.TopExp import TopExp_Explorer
-        from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
-        from OCP.TopoDS import TopoDS
-        from OCP.BRepAdaptor import BRepAdaptor_Curve
-        from OCP.GCPnts import GCPnts_UniformAbscissa
         from cad.prefs import prefs as _prefs
 
         is_cut = getattr(self, '_loft_preview_is_cut', False)
@@ -242,48 +234,8 @@ class LoftMixin:
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         try:
-            wrapped = solid.wrapped
-            BRepMesh_IncrementalMesh(wrapped, 0.15)
-
-            glColor4f(*fill_color)
-            exp = TopExp_Explorer(wrapped, TopAbs_FACE)
-            while exp.More():
-                face = TopoDS.Face_s(exp.Current())
-                loc  = face.Location()
-                tri  = BRep_Tool.Triangulation_s(face, loc)
-                if tri is not None:
-                    has_trsf = not loc.IsIdentity()
-                    trsf = loc.Transformation() if has_trsf else None
-                    glBegin(GL_TRIANGLES)
-                    for i in range(1, tri.NbTriangles() + 1):
-                        n1, n2, n3 = tri.Triangle(i).Get()
-                        for ni in (n1, n2, n3):
-                            p = tri.Node(ni)
-                            if trsf is not None:
-                                p = p.Transformed(trsf)
-                            glVertex3f(p.X(), p.Y(), p.Z())
-                    glEnd()
-                exp.Next()
-
-            glColor4f(*edge_color)
-            glLineWidth(1.4)
-            exp2 = TopExp_Explorer(wrapped, TopAbs_EDGE)
-            while exp2.More():
-                edge = exp2.Current()
-                try:
-                    adaptor = BRepAdaptor_Curve(edge)
-                    disc    = GCPnts_UniformAbscissa()
-                    disc.Initialize(adaptor, 24)
-                    if disc.IsDone() and disc.NbPoints() >= 2:
-                        glBegin(GL_LINE_STRIP)
-                        for pi in range(1, disc.NbPoints() + 1):
-                            p = adaptor.Value(disc.Parameter(pi))
-                            glVertex3f(p.X(), p.Y(), p.Z())
-                        glEnd()
-                except Exception:
-                    pass
-                exp2.Next()
-            glLineWidth(1.0)
+            from viewer.preview_job import draw_preview
+            draw_preview(solid, fill_color, edge_color)
         except Exception as ex:
             print(f"[Loft preview] draw error: {ex}")
 
@@ -315,13 +267,27 @@ class LoftMixin:
         try:
             faces = probe._resolve_profile_faces(
                 self.history, self.history.cursor + 1)
-            solid = probe._build_loft(faces)
         except Exception:
             self._loft_preview_mesh = None
             self.update()
             return
-        self._loft_preview_mesh   = solid
         self._loft_preview_is_cut = (panel._mode_str() == "cut")
+        ruled, continuity = probe.ruled, probe.continuity
+
+        def _compute():
+            from viewer.preview_job import loft_preview_meshes
+            return loft_preview_meshes(faces, ruled, continuity)
+        self._loft_job().submit(_compute)
+
+    def _loft_job(self):
+        from viewer.preview_job import job_for
+        return job_for(self, '_loft_preview_job', self._on_loft_mesh_done,
+                       "Loft preview")
+
+    def _on_loft_mesh_done(self, result, error):
+        if getattr(self, '_loft_panel', None) is None:
+            return
+        self._loft_preview_mesh = result   # None on a failed build
         self.update()
 
     def route_sketch_face_pick_for_loft(self, sketch_idx: int,

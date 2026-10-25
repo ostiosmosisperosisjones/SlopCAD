@@ -14,7 +14,6 @@ Subtract          : result replaces the target body (body_ids[0]); tool bodies
 """
 
 from __future__ import annotations
-from cad.solid_ref import as_compound
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
@@ -69,40 +68,17 @@ class BooleanOp(Op):
     # ------------------------------------------------------------------
 
     def _run_bool(self, wrapped_shapes: list) -> Any:
-        from build123d import Compound
-        from OCP.BRepAlgoAPI import (
-            BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut, BRepAlgoAPI_Common,
-        )
-        from OCP.TopTools import TopTools_ListOfShape
-
-        if self.operation == "union":
-            bool_op = BRepAlgoAPI_Fuse()
-        elif self.operation == "subtract":
-            bool_op = BRepAlgoAPI_Cut()
-        elif self.operation == "intersect":
-            bool_op = BRepAlgoAPI_Common()
-        else:
+        from cad.operations.boolean import bool_op
+        kind = {"union": "fuse", "subtract": "cut", "intersect": "common"}.get(self.operation)
+        if kind is None:
             raise RuntimeError(f"BooleanOp: unknown operation '{self.operation}'")
-
-        lst_a = TopTools_ListOfShape()
-        lst_b = TopTools_ListOfShape()
-        lst_a.Append(wrapped_shapes[0])
-        for w in wrapped_shapes[1:]:
-            lst_b.Append(w)
-
-        bool_op.SetArguments(lst_a)
-        bool_op.SetTools(lst_b)
-        bool_op.SetRunParallel(True)
         # Fuzzy tolerance absorbs near-coincident faces (e.g. subtracting a
         # body whose faces lie exactly on the target's) that otherwise make
         # the boolean fail or silently no-op.
-        bool_op.SetFuzzyValue(1e-5)
-        bool_op.Build()
-
-        if not bool_op.IsDone():
+        result = bool_op(kind, wrapped_shapes[:1], wrapped_shapes[1:], fuzzy=1e-5)
+        if result is None:
             raise RuntimeError(f"BooleanOp: {self.operation} failed")
-
-        return as_compound(bool_op.Shape())
+        return result
 
     # ------------------------------------------------------------------
     # Execute (replay)

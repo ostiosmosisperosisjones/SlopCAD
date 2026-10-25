@@ -271,12 +271,14 @@ def _adjacent_face_sigs(parent_shape_occ, occ_edge) -> list:
     from OCP.TopExp import TopExp
     from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
     from OCP.TopoDS import TopoDS
-    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    from OCP.collections import (
+        IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher
+        as TopTools_IndexedDataMapOfShapeListOfShape)
     m = TopTools_IndexedDataMapOfShapeListOfShape()
     TopExp.MapShapesAndAncestors_s(parent_shape_occ, TopAbs_EDGE, TopAbs_FACE, m)
     for i in range(1, m.Extent() + 1):
         if m.FindKey(i).IsSame(occ_edge):
-            return [_face_signature(TopoDS.Face_s(f))
+            return [_face_signature(TopoDS.Face(f))
                     for f in m.FindFromIndex(i)]
     return []
 
@@ -301,7 +303,9 @@ def _find_edge_via_face_sigs(shape, sig_a: dict, sig_b: dict):
     from OCP.TopExp import TopExp
     from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
     from OCP.TopoDS import TopoDS
-    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    from OCP.collections import (
+        IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher
+        as TopTools_IndexedDataMapOfShapeListOfShape)
 
     shape_occ = shape.wrapped if hasattr(shape, 'wrapped') else shape
     m = TopTools_IndexedDataMapOfShapeListOfShape()
@@ -310,12 +314,12 @@ def _find_edge_via_face_sigs(shape, sig_a: dict, sig_b: dict):
     best_score = float('inf')
     best_edge  = None
     for i in range(1, m.Extent() + 1):
-        edge = TopoDS.Edge_s(m.FindKey(i))
+        edge = TopoDS.Edge(m.FindKey(i))
         fl   = list(m.FindFromIndex(i))
         if len(fl) < 2:
             continue
-        f0 = TopoDS.Face_s(fl[0])
-        f1 = TopoDS.Face_s(fl[1])
+        f0 = TopoDS.Face(fl[0])
+        f1 = TopoDS.Face(fl[1])
         s1 = _score_face_match(sig_a, f0) + _score_face_match(sig_b, f1)
         s2 = _score_face_match(sig_a, f1) + _score_face_match(sig_b, f0)
         s  = min(s1, s2)

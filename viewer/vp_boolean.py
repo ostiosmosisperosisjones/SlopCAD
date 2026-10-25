@@ -34,7 +34,7 @@ def _shape_contains(outer, inner) -> bool:
     exp = TopExp_Explorer(inner.wrapped, TopAbs_VERTEX)
     if not exp.More():
         return False
-    pnt = BRep_Tool.Pnt_s(TopoDS.Vertex_s(exp.Current()))
+    pnt = BRep_Tool.Pnt_s(TopoDS.Vertex(exp.Current()))
     for solid in outer.solids():
         cls = BRepClass3d_SolidClassifier(solid.wrapped, pnt, _TOUCH_TOL)
         if cls.State() == TopAbs_State.TopAbs_IN:
@@ -79,7 +79,7 @@ def _shapes_share_volume(a, b) -> bool:
         if _shape_contains(a, b) or _shape_contains(b, a):
             return True
         from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
-        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
         from build123d import Compound
 
         lst_a = TopTools_ListOfShape(); lst_a.Append(a.wrapped)
@@ -307,7 +307,7 @@ class BooleanMixin:
             from OCP.BRepAlgoAPI import (
                 BRepAlgoAPI_Fuse, BRepAlgoAPI_Cut, BRepAlgoAPI_Common,
             )
-            from OCP.TopTools import TopTools_ListOfShape
+            from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
             from build123d import Compound
 
             lst_a = TopTools_ListOfShape()

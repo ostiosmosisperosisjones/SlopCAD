@@ -21,7 +21,7 @@ Usage in any op handler:
 
 While the op is running:
   - A "Computing…" overlay label is shown in the viewport.
-  - User input is blocked (setEnabled(False)).
+  - Input is navigation-only (viewer/busy.py): orbit/pan/zoom still work.
   - On error: the error is printed and the UI is re-enabled, no history entry.
   - If compute() raises, finalize() is never called.
 
@@ -112,17 +112,23 @@ class AsyncOpMixin:
             self._pending_op_error  = None
             self._async_set_busy(False)
 
+    op_busy = False     # an async op is running (tests poll this)
+
     def _async_set_busy(self, busy: bool, label: str = ""):
+        # Input goes navigation-only while the op runs: the viewport still
+        # orbits/pans/zooms, everything else is held off (viewer/busy.py).
+        from viewer import busy as _busy
+        if busy != self.op_busy:
+            self.op_busy = busy
+            (_busy.enter if busy else _busy.leave)()
         # Prefer the program-wide progress controller (status bar + overlay +
         # cancel). Fall back to the legacy local overlay if it isn't wired yet.
         pc = getattr(self, 'progress', None)
         if pc is not None:
             if busy:
                 pc.begin(label or "Working", modal=True, cancelable=False)
-                self.setEnabled(False)
             else:
                 pc.end()
-                self.setEnabled(True)
             return
 
         overlay = getattr(self, '_async_overlay', None)
@@ -146,11 +152,9 @@ class AsyncOpMixin:
             overlay.show()
             overlay.raise_()
             QApplication.processEvents()  # flush paint so overlay is visible before thread starts
-            self.setEnabled(False)
         else:
             if overlay is not None:
                 overlay.hide()
-            self.setEnabled(True)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +167,7 @@ def _tessellate(shape_after):
         return None
     from viewer.mesh import Mesh
     try:
-        return Mesh(shape_after)
+        return Mesh(shape_after, draft=True)
     except Exception as ex:
         print(f"[Mesh] Tessellation failed: {ex}")
         return None
@@ -192,4 +196,5 @@ def _upload_mesh(viewport, body_id: str, mesh):
     viewport.doneCurrent()
     viewport._rebuild_sketch_faces()
     viewport.selection_changed.emit()
+    viewport._schedule_refine()
     viewport.update()

@@ -300,14 +300,16 @@ def _adjacent_faces(shape_occ, occ_edge) -> list:
     from OCP.TopExp import TopExp
     from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
     from OCP.TopoDS import TopoDS
-    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    from OCP.collections import (
+        IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher
+        as TopTools_IndexedDataMapOfShapeListOfShape)
     m = TopTools_IndexedDataMapOfShapeListOfShape()
     TopExp.MapShapesAndAncestors_s(shape_occ, TopAbs_EDGE, TopAbs_FACE, m)
     for i in range(1, m.Extent() + 1):
         if m.FindKey(i).IsSame(occ_edge):
             out = []
             for f in m.FindFromIndex(i):
-                f = TopoDS.Face_s(f)
+                f = TopoDS.Face(f)
                 if not any(f.IsSame(g) for g in out):
                     out.append(f)
             return out

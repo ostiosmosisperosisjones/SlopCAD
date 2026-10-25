@@ -10,20 +10,13 @@ holding the GIL, so neither a Python-level timeout nor running it on a worker
 thread can interrupt it — the whole app freezes.
 
 The only robust defense is to run the kernel call in a *child process* that can
-be killed. This module serializes the shape to BREP, ships the request to a
-worker process, and enforces a hard wall-clock timeout; on overrun the worker is
-terminated and FilletTimeout is raised so callers surface a clean message
-instead of hanging.
-
-Edges are identified across the process boundary by geometry (midpoint), not by
-index — BREP round-trip does not preserve topology order.
+be killed.  Builds run in the warm workers of cad.kernel_pool with a hard
+wall-clock timeout; on overrun the worker is killed and FilletTimeout is
+raised so callers surface a clean message instead of hanging.
 """
 
 from __future__ import annotations
-from cad.solid_ref import as_compound
-import os
-import tempfile
-import multiprocessing as _mp
+from concurrent.futures import ThreadPoolExecutor
 
 
 # Default hard cap for a single fillet build. Generous enough for legitimately
@@ -31,9 +24,8 @@ import multiprocessing as _mp
 # true kernel hang can't lock the app indefinitely.
 DEFAULT_TIMEOUT_S = 25.0
 
-# Per-probe cap for the fit-largest search. Includes child spawn + import
-# (~3s) — on filletbug.vc a *buildable* radius takes ~9s end to end, so 8s
-# rejected every candidate and fit-largest always failed.
+# Per-probe cap for the fit-largest search. On filletbug.vc a *buildable*
+# radius takes ~6s; tighter caps rejected every candidate.
 ATTEMPT_TIMEOUT_S = 15.0
 
 
@@ -65,78 +57,33 @@ def _edge_midpoint(occ_edge):
     return (round(p.X(), 4), round(p.Y(), 4), round(p.Z(), 4))
 
 
-def _write_status(status_path: str, msg: str):
-    try:
-        with open(status_path, "w") as f:
-            f.write(msg)
-    except OSError:
-        pass
+def _own_edges(shape, edge_occs):
+    """Edges not found in `shape` (a caller passed a copy, not a sub-shape)
+    are swapped for the body's edge with the same midpoint."""
+    from OCP.TopExp import TopExp
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as IMap
+    m = IMap()
+    TopExp.MapShapes_s(getattr(shape, "wrapped", shape), TopAbs_EDGE, m)
+    if all(m.FindIndex(e) for e in edge_occs):
+        return edge_occs
+    by_mid = {_edge_midpoint(m.FindKey(i)): m.FindKey(i) for i in range(1, m.Size() + 1)}
+    return [e if m.FindIndex(e) else by_mid.get(_edge_midpoint(e), e) for e in edge_occs]
 
 
-def _worker(brep_path: str, face_indices, edge_mids, edge_radii, radius,
-            out_path: str, status_path: str, validate_mesh: bool = False):
-    """Child-process entry point. Reads the shape, re-matches edges by midpoint,
-    runs the (heal-retrying) fillet, writes the result BREP. Writes a short
-    status string to status_path the parent reads back.
-
-    Status goes through a file rather than a multiprocessing.Array because the
-    latter allocates a POSIX semaphore per call; preview fires one process per
-    value change, and those semaphores leaked and eventually exhausted the
-    system (the "leaked semaphore objects" warning + lockup).
-
-    edge_radii (optional, aligned with edge_mids) carries a per-edge radius
-    override (float, or [r1,r2] taper, or None). Matched to the rebuilt edges by
-    midpoint so it survives BREP round-trip (which doesn't preserve edge order).
-    When all overrides are None, the scalar `radius` is used for everything.
-    """
-    try:
-        from OCP.BRepTools import BRepTools
-        from OCP.BRep import BRep_Builder
-        from OCP.TopoDS import TopoDS_Shape
-        from build123d import Compound
-        from cad.operations.fillet import fillet_edges
-
-        builder = BRep_Builder()
-        occ = TopoDS_Shape()
-        BRepTools.Read_s(occ, brep_path, builder)
-        shape = as_compound(occ)
-
-        # Map midpoint → override radius (None entries fall back to scalar).
-        mid_to_r = {m: r for m, r in zip(edge_mids, edge_radii or [])}
-        wanted = set(edge_mids)
-        edge_occs, occ_radii = [], []
-        for e in shape.edges():
-            m = _edge_midpoint(e.wrapped)
-            if m in wanted:
-                edge_occs.append(e.wrapped)
-                r = mid_to_r.get(m)
-                occ_radii.append(radius if r is None else
-                                 (tuple(r) if isinstance(r, (list, tuple)) else r))
-
-        has_override = any(m in mid_to_r and mid_to_r[m] is not None
-                           for m in (edge_mids or []))
-        # Per-edge radii only apply to picked edges (no face_indices in that
-        # mode); pass the aligned list, else the plain scalar.
-        radius_arg = occ_radii if (has_override and not face_indices) else radius
-
-        result = fillet_edges(shape, list(face_indices), edge_occs, radius_arg)
-
-        # Validate that the result can actually be tessellated. OCCT happily
-        # produces fillet solids that the mesher then can't triangulate (the
-        # "tessellator gave N faces but shape.faces() gave N+1" failure), which
-        # render as an empty/broken body. Such a radius is useless, so for the
-        # fit-largest search we reject it the same as a build failure — this is
-        # what keeps fit-largest from returning a radius that builds but can't
-        # be shown or used.
-        if validate_mesh:
-            from viewer.mesh import Mesh
-            Mesh(result)   # raises on face-count mismatch / tessellation failure
-
-        result_occ = result.wrapped if hasattr(result, "wrapped") else result
-        BRepTools.Write_s(result_occ, out_path)
-        _write_status(status_path, "ok")
-    except Exception as ex:  # propagate a short reason, not a traceback object
-        _write_status(status_path, f"err:{ex}"[:255])
+def _fillet_task(shape, face_indices, edge_occs, radius_arg, validate_mesh):
+    """Worker-side build.  edge_occs arrive as sub-shapes of the worker's copy
+    of `shape` (see kernel_pool), aligned with any per-edge radii."""
+    from cad.operations.fillet import fillet_edges
+    edge_occs = _own_edges(shape, [getattr(e, "wrapped", e) for e in edge_occs])
+    result = fillet_edges(shape, list(face_indices), edge_occs, radius_arg)
+    # OCCT happily produces fillet solids the mesher then can't triangulate
+    # (tessellator face count != shape.faces()), which render broken.  For the
+    # fit-largest search such a radius is as useless as a failed build.
+    if validate_mesh:
+        from viewer.mesh import Mesh
+        Mesh(result)
+    return result
 
 
 def _max_search_ceiling(edge_occs):
@@ -216,12 +163,12 @@ def fillet_edges_find_max(shape, face_indices, edge_occs,
                                      should_cancel=should_cancel)
 
     def _reliable(r):
-        """Build r in `repeats` independent processes; return a result only if
-        ALL succeed (rejects unstable borderline radii)."""
-        result = None
-        for _ in range(repeats):
-            result = _build_once(r)   # raises on any failure → caller treats r as bad
-        return result
+        """Build r in `repeats` independent worker processes at once; return a
+        result only if ALL succeed (rejects unstable borderline radii)."""
+        with ThreadPoolExecutor(max_workers=repeats) as ex:
+            futs = [ex.submit(_build_once, r) for _ in range(repeats)]
+            results = [f.result() for f in futs]   # re-raises any failure
+        return results[0]
 
     hi = ceiling if ceiling and ceiling > 0 else _max_search_ceiling(edge_occs)
     lo = 0.0
@@ -273,7 +220,7 @@ def fillet_edges_isolated(shape, face_indices, edge_occs, radius: float,
                           timeout_s: float = DEFAULT_TIMEOUT_S,
                           edge_radii=None, validate_mesh: bool = False,
                           should_cancel=None):
-    """Run fillet_edges() in a killable child process with a hard timeout.
+    """Run fillet_edges() in a killable kernel worker with a hard timeout.
 
     Same signature/return as cad.operations.fillet.fillet_edges (a build123d
     Compound), but a kernel hang is bounded: on timeout the worker is killed and
@@ -286,86 +233,26 @@ def fillet_edges_isolated(shape, face_indices, edge_occs, radius: float,
     if it can't be meshed — used by the fit-largest search so it never reports a
     radius that builds but can't render.
     """
-    from OCP.BRepTools import BRepTools
-    from OCP.BRep import BRep_Builder
-    from OCP.TopoDS import TopoDS_Shape
     from build123d import Compound
+    from cad import kernel_pool as kp
 
-    src_occ = shape.wrapped if hasattr(shape, "wrapped") else shape
-    edge_mids = [_edge_midpoint(e) for e in (edge_occs or [])]
-    edge_radii = list(edge_radii) if edge_radii else [None] * len(edge_mids)
-
-    tmpdir = tempfile.mkdtemp(prefix="cadapp_fillet_")
-    brep_path = os.path.join(tmpdir, "src.brep")
-    out_path = os.path.join(tmpdir, "out.brep")
-    status_path = os.path.join(tmpdir, "status.txt")
-    BRepTools.Write_s(src_occ, brep_path)
-
-    # Status flows through a file, not a multiprocessing.Array — the latter
-    # allocates a POSIX semaphore per call which leaked under rapid preview
-    # firing and eventually locked the app.
-    ctx = _mp.get_context("spawn")
-    proc = ctx.Process(
-        target=_worker,
-        args=(brep_path, list(face_indices), edge_mids, edge_radii, radius,
-              out_path, status_path, validate_mesh),
-        daemon=True)
-    proc.start()
-    # Poll instead of one blocking join so the caller can cancel mid-build (and
-    # so a hung worker is still bounded by timeout_s). Cheap: ~20 wakeups/sec.
-    import time
-    deadline = time.monotonic() + timeout_s
-    canceled = False
-    while proc.is_alive():
-        if should_cancel is not None and should_cancel():
-            canceled = True
-            break
-        if time.monotonic() >= deadline:
-            break
-        proc.join(0.05)
-
+    edge_occs = list(edge_occs or [])
+    radius_arg = radius
+    # Per-edge radii only apply to picked edges (no face_indices in that mode).
+    if edge_radii and any(r is not None for r in edge_radii) and not face_indices:
+        radius_arg = [radius if r is None else
+                      (tuple(r) if isinstance(r, (list, tuple)) else r)
+                      for r in edge_radii]
+    args = (shape, list(face_indices), edge_occs, radius_arg, validate_mesh)
+    if not kp.enabled():
+        return Compound(_fillet_task(*args).wrapped)
     try:
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(2.0)
-            if proc.is_alive():
-                proc.kill()
-                proc.join(1.0)
-            if canceled:
-                raise FilletCanceled("fillet canceled")
-            raise FilletTimeout(radius, timeout_s)
-
-        try:
-            with open(status_path) as f:
-                st = f.read().strip()
-        except OSError:
-            st = ""
-        if st.startswith("err:"):
-            raise RuntimeError(st[4:])
-        if st != "ok" or not os.path.exists(out_path):
-            raise FilletProcessError(
-                f"fillet worker exited (code {proc.exitcode}) without a result")
-
-        builder = BRep_Builder()
-        result_occ = TopoDS_Shape()
-        BRepTools.Read_s(result_occ, out_path, builder)
-        return Compound(result_occ)
-    finally:
-        # Reap the process so its OS resources are released (avoids zombie/leak
-        # accumulation across many preview calls).
-        try:
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(1.0)
-            proc.close()
-        except Exception:
-            pass
-        for p in (brep_path, out_path, status_path):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        try:
-            os.rmdir(tmpdir)
-        except OSError:
-            pass
+        r = kp.pool().call(_fillet_task, *args, timeout=timeout_s,
+                           should_cancel=should_cancel)
+    except kp.KernelTimeout:
+        raise FilletTimeout(radius, timeout_s)
+    except kp.KernelCanceled:
+        raise FilletCanceled("fillet canceled")
+    except kp.KernelWorkerDied as ex:
+        raise FilletProcessError(str(ex))
+    return r if isinstance(r, Compound) else Compound(r.wrapped)

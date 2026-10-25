@@ -913,7 +913,7 @@ class ExtrudeMixin:
         from cad.cut_all import fan_out_cut
         from build123d import Plane, Compound
         from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 
         # ---- Resolve tool faces (depends on UI selection) ------------------
         if sketch_idx is not None:
@@ -1028,7 +1028,7 @@ class ExtrudeMixin:
             from cad.operations.extrude import _do_extrude_solid
             from build123d import Compound
             from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-            from OCP.TopTools import TopTools_ListOfShape
+            from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
             from cad.op_types import _push_result
             shape_before = self.workspace.current_shape(body_id)
             target_shape = self.workspace.current_shape(merge_body_id)
@@ -1051,7 +1051,7 @@ class ExtrudeMixin:
             def _compute():
                 from build123d import Compound as _C
                 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse as _F
-                from OCP.TopTools import TopTools_ListOfShape as _L
+                from OCP.collections import List_TopoDS_Shape as _L
                 result = target_occ
                 for fo in face_objs:
                     tool = _do_extrude_solid(fo, distance, direction,

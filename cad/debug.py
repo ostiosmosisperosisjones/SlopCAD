@@ -64,7 +64,9 @@ def shape_stats(shape) -> str:
         try:
             BRepBndLib.Add_s(s, bb)
             if not bb.IsVoid():
-                xmin, ymin, zmin, xmax, ymax, zmax = bb.Get()
+                _lo, _hi = bb.CornerMin(), bb.CornerMax()
+                xmin, ymin, zmin = _lo.X(), _lo.Y(), _lo.Z()
+                xmax, ymax, zmax = _hi.X(), _hi.Y(), _hi.Z()
                 bbox = (f"bbox=[{xmin:.3f},{ymin:.3f},{zmin:.3f}]→"
                         f"[{xmax:.3f},{ymax:.3f},{zmax:.3f}]")
             else:

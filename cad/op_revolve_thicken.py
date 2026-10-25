@@ -139,7 +139,18 @@ class ThickenOp(Op):
             vp.history.seek(history_idx - 1)
             vp._rebuild_body_mesh(self.source_body_id)
         vp.history_changed.emit()
-        vp._show_thicken_panel(self.source_body_id, self.face_indices, editing_entry=entry)
+        # Saved face_indices are commit-time positions; upstream edits since
+        # then renumber faces (replay re-finds them by face_refs).  Re-find
+        # them the same way here, or the edit commits against stale indices.
+        indices = list(self.face_indices)
+        shape = vp.workspace.current_shape(self.source_body_id)
+        if shape is not None and self.face_refs:
+            try:
+                indices = [i for i, _f in self._resolve_faces(shape)]
+            except RuntimeError as ex:
+                print(f"[Thicken] reopen: {ex}; using saved face indices")
+        vp._thicken_face_indices = indices
+        vp._show_thicken_panel(self.source_body_id, indices, editing_entry=entry)
         panel = getattr(vp, '_thicken_panel', None)
         if panel is not None:
             panel.set_thickness(self.thickness)
@@ -157,7 +168,8 @@ class ThickenOp(Op):
             p["face_refs"] = [
                 {"centroid": list(r.centroid),
                  "area":     r.area,
-                 "category": r.category}
+                 "category": r.category,
+                 **({"normal": list(r.normal)} if r.normal else {})}
                 for r in self.face_refs
             ]
         return p
@@ -173,7 +185,8 @@ class ThickenOp(Op):
         face_refs = [
             AnyFaceRef(centroid=tuple(r["centroid"]),
                        area=r["area"],
-                       category=r.get("category", ""))
+                       category=r.get("category", ""),
+                       normal=tuple(r["normal"]) if r.get("normal") else None)
             for r in raw_refs
         ]
         return cls(
@@ -239,8 +252,10 @@ class FaceRevolveOp(Op):
             from cad.solid_ref import (assign_solids_to_children,
                                        solid_refs_from_dicts)
             refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
-            assign_solids_to_children(result, child_body_ids, refs,
-                                      history._workspace, history, entry_index)
+            assigned = assign_solids_to_children(result, child_body_ids, refs,
+                                                 history._workspace, history,
+                                                 entry_index)
+            return _own_child_shape(entry, child_body_ids, assigned, shape)
         return shape
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
@@ -292,6 +307,7 @@ class FaceRevolveOp(Op):
         op_params = self.to_params()
         if extra_params:
             op_params.update(extra_params)
+        preserved_body_ids = list(op_params.pop("_preserved_body_ids", []))
 
         def compute():
             return revolve_face_direct(None, face_obj, axis_pt, axis_dir, angle)
@@ -310,12 +326,8 @@ class FaceRevolveOp(Op):
 
             from cad.solid_ref import solid_refs_to_dicts
             solids = list(shape_after.solids())
-            new_bodies = []
-            for solid in solids:
-                new_name = viewport.workspace.next_part_name()
-                new_body = viewport.workspace.add_body(
-                    new_name, as_compound(solid))
-                new_bodies.append(new_body)
+            new_bodies = _add_child_bodies(viewport.workspace, solids,
+                                           preserved_body_ids)
             op_params["child_body_ids"] = [b.id for b in new_bodies]
             # Per-child geometric fingerprint, aligned with child_body_ids.
             op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
@@ -390,6 +402,32 @@ class FaceRevolveOp(Op):
 # ---------------------------------------------------------------------------
 # SketchRevolveOp  —  revolve a sketch profile around an axis
 # ---------------------------------------------------------------------------
+
+def _own_child_shape(entry, child_body_ids, assigned, shape):
+    """What execute() returns for a face op whose result became new child
+    bodies: the entry is tagged to its primary child (see finalize), so its
+    shape is that child's solid — returning the (source) input shape left the
+    child empty on replay/reload and broke every downstream op on it."""
+    if entry.body_id in child_body_ids:
+        own = assigned[child_body_ids.index(entry.body_id)]
+        if own is None:
+            raise RuntimeError("could not assign a solid to the primary child body")
+        return own
+    return shape
+
+
+def _add_child_bodies(ws, solids, preserved_body_ids):
+    """One new body per solid.  On an edit re-commit, solid i reuses
+    preserved_body_ids[i] (and that body's name) so downstream entries that
+    reference the old child bodies keep resolving."""
+    bodies = []
+    for i, solid in enumerate(solids):
+        preserved = preserved_body_ids[i] if i < len(preserved_body_ids) else None
+        existing = ws.bodies.get(preserved) if preserved else None
+        name = existing.name if existing else ws.next_part_name()
+        bodies.append(ws.add_body(name, as_compound(solid), body_id=preserved))
+    return bodies
+
 
 def _sketch_frame(se):
     import numpy as np
@@ -479,7 +517,7 @@ def _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle_deg):
     from cad.operations.revolve import revolve_face_direct
     from build123d import Compound
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-    from OCP.TopTools import TopTools_ListOfShape
+    from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 
     tool = None
     for face in faces:
@@ -502,7 +540,7 @@ def _fuse_tool_into_target(tool, target_occ):
     build123d Compound. Shared by commit and replay."""
     from build123d import Compound
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-    from OCP.TopTools import TopTools_ListOfShape
+    from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 
     lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
     lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
@@ -729,6 +767,7 @@ class SketchRevolveOp(Op):
             op_params["axis_line_uid"] = self.axis_line_uid
         if extra_params:
             op_params.update(extra_params)
+        preserved_body_ids = list(op_params.pop("_preserved_body_ids", []))
 
         mesh     = viewport._meshes.get(body_id)
         face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[se.face_idx]) if mesh else None)
@@ -771,14 +810,10 @@ class SketchRevolveOp(Op):
                 from cad.units import format_op_label as _lbl
                 from cad.solid_ref import solid_refs_to_dicts
                 solids    = list(shape_after.solids())
-                op_params["child_body_ids"] = []
                 op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
-                new_bodies = []
-                for solid in solids:
-                    new_name = viewport.workspace.next_part_name()
-                    new_body = viewport.workspace.add_body(new_name, as_compound(solid))
-                    new_bodies.append(new_body)
-                    op_params["child_body_ids"].append(new_body.id)
+                new_bodies = _add_child_bodies(viewport.workspace, solids,
+                                               preserved_body_ids)
+                op_params["child_body_ids"] = [b.id for b in new_bodies]
                 primary_body = new_bodies[0] if new_bodies else None
                 tag_body_id  = primary_body.id if primary_body else body_id
                 parent_entry = viewport.history.push(
@@ -885,12 +920,13 @@ class CrossBodyRevolveCutOp(Op):
     revolve operation.
 
     cut_body_id      : body being cut
-    source_sketch_id : entry_id of the sketch entry whose profile is revolved
-                       (sketch-driven cuts only — face-driven revolve cuts go
-                       through this same op with source_sketch_id=None and a
-                       source_body_id+source_face_idx pair, for symmetry with
-                       CrossBodyCutOp; unimplemented for now)
-    source_body_id   : sketch's parent body (informational; not used for cut)
+    source_sketch_id : entry_id of the sketch entry whose profile is revolved,
+                       or None for a face-driven cut (CrossBodyCutOp-style):
+                       source_body_id's face source_face_idx, re-found on
+                       replay through the entry's face_ref; axis is world-space
+    source_body_id   : sketch's parent body (informational), or the body whose
+                       face is revolved (face-driven)
+    source_face_idx  : face index at commit time (face-driven only)
     angle_deg        : revolution arc in degrees
     axis_point       : world-space point on the rotation axis
     axis_dir         : unit direction of the rotation axis
@@ -898,6 +934,7 @@ class CrossBodyRevolveCutOp(Op):
     cut_body_id      : str
     source_body_id   : str  | None       = None
     source_sketch_id : str  | None       = None
+    source_face_idx  : int  | None       = None
     angle_deg        : float = 360.0
     axis_point       : list[float] | None = None
     axis_dir         : list[float] | None = None
@@ -915,11 +952,11 @@ class CrossBodyRevolveCutOp(Op):
         import numpy as np
         from cad.operations.revolve import _do_revolve_solid
         from build123d import Compound
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
-        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 
         if self.source_sketch_id is None:
-            raise RuntimeError("CrossBodyRevolveCutOp: no source_sketch_id")
+            return self._execute_face(shape, history, entry_index)
         sketch_idx = history.id_to_index(self.source_sketch_id)
         if sketch_idx is None:
             raise RuntimeError(
@@ -982,14 +1019,36 @@ class CrossBodyRevolveCutOp(Op):
                 if fu.IsDone():
                     tool = as_compound(fu.Shape())
 
-        lst_a = TopTools_ListOfShape(); lst_a.Append(shape.wrapped)
-        lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
-        op = BRepAlgoAPI_Cut()
-        op.SetArguments(lst_a); op.SetTools(lst_b)
-        op.SetRunParallel(True); op.Build()
-        if not op.IsDone():
+        from cad.operations.boolean import bool_op
+        result = bool_op("cut", [shape], [tool])
+        if result is None:
             raise RuntimeError("CrossBodyRevolveCutOp: boolean cut failed")
-        return as_compound(op.Shape())
+        return result
+
+    def _execute_face(self, shape, history, entry_index):
+        import numpy as np
+        from cad.operations.revolve import _do_revolve_solid
+        from cad.operations.boolean import bool_op
+        src_shape = history._shape_for_body_at(self.source_body_id, entry_index)
+        if src_shape is None:
+            raise RuntimeError(
+                f"CrossBodyRevolveCutOp: no shape for source body '{self.source_body_id}'")
+        face_ref = getattr(history._entries[entry_index], "face_ref", None)
+        if face_ref is not None:
+            _, face = face_ref.find_in(src_shape)
+            if face is None:
+                raise RuntimeError("CrossBodyRevolveCutOp: could not re-locate source face")
+        else:
+            all_f = list(src_shape.faces())
+            if self.source_face_idx is None or self.source_face_idx >= len(all_f):
+                raise RuntimeError("CrossBodyRevolveCutOp: source face index out of range")
+            face = all_f[self.source_face_idx]
+        tool = _do_revolve_solid(face, np.array(self.axis_point, dtype=float),
+                                 np.array(self.axis_dir, dtype=float), self.angle_deg)
+        result = bool_op("cut", [shape], [tool])
+        if result is None:
+            raise RuntimeError("CrossBodyRevolveCutOp: boolean cut failed")
+        return result
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
@@ -1016,11 +1075,11 @@ class CrossBodyRevolveCutOp(Op):
         import numpy as np
         from cad.operations.revolve import _do_revolve_solid
         from build123d import Compound
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
-        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 
         if self.source_sketch_id is None:
-            raise RuntimeError("[Revolve cut] No source_sketch_id.")
+            return self._split_commit_face(viewport, extra_params)
         entries = viewport.history.entries
         sketch_idx = viewport.history.id_to_index(self.source_sketch_id)
         if sketch_idx is None:
@@ -1086,14 +1145,11 @@ class CrossBodyRevolveCutOp(Op):
                     fu.SetRunParallel(True); fu.Build()
                     if fu.IsDone():
                         tool = as_compound(fu.Shape())
-            lst_a = TopTools_ListOfShape(); lst_a.Append(target_occ)
-            lst_b = TopTools_ListOfShape(); lst_b.Append(tool.wrapped)
-            op = BRepAlgoAPI_Cut()
-            op.SetArguments(lst_a); op.SetTools(lst_b)
-            op.SetRunParallel(True); op.Build()
-            if not op.IsDone():
+            from cad.operations.boolean import bool_op
+            result = bool_op("cut", [target_occ], [tool])
+            if result is None:
                 raise RuntimeError("Revolve cut failed.")
-            return as_compound(op.Shape())
+            return result
 
         def finalize(result):
             _push_result(viewport, "revolve_cut", op_params, self.cut_body_id,
@@ -1101,6 +1157,49 @@ class CrossBodyRevolveCutOp(Op):
                          split_key="split_from")
             viewport._selected_sketch_entry = None
             viewport._selected_sketch_face  = None
+
+        return compute, finalize
+
+    def _split_commit_face(self, viewport, extra_params):
+        import numpy as np
+        from cad.operations.revolve import _do_revolve_solid
+        from cad.operations.boolean import bool_op
+        from cad.face_ref import FaceRef, AnyFaceRef
+
+        src_shape = viewport.workspace.current_shape(self.source_body_id)
+        if src_shape is None:
+            raise RuntimeError("[Revolve cut] Source body has no shape.")
+        all_f = list(src_shape.faces())
+        if self.source_face_idx is None or self.source_face_idx >= len(all_f):
+            raise RuntimeError("[Revolve cut] source_face_idx out of range.")
+        face = all_f[self.source_face_idx]
+        face_ref = (FaceRef.from_occ_face(face.wrapped)
+                    or AnyFaceRef.from_occ_face(face.wrapped))
+
+        target_shape = viewport.workspace.current_shape(self.cut_body_id)
+        if target_shape is None:
+            raise RuntimeError("[Revolve cut] Target body has no shape.")
+        original_solid_count = len(list(target_shape.solids()))
+        target_occ = target_shape.wrapped
+
+        axis_pt  = np.array(self.axis_point, dtype=float)
+        axis_dir = np.array(self.axis_dir, dtype=float)
+        angle    = self.angle_deg
+        op_params = self.to_params()
+        if extra_params:
+            op_params.update(extra_params)
+
+        def compute():
+            tool = _do_revolve_solid(face, axis_pt, axis_dir, angle)
+            result = bool_op("cut", [target_occ], [tool])
+            if result is None:
+                raise RuntimeError("Revolve cut failed.")
+            return result
+
+        def finalize(result):
+            _push_result(viewport, "revolve_cut", op_params, self.cut_body_id,
+                         face_ref, target_shape, result, original_solid_count,
+                         split_key="split_from")
 
         return compute, finalize
 
@@ -1121,7 +1220,12 @@ class CrossBodyRevolveCutOp(Op):
             vp._selected_sketch_face  = (list(self.face_indices)
                                           if self.face_indices else None)
 
-        vp._show_revolve_panel(sketch_idx=sketch_idx, editing_entry=entry)
+        if sketch_idx is None and self.source_face_idx is not None:
+            vp._show_revolve_panel(body_id=self.source_body_id,
+                                   face_idx=self.source_face_idx,
+                                   editing_entry=entry)
+        else:
+            vp._show_revolve_panel(sketch_idx=sketch_idx, editing_entry=entry)
 
         panel = vp._revolve_panel
         if panel is None:
@@ -1158,6 +1262,8 @@ class CrossBodyRevolveCutOp(Op):
             p["source_body_id"] = self.source_body_id
         if self.source_sketch_id is not None:
             p["source_sketch_id"] = self.source_sketch_id
+        if self.source_face_idx is not None:
+            p["source_face_idx"] = self.source_face_idx
         if self.face_indices is not None:
             p["face_indices"] = self.face_indices
         if self.face_centroids is not None:
@@ -1176,6 +1282,7 @@ class CrossBodyRevolveCutOp(Op):
             cut_body_id      = params.get("cut_body_id", ""),
             source_body_id   = params.get("source_body_id"),
             source_sketch_id = params.get("source_sketch_id"),
+            source_face_idx  = params.get("source_face_idx"),
             angle_deg        = float(params.get("angle_deg", 360.0)),
             axis_point       = params.get("axis_point"),
             axis_dir         = params.get("axis_dir"),

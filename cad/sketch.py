@@ -23,9 +23,12 @@ from enum import Enum, auto
 from build123d import Plane
 
 # Memoized SketchEntry.build_faces() results, keyed by (geometry fingerprint,
-# tol).  Entries hold OCCT faces; keep the cache small.
+# tol).  Entries hold OCCT faces.  Must exceed a document's sketch count:
+# every history change rebuilds all sketches' faces in order, and a cyclic
+# walk over more sketches than slots evicts each one before its reuse (8 slots
+# vs headphones' 18 sketches → 100% misses, ~200 ms main-thread stall per op).
 _FACE_BUILD_CACHE: OrderedDict = OrderedDict()
-_FACE_BUILD_CACHE_MAX = 8
+_FACE_BUILD_CACHE_MAX = 128
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +182,7 @@ class SplineEntity:
     def _occ_curve(self):
         """Build (and return) the Geom_BSplineCurve through the fit points in the
         sketch UV plane (z=0).  Returns None if it can't be built."""
-        from OCP.TColgp import TColgp_Array1OfPnt
+        from OCP.collections import Array1_gp_Pnt as TColgp_Array1OfPnt
         from OCP.gp import gp_Pnt
         from OCP.GeomAPI import GeomAPI_PointsToBSpline
         pts = self.points
@@ -2155,7 +2158,7 @@ class SketchEntry:
         from OCP.gp import gp_Pln, gp_Ax3, gp_Ax2, gp_Pnt, gp_Dir
         from OCP.TopExp import TopExp_Explorer
         from OCP.TopAbs import TopAbs_FACE, TopAbs_WIRE
-        from OCP.TopTools import TopTools_ListOfShape
+        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
         from OCP.TopoDS import TopoDS
 
         plane_pln = gp_Pln(gp_Ax3(
@@ -2235,7 +2238,7 @@ class SketchEntry:
 
             elif isinstance(ent, SplineEntity):
                 try:
-                    from OCP.TColgp import TColgp_Array1OfPnt
+                    from OCP.collections import Array1_gp_Pnt as TColgp_Array1OfPnt
                     from OCP.GeomAPI import GeomAPI_PointsToBSpline
                     pts = list(ent.points)
                     if ent.closed and pts:
@@ -2390,7 +2393,8 @@ class SketchEntry:
             return [], [], []
 
         # Every output edge → the entity whose tool edge it came from.
-        from OCP.TopTools import TopTools_IndexedMapOfShape
+        from OCP.collections import (
+            IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as TopTools_IndexedMapOfShape)
         from OCP.TopAbs import TopAbs_EDGE
         edge_map = TopTools_IndexedMapOfShape()
         edge_owner: list[int] = []
@@ -2456,7 +2460,7 @@ class SketchEntry:
         exp = TopExp_Explorer(splitter.Shape(), TopAbs_FACE)
         while exp.More():
             try:
-                occ_face = TopoDS.Face_s(exp.Current())
+                occ_face = TopoDS.Face(exp.Current())
                 raw_faces.append((occ_face, _face_area(occ_face)))
             except Exception as ex:
                 print(f"[Sketch] build_faces: face extraction error — {ex}")
@@ -2477,7 +2481,7 @@ class SketchEntry:
                 wire_uvs = []
                 wexp = TopExp_Explorer(occ_face, TopAbs_WIRE)
                 while wexp.More():
-                    uvs = _wire_uv_pts(TopoDS.Wire_s(wexp.Current()))
+                    uvs = _wire_uv_pts(TopoDS.Wire(wexp.Current()))
                     if len(uvs) >= 3:
                         wire_uvs.append(uvs)
                     wexp.Next()

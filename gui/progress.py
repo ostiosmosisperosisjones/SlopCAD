@@ -39,6 +39,7 @@ class ProgressController(QObject):
 
     # internal: (text, modal, cancelable, active)
     _state_changed = pyqtSignal(str, bool, bool, bool)
+    _bg_changed = pyqtSignal()
 
     def __init__(self, main_window):
         super().__init__(main_window)
@@ -57,6 +58,12 @@ class ProgressController(QObject):
 
         self._state_changed.connect(
             self._apply_state, Qt.ConnectionType.QueuedConnection)
+        self._bg_changed.connect(
+            self._render, Qt.ConnectionType.QueuedConnection)
+        # Background kernel-worker calls (previews, meshing, replays):
+        # {label: count}, shown when no explicit op is running.
+        self._bg: dict[str, int] = {}
+        self._op_state = None    # (msg, cancelable) of the running begin()
 
     # ---- public, thread-safe ----------------------------------------------
 
@@ -91,6 +98,18 @@ class ProgressController(QObject):
         # reflect immediately so the user sees the click register
         self.phase("canceling…")
 
+    def background(self, delta: int, qualname: str):
+        """kernel_pool activity hook (any thread): a worker call started
+        (+1) or finished (-1)."""
+        label = _BG_LABELS.get(qualname.rsplit(".", 1)[-1], "Computing")
+        with self._lock:
+            n = self._bg.get(label, 0) + delta
+            if n > 0:
+                self._bg[label] = n
+            else:
+                self._bg.pop(label, None)
+        self._bg_changed.emit()
+
     # callbacks to hand to worker threads / kernel code (Qt-free) ------------
 
     def report(self, text: str = "", i: int | None = None, n: int | None = None):
@@ -120,8 +139,19 @@ class ProgressController(QObject):
             _last_cancel[0] = cancelable
 
     def _apply_state(self, msg: str, modal: bool, cancelable: bool, active: bool):
+        self._op_state = (msg, cancelable) if active else None
+        self._render()
+
+    def _render(self):
+        """Explicit op (begin/phase) wins; else the background worker calls."""
         self._ensure_widgets()
-        if not active:
+        if self._op_state is not None:
+            msg, cancelable = self._op_state
+        else:
+            with self._lock:
+                labels = list(self._bg)
+            msg, cancelable = (f"{labels[-1]}…" if labels else None), False
+        if msg is None:
             self._timer.stop()
             self._sb_label.setText("")
             self._cancel_btn.setVisible(False)
@@ -161,6 +191,24 @@ class ProgressController(QObject):
         btn.setVisible(False)
         self._mw.statusBar().addWidget(btn)
         self._cancel_btn = btn
+
+
+# Status text for background kernel-worker calls, by function name.
+_BG_LABELS = {
+    "_mesh_data":             "Meshing",
+    "revolve_preview_meshes": "Revolve preview",
+    "thicken_preview_meshes": "Thicken preview",
+    "thicken_face_preview":   "Thicken preview",
+    "thicken_body_preview":   "Thicken preview",
+    "loft_preview_meshes":    "Loft preview",
+    "_fillet_task":           "Fillet",
+    "_chamfer_task":          "Chamfer",
+    "_loft_task":             "Loft",
+    "thicken_face":           "Thicken",
+    "revolve_face_direct":    "Revolve",
+    "extrude_face_direct":    "Extrude",
+    "bool_op":                "Boolean",
+}
 
 
 # Sentinels for "leave this attribute unchanged" across phase() updates, plus

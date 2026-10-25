@@ -28,8 +28,29 @@ from OCP.Bnd import Bnd_Box
 from OCP.BRepBndLib import BRepBndLib
 
 
+_PROPS_CACHE: dict = {}         # hash → [(solid, props)]; see _occ_solid_props
+_PROPS_CACHE_MAX = 512
+
+
 def _occ_solid_props(occ_solid):
-    """Return (volume, center_of_mass_xyz, bbox_extents_xyz) for a raw OCC solid."""
+    """Return (volume, center_of_mass_xyz, bbox_extents_xyz) for a raw OCC solid.
+
+    Memoized: replay scores every SolidRef against every candidate solid
+    (split children, import picks), and exact volume integration was ~1 s of
+    a 3.7 s reload.  Keyed by the shape hash and confirmed with IsSame, so a
+    hash collision can't return another solid's props."""
+    h = hash(occ_solid)
+    for s, props in _PROPS_CACHE.get(h, ()):
+        if s.IsSame(occ_solid):
+            return props
+    props = _occ_solid_props_uncached(occ_solid)
+    if len(_PROPS_CACHE) >= _PROPS_CACHE_MAX:
+        _PROPS_CACHE.clear()
+    _PROPS_CACHE.setdefault(h, []).append((occ_solid, props))
+    return props
+
+
+def _occ_solid_props_uncached(occ_solid):
     props = GProp_GProps()
     BRepGProp.VolumeProperties_s(occ_solid, props)
     com = props.CentreOfMass()
@@ -37,7 +58,9 @@ def _occ_solid_props(occ_solid):
 
     box = Bnd_Box()
     BRepBndLib.Add_s(occ_solid, box)
-    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+    _lo, _hi = box.CornerMin(), box.CornerMax()
+    xmin, ymin, zmin = _lo.X(), _lo.Y(), _lo.Z()
+    xmax, ymax, zmax = _hi.X(), _hi.Y(), _hi.Z()
     extents = np.array([xmax - xmin, ymax - ymin, zmax - zmin])
 
     return (float(vol),
@@ -193,7 +216,9 @@ def _solid_contains_point(occ_solid, pt, pad: float = 0.5) -> bool:
     from OCP.BRepBndLib import BRepBndLib
     box = Bnd_Box()
     BRepBndLib.Add_s(occ_solid, box)
-    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+    _lo, _hi = box.CornerMin(), box.CornerMax()
+    xmin, ymin, zmin = _lo.X(), _lo.Y(), _lo.Z()
+    xmax, ymax, zmax = _hi.X(), _hi.Y(), _hi.Z()
     x, y, z = pt
     return (xmin - pad <= x <= xmax + pad and
             ymin - pad <= y <= ymax + pad and

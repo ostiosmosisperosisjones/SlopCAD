@@ -299,6 +299,14 @@ class History:
         for j, e in enumerate(self._entries[:index]):
             if e.shape_after is not None:
                 shape_cache[e.body_id] = (j, e.shape_after)
+            # Non-primary split children of an earlier entry (seeded in-loop
+            # below when the split itself is replayed).
+            if e.shape_after is not None and self._workspace is not None:
+                for cbid in e.params.get("child_body_ids", []):
+                    body = self._workspace.bodies.get(cbid)
+                    if (cbid != e.body_id and body is not None
+                            and body.source_shape is not None):
+                        shape_cache[cbid] = (j, body.source_shape)
 
         # Per-body state: current_shape and chain_broken flag.
         current_shapes: dict[str, Any]  = {bid: sv[1] for bid, sv in shape_cache.items()}

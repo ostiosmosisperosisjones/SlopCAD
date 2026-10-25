@@ -38,12 +38,18 @@ def _fillet_cache_key(shape, face_indices, edge_occs, radius, edge_radii=None):
             return tuple(round(float(x), 6) for x in r)
         return round(float(r), 6)
 
+    # No overrides is "no overrides" however it's spelled: preview passes one
+    # None per edge, commit passes None — keying those apart meant the commit
+    # never reused the preview's solid.
+    radii = tuple(_norm(r) for r in (edge_radii or []))
+    if all(r is None for r in radii):
+        radii = ()
     return (
         hash(shape.wrapped) if hasattr(shape, "wrapped") else hash(shape),
         tuple(sorted(face_indices)),
         tuple(sorted(m for m in mids if m is not None)),
         round(float(radius), 6),
-        tuple(_norm(r) for r in (edge_radii or [])),
+        radii,
     )
 
 
@@ -179,7 +185,9 @@ class Fillet3DMixin:
 
         self._fillet3d_job().cancel()
         self._fillet3d_preview_mesh  = None
-        self._fillet3d_result_cache  = None
+        # _fillet3d_result_cache survives the close on purpose: OK closes the
+        # panel *before* the commit, which reuses it.  It's keyed on shape +
+        # edges + radius, so a stale entry can only match the identical fillet.
         self._fillet3d_arrow_base    = None
         self._fillet3d_arrow_origin  = None
         self._fillet3d_arrow_dir     = None

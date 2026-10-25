@@ -86,6 +86,7 @@ class HistoryMixin:
         self.doneCurrent()
         self._rebuild_sketch_faces()
         self.selection_changed.emit()
+        self._schedule_refine()
         self.update()
 
     # ------------------------------------------------------------------

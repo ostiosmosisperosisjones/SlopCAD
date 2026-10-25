@@ -17,6 +17,7 @@ chamfer_edges(shape, edge_occs, distance, angle_deg, flip_reference_face=False)
 
 from __future__ import annotations
 from cad.solid_ref import as_compound
+from cad.kernel_pool import offload
 import math
 from build123d import Compound
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer
@@ -29,7 +30,9 @@ from OCP.TopoDS import TopoDS
 def _build_edge_to_faces_map(shape_occ):
     """Return TopTools_IndexedDataMapOfShapeListOfShape mapping each edge to
     its adjacent faces."""
-    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    from OCP.collections import (
+        IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher
+        as TopTools_IndexedDataMapOfShapeListOfShape)
     edge_face_map = TopTools_IndexedDataMapOfShapeListOfShape()
     TopExp.MapShapesAndAncestors_s(shape_occ, TopAbs_EDGE, TopAbs_FACE,
                                     edge_face_map)
@@ -50,8 +53,8 @@ def smooth_edges(edge_occs, edge_face_map, tol_deg: float = 1.0) -> list:
         faces = list(edge_face_map.FindFromKey(e))
         if len(faces) != 2 or faces[0].IsSame(faces[1]):
             continue                        # boundary or seam edge
-        n1 = _face_normal_at_edge(e, TopoDS.Face_s(faces[0]))
-        n2 = _face_normal_at_edge(e, TopoDS.Face_s(faces[1]))
+        n1 = _face_normal_at_edge(e, TopoDS.Face(faces[0]))
+        n2 = _face_normal_at_edge(e, TopoDS.Face(faces[1]))
         if n1 is None or n2 is None:
             continue
         if sum(a * b for a, b in zip(n1, n2)) > math.cos(math.radians(tol_deg)):
@@ -121,7 +124,7 @@ def _ordered_adjacent_faces(edge_occ, edge_face_map):
     if not edge_face_map.Contains(edge_occ):
         raise RuntimeError("Chamfer: edge has no adjacent faces in this shape")
     face_list = edge_face_map.FindFromKey(edge_occ)
-    faces = [TopoDS.Face_s(f) for f in face_list]
+    faces = [TopoDS.Face(f) for f in face_list]
     if not faces:
         raise RuntimeError("Chamfer: edge has no adjacent faces")
     if len(faces) < 2:
@@ -214,6 +217,35 @@ def chamfer_edges_validate(shape, edge_occs, distance: float, angle_deg: float,
 def chamfer_edges(shape, edge_occs, distance: float, angle_deg: float,
                   flip_reference_face: bool = False,
                   per_edge_errors: list | None = None):
+    """Chamfer in a kernel worker (see _chamfer_edges_local); per_edge_errors
+    is filled from the worker's result."""
+    result, per_edge, err = _chamfer_task(shape, list(edge_occs), distance,
+                                          angle_deg, flip_reference_face)
+    if per_edge_errors is not None:
+        per_edge_errors.extend(per_edge)
+    if err is not None:
+        raise err
+    return result
+
+
+@offload()
+def _chamfer_task(shape, edge_occs, distance, angle_deg, flip_reference_face):
+    from cad.operations.fillet_proc import _own_edges
+    edge_occs = _own_edges(shape, [getattr(e, "wrapped", e) for e in edge_occs])
+    per_edge: list = []
+    try:
+        result = _chamfer_edges_local(shape, edge_occs, distance, angle_deg,
+                                      flip_reference_face, per_edge)
+    except ValueError as ex:
+        return None, per_edge, ValueError(str(ex))
+    except Exception as ex:   # OCCT exception types don't pickle
+        return None, per_edge, RuntimeError(str(ex))
+    return result, per_edge, None
+
+
+def _chamfer_edges_local(shape, edge_occs, distance: float, angle_deg: float,
+                         flip_reference_face: bool = False,
+                         per_edge_errors: list | None = None):
     """Chamfer the given OCCT edges with distance + angle.
 
     shape         : build123d Shape (with .wrapped) or raw TopoDS_Shape
@@ -286,7 +318,7 @@ def chamfer_edges(shape, edge_occs, distance: float, angle_deg: float,
     # wide cache so repeated previews with the same edges and parameters
     # don't recompute them.
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
-    from OCP.TopTools import TopTools_ListOfShape
+    from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
     from OCP.BRepGProp import BRepGProp
     from OCP.GProp import GProp_GProps
     from OCP.BRep import BRep_Builder
@@ -404,13 +436,42 @@ def _edge_cache_key(edge_occ) -> tuple:
             round(length, 4))
 
 
+_LAST_SOURCE: list = [None, None]   # [shape (held so it can't recycle), key]
+
+
+def _source_key(source_occ) -> tuple:
+    """Geometry fingerprint of the chamfered body (memoized for the last one,
+    since every edge of a call asks with the same shape)."""
+    last, key = _LAST_SOURCE
+    if last is not None and last.IsSame(source_occ):
+        return key
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+    from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as IMap
+    counts = []
+    for kind in (TopAbs_FACE, TopAbs_EDGE):
+        m = IMap()
+        TopExp.MapShapes_s(source_occ, kind, m)
+        counts.append(m.Size())
+    box = Bnd_Box()
+    BRepBndLib.Add_s(source_occ, box)
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(source_occ, props)
+    key = (*counts, *(round(c, 4) for p in (box.CornerMin(), box.CornerMax())
+                                for c in (p.X(), p.Y(), p.Z())), round(props.Mass(), 4))
+    _LAST_SOURCE[:] = [source_occ, key]
+    return key
+
+
 def _get_cached_cutter(source_occ, edge_occ, distance: float,
                        angle_rad: float, flip: bool):
     """Return a cutter solid for this edge, building and caching if needed."""
-    # Body identity changes whenever the shape's hash changes (any prior op),
-    # so include it — otherwise a previously chamfered preview would reuse
-    # cutters built against the wrong topology.
-    key = (id(source_occ),
+    # Key on the body's geometry, not id(): workers get a fresh unpickled copy
+    # per call, so ids recycle — and a previously chamfered preview must not
+    # reuse cutters built against the wrong topology.
+    key = (_source_key(source_occ),
            _edge_cache_key(edge_occ),
            round(distance, 6), round(angle_rad, 8), bool(flip))
     hit = _CUTTER_CACHE.get(key)
@@ -450,6 +511,7 @@ def chamfer_cache_clear():
     """Drop all cached cutters. Call when a body's shape changes for reasons
     unrelated to chamfer (e.g. a different upstream op committed)."""
     _CUTTER_CACHE.clear()
+    _LAST_SOURCE[:] = [None, None]
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +561,7 @@ def _build_chamfer_cutter(edge_occ, face_a, face_b,
     from OCP.GProp import GProp_GProps
     from OCP.Geom import Geom_Circle
     from OCP.GeomAPI import GeomAPI_PointsToBSpline
-    from OCP.TColgp import TColgp_Array1OfPnt
+    from OCP.collections import Array1_gp_Pnt as TColgp_Array1OfPnt
     from OCP.TopAbs import TopAbs_SHELL
     from OCP.TopoDS import TopoDS
 
@@ -705,7 +767,7 @@ def _build_chamfer_cutter(edge_occ, face_a, face_b,
         raise RuntimeError(
             f"chamfer cutter shell did not sew (got {sewn.ShapeType()})")
 
-    solid_mk = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(sewn))
+    solid_mk = BRepBuilderAPI_MakeSolid(TopoDS.Shell(sewn))
     if not solid_mk.IsDone():
         raise RuntimeError("chamfer cutter: solid construction failed")
     cutter = solid_mk.Solid()
@@ -757,7 +819,7 @@ def _offset_point_on_face(p_world, tangent, face, distance: float, sign_hint,
     Subsequent calls reuse `sign_hint` to avoid the polyline flipping
     mid-edge."""
     from OCP.BRep import BRep_Tool
-    from OCP.BRepTopAdaptor import BRepTopAdaptor_FClass2d
+    from OCP.IntTools import IntTools_FClass2d as BRepTopAdaptor_FClass2d
     from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
     from OCP.GeomLProp import GeomLProp_SLProps
     from OCP.gp import gp_Pnt, gp_Pnt2d, gp_Vec

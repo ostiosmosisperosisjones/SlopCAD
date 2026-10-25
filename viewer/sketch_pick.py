@@ -461,7 +461,7 @@ class SketchPickMixin:
 
                 exp = TopExp_Explorer(wrapped, TopAbs_FACE)
                 while exp.More():
-                    face = TopoDS.Face_s(exp.Current())
+                    face = TopoDS.Face(exp.Current())
                     loc  = face.Location()
                     tri  = BRep_Tool.Triangulation_s(face, loc)
                     if tri is not None:
@@ -482,7 +482,7 @@ class SketchPickMixin:
                         # a TopoDS_Edge — without the cast it raises TypeError,
                         # which the old code silently swallowed (dropping every
                         # preview edge). Cast so edges actually render.
-                        edge = TopoDS.Edge_s(exp2.Current())
+                        edge = TopoDS.Edge(exp2.Current())
                         adaptor = BRepAdaptor_Curve(edge)
                         disc    = GCPnts_UniformAbscissa()
                         disc.Initialize(adaptor, 24)

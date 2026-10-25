@@ -221,40 +221,25 @@ class ThickenMixin:
         """Build the preview mesh in the background (one worker at a time,
         latest params win — see viewer/preview_job.py)."""
         def _compute():
-            from cad.operations.thicken import thicken_face_preview
-            from viewer.preview_job import preview_mesh_data
-            tris_list, edges_list, errors = [], [], []
-            for fo in face_occs:
-                try:
-                    tris, edges = preview_mesh_data(
-                        thicken_face_preview(fo, thickness).wrapped, 0.15)
-                    tris_list.append(tris)
-                    edges_list.append(edges)
-                    errors.append(None)
-                except Exception as ex:
-                    tris_list.append([])
-                    edges_list.append([])
-                    errors.append(str(ex))
-            return tris_list, edges_list, errors
+            from viewer.preview_job import thicken_preview_meshes
+            return thicken_preview_meshes(face_occs, thickness)
         self._thicken_job().submit(_compute)
 
     def _on_thicken_mesh_done(self, result, error):
         panel = getattr(self, '_thicken_panel', None)
         if panel is None or result is None:
             return
-        tris_list, edges_list, errors = result
-        self._thicken_preview_mesh = (tris_list, edges_list)
+        packed, errors = result
+        self._thicken_preview_mesh = packed
         for i, err in enumerate(errors):
             if err is not None:
                 panel.set_face_entry_error(i, err)
         self.update()
 
     def _draw_thicken_preview(self):
-        from OpenGL.GL import (glDisable, glEnable, glColor4f, glBegin, glEnd,
-                               glVertex3f, glLineWidth, glBlendFunc,
+        from OpenGL.GL import (glDisable, glEnable, glBlendFunc,
                                GL_LIGHTING, GL_DEPTH_TEST, GL_CULL_FACE,
-                               GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-                               GL_TRIANGLES, GL_LINE_STRIP)
+                               GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         from cad.prefs import prefs as _prefs
         r, g, b = _prefs.op_preview_color
         op = _prefs.op_preview_opacity
@@ -268,25 +253,9 @@ class ThickenMixin:
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         mesh_data = getattr(self, '_thicken_preview_mesh', None)
-        # A tuple ([], []) is truthy but empty — treat as no mesh.
-        if mesh_data and any(mesh_data[0]):
-            tris_list, edges_list = mesh_data
-            glColor4f(*fill_color)
-            for tris in tris_list:
-                if tris:
-                    glBegin(GL_TRIANGLES)
-                    for (x, y, z) in tris:
-                        glVertex3f(x, y, z)
-                    glEnd()
-            glColor4f(*edge_color)
-            glLineWidth(1.4)
-            for edges in edges_list:
-                for pts in edges:
-                    glBegin(GL_LINE_STRIP)
-                    for (x, y, z) in pts:
-                        glVertex3f(x, y, z)
-                    glEnd()
-            glLineWidth(1.0)
+        if mesh_data:
+            from viewer.preview_job import draw_preview
+            draw_preview(mesh_data, fill_color, edge_color)
         else:
             self._draw_thicken_cage(edge_color)
 
@@ -572,7 +541,7 @@ def _extract_face_wires(face_occs) -> list:
 
         exp = TopExp_Explorer(fo, TopAbs_EDGE)
         while exp.More():
-            edge = TopoDS.Edge_s(exp.Current())
+            edge = TopoDS.Edge(exp.Current())
             try:
                 adp  = BRepAdaptor_Curve(edge)
                 disc = GCPnts_UniformAbscissa()
