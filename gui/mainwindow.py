@@ -387,7 +387,7 @@ class MainWindow(QMainWindow):
                 SketchTool.SPLINE:    "SPLINE — click points; Enter or click start to finish",
                 SketchTool.OFFSET:    "OFFSET — click entity or loop",
                 SketchTool.POINT:     "POINT — click to place",
-                SketchTool.DIMENSION: "DIMENSION — line twice = length · two parallel lines = gap · arc = diameter · C/M/E then click = centre/mid/end point",
+                SketchTool.DIMENSION: "DIMENSION — line twice = length · two parallel lines = gap · line, circle = edge gap · arc = diameter · C/M/E then click = centre/mid/end point",
                 SketchTool.GEOMETRIC: "CONSTRAINTS — click a line  (Tab=cycle mode)",
                 SketchTool.MIRROR:    "MIRROR — click a line to use as the axis",
                 SketchTool.PATTERN_LINEAR:   "LINEAR PATTERN — click a line for the direction",

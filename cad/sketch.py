@@ -531,6 +531,9 @@ class SketchConstraint:
                    'gap' (ref, mov): distance between two parallel lines
                    'pt_distance' (a, b): distance from a point of a to a
                    point of b, or to line b (see points)
+                   'edge_gap' (line, arc): line to the arc/circle's edge
+                   'equal' (a, b): equal length — or radius, for two arcs
+                   'concentric' (a, b): two arcs/circles share a centre
     indices      : tuple of entity indices the constraint applies to
     value        : numeric value (mm for distance/diameter; 0 for geometric)
     label_offset : for 'distance'  — perpendicular offset of label from line (mm)
@@ -765,7 +768,7 @@ _LENGTH_CONSTRAINTS = ('distance', 'equal', 'sharp_distance')
 # Constraints with no value: safe to drop when SolveSpace calls them
 # redundant, provided they still hold afterwards (see apply_constraints).
 _GEOMETRIC_CONSTRAINTS = ('horizontal', 'vertical', 'parallel',
-                          'perpendicular', 'equal')
+                          'perpendicular', 'equal', 'concentric')
 
 
 def sharp_corner(entities, i: int, n: int):
@@ -827,6 +830,26 @@ def pt_distance_ends(entities, con):
         return A, p0 + t * d
     B = ref_point(entities, b, wb)
     return None if B is None else (A, B)
+
+
+def edge_gap_ends(entities, con):
+    """(foot on the line, nearest point of the circle) an 'edge_gap'
+    measures between, or None."""
+    li, ai = con.indices
+    if not (0 <= li < len(entities) and 0 <= ai < len(entities)) or not \
+            isinstance(entities[li], LineEntity) or \
+            not isinstance(entities[ai], ArcEntity):
+        return None
+    L, A = entities[li], entities[ai]
+    p0, p1 = np.asarray(L.p0, float)[:2], np.asarray(L.p1, float)[:2]
+    c = np.asarray(A.center, float)[:2]
+    d = p1 - p0
+    foot = p0 + d * float(np.dot(c - p0, d) / max(float(np.dot(d, d)), 1e-24))
+    v = foot - c
+    n = float(np.linalg.norm(v))
+    if n < 1e-12:
+        return None
+    return foot, c + v / n * A.radius
 
 
 def _firm_lock(sketch, i, group) -> bool:
@@ -1396,6 +1419,17 @@ class SketchEntry:
                 a, b = con.indices
                 if a in slvs_lines and b in slvs_lines:
                     slvs.equal(slvs_lines[a], slvs_lines[b], wp)
+                elif a in slvs_arcs and b in slvs_arcs:
+                    from python_solvespace import Constraint as K, Entity as E
+                    slvs.add_constraint(K.EQUAL_RADIUS, wp, 0.0, E.NONE,
+                                        E.NONE, slvs_arcs[a], slvs_arcs[b])
+            elif con.type == 'concentric':
+                a, b = con.indices
+                if a in slvs_arcs and b in slvs_arcs and \
+                        canon_map[(a, 'center')] != canon_map[(b, 'center')]:
+                    slvs.coincident(_pt(a, 'center'), _pt(b, 'center'), wp)
+            elif con.type == 'edge_gap':
+                self._emit_edge_gap(slvs, wp, con, _pt, slvs_lines, slvs_arcs)
             elif con.type == 'symmetric':
                 # (src_idx, copy_idx, axis_line_idx): reflect each corresponding
                 # point of src/copy across the axis line.
@@ -1443,6 +1477,26 @@ class SketchEntry:
                     slvs.coincident(V, slvs_lines[n], wp)
                     pts.append(V)
                 slvs.distance(pts[0], pts[1], con.value, wp)
+
+    def _emit_edge_gap(self, slvs, wp, con, _pt, slvs_lines, slvs_arcs) -> None:
+        """('edge_gap', (line, arc)): a hidden point T on the circle, its
+        radius ⊥ the line, T *value* from the line on the centre's side."""
+        from python_solvespace import Constraint as K, Entity as E
+        li, ai = con.indices
+        ends = edge_gap_ends(self.entities, con)
+        if ends is None or li not in slvs_lines or ai not in slvs_arcs:
+            return
+        L, c = self.entities[li], self.entities[ai].center
+        t = ends[1]
+        T = slvs.add_point_2d(float(t[0]), float(t[1]), wp)
+        slvs.add_constraint(K.PT_ON_CIRCLE, wp, 0.0, T, E.NONE,
+                            slvs_arcs[ai], E.NONE)
+        slvs.perpendicular(slvs.add_line_2d(_pt(ai, 'center'), T, wp),
+                           slvs_lines[li], wp)
+        cross = (L.p1[0] - L.p0[0]) * (c[1] - L.p0[1]) - \
+            (L.p1[1] - L.p0[1]) * (c[0] - L.p0[0])
+        slvs.distance(T, slvs_lines[li],
+                      (-1.0 if cross > 0 else 1.0) * con.value, wp)
 
     def _emit_pt_distance(self, slvs, wp, con, _pt, slvs_lines) -> None:
         """('pt_distance', (a, b), points=(wa, wb)): point to point, or
@@ -1832,6 +1886,10 @@ class SketchEntry:
                   for j in tan if isinstance(self.entities[j], ArcEntity)}
         saved = [copy.deepcopy(e.__dict__) for e in self.entities]
         if not self._solve_local_stages(seed, pins, attachments):
+            if self.solve_error is None:
+                self.solve_error = ("Constraint refused: it conflicts with "
+                                    "(or repeats) other constraints")
+                print(f"[Sketch] {self.solve_error}")
             return False
         def _sin(d, e):
             return abs(float(d[0] * e[1] - d[1] * e[0]))
@@ -1959,10 +2017,25 @@ class SketchEntry:
         as _direction_locks).  Without it the minimum-motion solve happily
         resizes a fillet — or collapses it to a point — instead of moving
         lines.  Arcs with a diameter dimension are already held."""
+        arcs = {i for i, e in enumerate(self.entities)
+                if isinstance(e, ArcEntity) and e.radius > 1e-9}
+        group = {i: {i} for i in arcs}          # equal radius → one size
+        for c in self.constraints:
+            if c.type == 'equal' and set(c.indices) <= arcs:
+                a, b = c.indices
+                if group[a] is not group[b]:
+                    merged = group[a] | group[b]
+                    for k in merged:
+                        group[k] = merged
         sized = {c.indices[0] for c in self.constraints if c.type == 'diameter'}
-        return [(i, {i}) for i, e in enumerate(self.entities)
-                if isinstance(e, ArcEntity) and i not in sized
-                and e.radius > 1e-9]
+        out, seen = [], set()
+        for i in sorted(arcs):
+            g = group[i]
+            if id(g) in seen or g & sized:
+                continue
+            seen.add(id(g))
+            out.append((i, set(g)))
+        return out
 
     def _point_adjacency(self, canon_map) -> dict:
         """Canonical-point graph for apply_constraints_local: points of one
@@ -2099,7 +2172,7 @@ class SketchEntry:
             i = con.indices[0]
             if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
                 free.add(canon_map[(i, 'p1')])
-        elif con.type == 'pt_distance':
+        elif con.type in ('pt_distance', 'edge_gap', 'concentric'):
             mov = con.indices[1]
             for w in ('p0', 'p1', 'center'):
                 if (mov, w) in canon_map:
@@ -2219,8 +2292,24 @@ class SketchEntry:
             checks[n] = check
         return checks, attached
 
-    def _constraint_holds(self, con, slvs, canon_map, slvs_pts, ref_geo) -> bool:
+    def _constraint_holds(self, con, slvs, canon_map, slvs_pts, ref_geo,
+                          arc_dist_ents=None) -> bool:
         """Whether a geometric constraint is satisfied by the solved points."""
+        if con.type in ('equal', 'concentric') and all(
+                0 <= i < len(self.entities) and
+                isinstance(self.entities[i], ArcEntity) for i in con.indices):
+            def at(i, w):
+                return np.array(slvs.params(
+                    slvs_pts[canon_map[(i, w)]].params)[:2])
+
+            def radius(i):
+                if arc_dist_ents and i in arc_dist_ents:
+                    return float(slvs.params(arc_dist_ents[i].params)[0])
+                return float(np.linalg.norm(at(i, 'p0') - at(i, 'center')))
+            a, b = con.indices
+            if con.type == 'concentric':
+                return float(np.linalg.norm(at(a, 'center') - at(b, 'center'))) < 1e-6
+            return abs(radius(a) - radius(b)) < 1e-6 * max(1.0, radius(a))
         def ends(i):
             if i in ref_geo:
                 if ref_line(self.entities[i]) is None:
@@ -2324,28 +2413,44 @@ class SketchEntry:
                 no_drag.add(ck)
 
             if free_points is not None:
-                # A held partial arc: its ends + radius fix it.  Holding the
-                # centre too is one equation too many (the arc keeps its end
-                # on its circle by itself) and SolveSpace rejects the system.
+                # Held arcs keep their size.  A partial arc is fixed by its
+                # ends + radius: holding the centre too is one equation too
+                # many (the arc keeps its end on its circle by itself) and
+                # SolveSpace rejects the system.  A held circle's centre
+                # doesn't fix its radius, so that is held too.  One radius
+                # hold per equal-radius group (see _radius_locks); sized
+                # groups are held by their diameter constraint.
                 centre_uses: dict = {}
                 for i, ent in enumerate(self.entities):
                     if isinstance(ent, ArcEntity):
                         ck = canon_map[(i, 'center')]
                         centre_uses[ck] = centre_uses.get(ck, 0) + 1
-                radius_held = set()
+                lock_group = {j: frozenset(g) for _i, g in self._radius_locks()
+                              for j in g}
+                radius_held, held_groups = set(), set()
                 for i, ent in enumerate(self.entities):
-                    if not isinstance(ent, ArcEntity) or _is_full_circle(ent):
+                    if not isinstance(ent, ArcEntity):
                         continue
-                    cks = [canon_map[(i, w)] for w in ('center', 'p0', 'p1')]
-                    if centre_uses[cks[0]] == 1 and not any(
-                            ck in free_points or ck in circ_cks or ck in no_drag
-                            for ck in cks):
+                    full = _is_full_circle(ent)
+                    cks = [canon_map[(i, w)]
+                           for w in (('center',) if full else ('center', 'p0', 'p1'))]
+                    if any(ck in free_points or ck in circ_cks or ck in no_drag
+                           for ck in cks):
+                        continue
+                    if not full:
+                        if centre_uses[cks[0]] > 1:
+                            continue        # shared centre: drag as before
+                        no_drag.add(cks[0])
                         # (A semicircle's diameter is its chord: singular —
                         # leave the centre to min-motion there.)
-                        if abs(ent.end_angle - ent.start_angle - np.pi) > 1e-3:
-                            slvs.diameter(slvs_arcs[i], 2.0 * float(ent.radius))
-                        no_drag.add(cks[0])
-                        radius_held.add(i)
+                        if abs(ent.end_angle - ent.start_angle - np.pi) < 1e-3:
+                            continue
+                    g = lock_group.get(i)
+                    if g is None or g in held_groups:
+                        continue
+                    slvs.diameter(slvs_arcs[i], 2.0 * float(ent.radius))
+                    held_groups.add(g)
+                    radius_held |= g
                 for ck, sp in slvs_pts.items():
                     if ck not in free_points and ck not in circ_cks and ck not in no_drag:
                         slvs.dragged(sp, wp)
@@ -2386,6 +2491,13 @@ class SketchEntry:
                             if c.type == 'pt_distance'
                             for i, w in zip(c.indices, c.points or ())
                             if w == 'center'}
+                measured |= {canon_map.get((c.indices[1], 'center'))
+                             for c in self.constraints if c.type == 'edge_gap'}
+                # Concentric circles: pin one centre per group.
+                for c in self.constraints:
+                    if c.type == 'concentric' and all(
+                            (i, 'center') in canon_map for i in c.indices):
+                        measured.add(canon_map[(c.indices[1], 'center')])
                 for i, ent in enumerate(self.entities):
                     if not isinstance(ent, ArcEntity):
                         continue
@@ -2406,7 +2518,12 @@ class SketchEntry:
 
             cons = [c for k, c in enumerate(self.constraints) if k not in drop_con
                     and not (held is not None
-                             and all(i in held_ents for i in c.indices))]
+                             and all(i in held_ents for i in c.indices)
+                             # a held arc's size isn't held by its points
+                             and c.type != 'diameter'
+                             and not (c.type == 'equal' and all(
+                                 isinstance(self.entities[i], ArcEntity)
+                                 for i in c.indices)))]
             self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
                                               slvs_lines, slvs_arcs,
                                               arc_dist_ents, cons)
@@ -2418,11 +2535,13 @@ class SketchEntry:
         def _dropped_hold(state, drop_att, drop_con) -> bool:
             """A constraint dropped as redundant must still hold after the
             solve — otherwise it was a real conflict, not a redundancy."""
-            slvs, _, canon_map, slvs_pts, _, _, _, ref_geo, att_checks = state
+            slvs, _, canon_map, slvs_pts, _, _, arc_dist_ents, ref_geo, \
+                att_checks = state
             ok = all(chk(slvs) for k, chk in att_checks.items() if k in drop_att)
             for k in drop_con:
                 ok = ok and self._constraint_holds(
-                    self.constraints[k], slvs, canon_map, slvs_pts, ref_geo)
+                    self.constraints[k], slvs, canon_map, slvs_pts, ref_geo,
+                    arc_dist_ents)
             return ok
 
         result, state = _attempt(implicit_lengths=True)

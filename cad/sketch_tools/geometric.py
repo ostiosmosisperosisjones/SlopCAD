@@ -1,8 +1,9 @@
 """
 cad/sketch_tools/geometric.py
 
-GeometricConstraintTool — apply parallel, perpendicular, horizontal, or
-vertical constraints.
+GeometricConstraintTool — apply parallel, perpendicular, tangent,
+horizontal, vertical, equal (lines: length, arcs/circles: radius) or
+concentric constraints.
 
 Tab cycles through modes.  Horizontal/vertical are single-click; parallel,
 perpendicular and equal take two clicks (reference line, then target line).
@@ -16,7 +17,8 @@ from cad.sketch_tools.base import BaseTool
 from cad.sketch_tools.dimension import _nearest_line, _pt_to_seg_dist
 
 
-MODES = ['parallel', 'perpendicular', 'tangent', 'horizontal', 'vertical', 'equal']
+MODES = ['parallel', 'perpendicular', 'tangent', 'horizontal', 'vertical',
+         'equal', 'concentric']
 
 
 def _writeback_entities(sketch, tmp):
@@ -38,7 +40,22 @@ MODE_LABELS = {
     'horizontal':    'HORIZONTAL  (Tab→)',
     'vertical':      'VERTICAL  (Tab→)',
     'equal':         'EQUAL  (Tab→)',
+    'concentric':    'CONCENTRIC  (Tab→)',
 }
+
+
+def _nearest_arc(pt, entities, tol: float = 5.0) -> int | None:
+    """Closest arc/circle by its rim or its centre, within tol mm."""
+    from cad.sketch import ArcEntity
+    best_idx, best_dist = None, tol
+    for i, ent in enumerate(entities):
+        if not isinstance(ent, ArcEntity):
+            continue
+        r = float(np.linalg.norm(pt - ent.center))
+        d = min(r, abs(r - ent.radius))
+        if d < best_dist:
+            best_idx, best_dist = i, d
+    return best_idx
 
 
 def _nearest_line_or_include(pt, entities, tol: float = 5.0) -> int | None:
@@ -96,9 +113,14 @@ class GeometricConstraintTool(BaseTool):
     def _pick(self, pt, sketch) -> int | None:
         if self._mode in ('horizontal', 'vertical'):
             return _nearest_line(pt, sketch.entities)
+        from cad.sketch_tools.dimension import _nearest_dimensionable
         if self._mode == 'tangent':
-            from cad.sketch_tools.dimension import _nearest_dimensionable
             return _nearest_dimensionable(pt, sketch.entities)
+        if self._mode == 'concentric':
+            return _nearest_arc(pt, sketch.entities)
+        if self._mode == 'equal':
+            i = _nearest_dimensionable(pt, sketch.entities)
+            return i if i is not None else _nearest_line_or_include(pt, sketch.entities)
         return _nearest_line_or_include(pt, sketch.entities)
 
     def handle_click(self, snap_result, sketch) -> bool:
@@ -128,7 +150,7 @@ class GeometricConstraintTool(BaseTool):
         if idx == self._first_idx:
             return True
 
-        from cad.sketch import SketchConstraint, SketchEntry, ReferenceEntity
+        from cad.sketch import SketchConstraint, SketchEntry, ReferenceEntity, ArcEntity
         ref_idx, mov_idx = self._first_idx, idx
         self._first_idx = None
         is_ref = lambda i: isinstance(sketch.entities[i], ReferenceEntity)
@@ -142,6 +164,13 @@ class GeometricConstraintTool(BaseTool):
             if not arc(ref_idx) or is_ref(mov_idx):
                 print("[Sketch] Tangent needs an arc/circle and a line or arc")
                 return True
+        elif self._mode == 'equal' and any(
+                isinstance(sketch.entities[i], ArcEntity)
+                for i in (ref_idx, mov_idx)) and not all(
+                isinstance(sketch.entities[i], ArcEntity)
+                for i in (ref_idx, mov_idx)):
+            print("[Sketch] Equal needs two lines (length) or two arcs/circles (radius)")
+            return True
         elif is_ref(mov_idx):
             # The solver treats the first index as the reference; an include
             # can't move, so it must be that one.
@@ -152,7 +181,10 @@ class GeometricConstraintTool(BaseTool):
             SketchConstraint(self._mode, (ref_idx, mov_idx), 0.0)
         )
         tmp = SketchEntry.from_sketch_mode(sketch)
-        if tmp.apply_constraints_local():
+        # Circles: the second pick moves / resizes to match the first.
+        arcs = isinstance(sketch.entities[mov_idx], ArcEntity) and \
+            isinstance(sketch.entities[ref_idx], ArcEntity)
+        if tmp.apply_constraints_local({mov_idx} if arcs else None):
             _writeback_entities(sketch, tmp)
         else:
             sketch.constraints.pop()

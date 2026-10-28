@@ -1385,14 +1385,16 @@ class SketchOverlay:
         glEnable(GL_BLEND)
         glLineWidth(1.2)
 
-        from cad.sketch import sharp_ends, pt_distance_ends
+        from cad.sketch import sharp_ends, pt_distance_ends, edge_gap_ends
         for ci, con in enumerate(constraints):
-            if con.type not in ('distance', 'sharp_distance', 'pt_distance'):
+            if con.type not in ('distance', 'sharp_distance', 'pt_distance',
+                                'edge_gap'):
                 continue
-            if con.type == 'pt_distance':
-                # Between two points (or a point and its foot on a line),
-                # drawn straight across unless dragged aside.
-                ends = pt_distance_ends(entities, con)
+            if con.type in ('pt_distance', 'edge_gap'):
+                # Between two points (a point and its foot on a line, a line
+                # and a circle's edge), straight across unless dragged aside.
+                ends = (pt_distance_ends if con.type == 'pt_distance'
+                        else edge_gap_ends)(entities, con)
                 if ends is None:
                     continue
                 ei = con.indices[1]
@@ -1430,7 +1432,8 @@ class SketchOverlay:
 
             # Use stored label_offset if dragged, otherwise default.
             offset = float(con.label_offset) if con.label_offset is not None \
-                else 0.0 if con.type == 'pt_distance' else default_offset
+                else 0.0 if con.type in ('pt_distance', 'edge_gap') \
+                else default_offset
 
             d0 = p0 + perp * offset
             d1 = p1 + perp * offset
@@ -1682,6 +1685,40 @@ class SketchOverlay:
                                       np.array([0.0, 0.0, 0.0]),
                     'perp_uv':        perp if slen > 1e-6 else np.array([0.0, 1.0]),
                     'p0_uv':          mid_uv,
+                    'constraints':    constraints,
+                })
+
+        # Equal radius / concentric: glyph on each arc, above its centre
+        # (concentric) or on its rim (equal).
+        from cad.sketch import ArcEntity
+        for ci, con in enumerate(constraints):
+            if con.type not in ('equal', 'concentric') or not all(
+                    0 <= ei < len(entities) and isinstance(entities[ei], ArcEntity)
+                    for ei in con.indices):
+                continue
+            for k, ei in enumerate(con.indices):
+                A = entities[ei]
+                c = np.array([float(A.center[0]), float(A.center[1])])
+                if con.type == 'concentric':
+                    # Stacked so the two tags at one centre don't overlap.
+                    pos = c + np.array([0.0, 1.0]) * max(camera_distance * 0.025, 1.5) * (k + 1)
+                    text = 'conc'
+                else:
+                    ang = (A.start_angle + A.end_angle) / 2
+                    pos = c + np.array([np.cos(ang), np.sin(ang)]) * \
+                        (A.radius + max(camera_distance * 0.025, 1.5))
+                    text = '=R'
+                w = to_3d(*pos)
+                labels.append({
+                    'world':          np.array([float(w[0]), float(w[1]), float(w[2])]),
+                    'text':           text,
+                    'constraint_idx': ci,
+                    'entity_idx':     ei,
+                    'parallel':       True,
+                    'dimmed':         dimmed,
+                    'perp_world':     np.zeros(3),
+                    'perp_uv':        np.array([0.0, 1.0]),
+                    'p0_uv':          pos,
                     'constraints':    constraints,
                 })
 

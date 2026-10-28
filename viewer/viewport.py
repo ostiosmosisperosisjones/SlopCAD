@@ -1948,10 +1948,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         lcons = lbl.get('constraints') or []
         is_gap = ci < len(lcons) and lcons[ci].type == 'gap'
         is_sharp = ci < len(lcons) and lcons[ci].type == 'sharp_distance'
-        is_pt = ci < len(lcons) and lcons[ci].type == 'pt_distance'
+        is_pt = ci < len(lcons) and lcons[ci].type in ('pt_distance', 'edge_gap')
         con_type    = ('diameter' if is_diameter else 'gap' if is_gap
                        else 'sharp_distance' if is_sharp
-                       else 'pt_distance' if is_pt else 'distance')
+                       else lcons[ci].type if is_pt else 'distance')
         edit_title  = ("Edit Diameter" if is_diameter else "Edit Gap" if is_gap
                        else "Edit Distance" if is_pt else "Edit Length")
         edit_label  = ("Diameter:" if is_diameter else "Gap:" if is_gap

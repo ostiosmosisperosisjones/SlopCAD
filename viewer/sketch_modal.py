@@ -127,12 +127,15 @@ class SketchModalMixin:
         is_arc = (entity_type == 'arc')
         is_gap = (entity_type == 'gap')
         is_pt  = (entity_type == 'pt')
+        is_edge = (entity_type == 'edge')
+        is_gap = is_gap or is_edge
         points = ref_idx[1] if is_pt else None
         label  = ("Diameter:" if is_arc else "Gap:" if is_gap
                   else "Distance:" if is_pt else "Length:")
         title  = ("Set Diameter" if is_arc else "Set Gap" if is_gap
                   else "Set Distance" if is_pt else "Set Length")
-        con_type = ('diameter' if is_arc else 'gap' if is_gap
+        con_type = ('diameter' if is_arc else 'edge_gap' if is_edge
+                    else 'gap' if is_gap
                     else 'pt_distance' if is_pt else 'distance')
         indices  = ((ref_idx, entity_idx) if is_gap else ref_idx[0] if is_pt
                     else (entity_idx,))
@@ -161,7 +164,7 @@ class SketchModalMixin:
                     (not is_pt or (c.indices, c.points) == (indices, points)))
         ]
         from cad.sketch import SketchEntry, LineEntity, ArcEntity
-        if is_gap:
+        if is_gap and not is_edge:
             # A gap pins one point's distance: the lines must also be held
             # parallel, unless other constraints already do that.
             par = SketchConstraint('parallel', indices, 0.0)

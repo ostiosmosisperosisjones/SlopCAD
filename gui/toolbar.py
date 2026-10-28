@@ -544,6 +544,13 @@ _SVG_CONSTRAINT_TANGENT = """
   <circle cx="16" cy="11" r="2" fill="#64b5f6"/>
 </svg>"""
 
+_SVG_CONSTRAINT_CONCENTRIC = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <circle cx="18" cy="18" r="13" fill="none" stroke="#64b5f6" stroke-width="2.2"/>
+  <circle cx="18" cy="18" r="7" fill="none" stroke="#64b5f6" stroke-width="2.2"/>
+  <circle cx="18" cy="18" r="1.8" fill="#64b5f6"/>
+</svg>"""
+
 _SVG_CONSTRAINT_HORIZ = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
   <line x1="6" y1="14" x2="30" y2="22" stroke="#64b5f6" stroke-width="2.2"
@@ -581,11 +588,12 @@ _SVG_CONSTRAINT_DIAMETER = """
   <polygon points="29,18 25,16 25,20" fill="#64b5f6"/>
 </svg>"""
 
-_CONSTRAINT_MODES = ['distance', 'diameter', 'equal', 'parallel', 'perpendicular', 'tangent', 'horizontal', 'vertical']
+_CONSTRAINT_MODES = ['distance', 'diameter', 'equal', 'parallel', 'perpendicular', 'tangent', 'concentric', 'horizontal', 'vertical']
 _CONSTRAINT_LABELS = {
     'distance':     'Distance (length / gap / points)',
     'diameter':     'Diameter (arc/circle)',
-    'equal':        'Equal',
+    'equal':        'Equal (length / radius)',
+    'concentric':   'Concentric (arcs/circles)',
     'parallel':     'Parallel',
     'perpendicular':'Perpendicular',
     'tangent':      'Tangent (arc/circle + line/arc)',
@@ -599,6 +607,7 @@ _CONSTRAINT_ICONS = {
     'parallel':     _SVG_CONSTRAINT_PARALLEL,
     'perpendicular':_SVG_CONSTRAINT_PERP,
     'tangent':      _SVG_CONSTRAINT_TANGENT,
+    'concentric':   _SVG_CONSTRAINT_CONCENTRIC,
     'horizontal':   _SVG_CONSTRAINT_HORIZ,
     'vertical':     _SVG_CONSTRAINT_VERT,
 }

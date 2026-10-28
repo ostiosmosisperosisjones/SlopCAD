@@ -5,6 +5,7 @@ DimensionTool — length, gap or diameter constraint.
 
   Line, same line again   → length of that line
   Line, a parallel line   → gap between them (perpendicular distance)
+  Line, an arc / circle   → gap from the line to its edge
   Arc / circle            → diameter (one click)
 
 Point picks — press C (centre), M (midpoint) or E (endpoint) before a click:
@@ -86,7 +87,10 @@ class DimensionTool(BaseTool):
             print("[Sketch] Point to a circle: press C to use its centre")
             return True
         if isinstance(ent, ArcEntity):
-            self.first_idx = None
+            first, self.first_idx = self.first_idx, None
+            if first is not None and first < len(sketch.entities) and \
+                    isinstance(sketch.entities[first], LineEntity):
+                return self._line_to_edge(first, idx, sketch, cb)
             if cb:
                 cb(idx, float(ent.radius * 2.0), 'arc')
             return True
@@ -106,6 +110,19 @@ class DimensionTool(BaseTool):
             return True
         if cb:
             cb(idx, gap, 'gap', first)
+        return True
+
+    def _line_to_edge(self, line, arc, sketch, cb) -> bool:
+        from cad.sketch import SketchConstraint, edge_gap_ends
+        A = sketch.entities[arc]
+        L = sketch.entities[line]
+        if _dist_to_line(A.center[:2], L.p0[:2], L.p1[:2]) <= A.radius + 1e-6:
+            print("[Sketch] The line cuts that circle — no gap to dimension")
+            return True
+        foot, rim = edge_gap_ends(sketch.entities,
+                                  SketchConstraint('edge_gap', (line, arc), 0.0))
+        if cb:
+            cb(arc, float(np.linalg.norm(foot - rim)), 'edge', line)
         return True
 
     def _point_to_point(self, a, b, sketch, cb) -> bool:
