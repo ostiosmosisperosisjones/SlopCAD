@@ -55,7 +55,7 @@ class SquareTool(BaseTool):
         Given self._p1 and self._cursor_2d (the opposite corner),
         build the square aligned with sketch axes and append 4 edges.
         """
-        from cad.sketch import LineEntity
+        from cad.sketch import LineEntity, SketchConstraint
         x0, y0 = float(self._p1[0]), float(self._p1[1])
         x1, y1 = float(self._cursor_2d[0]), float(self._cursor_2d[1])
 
@@ -66,6 +66,7 @@ class SquareTool(BaseTool):
         d = np.array([x0, y1])   # adjacent on Y axis
 
         sketch.push_undo_snapshot()
+        n0 = len(sketch.entities)
         for vert_a, vert_b in [(a, b), (b, c), (c, d), (d, a)]:
             ent = LineEntity(vert_a, vert_b)
             # Propagate snap metadata from endpoints
@@ -73,6 +74,15 @@ class SquareTool(BaseTool):
                 # This endpoint is the first corner — preserve snap info
                 pass
             sketch.entities.append(ent)
+        # Bake in "rectangle" the way Onshape does: opposite sides parallel,
+        # one corner square, and one horizontal side for orientation only —
+        # delete that one and it stays a rectangle that can rotate.
+        if abs(x1 - x0) > 1e-9 and abs(y1 - y0) > 1e-9:
+            for kind, idx in (('parallel', (n0, n0 + 2)),
+                              ('parallel', (n0 + 1, n0 + 3)),
+                              ('perpendicular', (n0, n0 + 1)),
+                              ('horizontal', (n0,))):
+                sketch.constraints.append(SketchConstraint(kind, idx, 0.0))
 
         self._p1 = None
 

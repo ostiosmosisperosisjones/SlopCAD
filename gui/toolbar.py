@@ -397,6 +397,18 @@ _SVG_DIVIDE = """
         stroke-linecap="round" opacity="0.6" stroke-dasharray="2,2"/>
 </svg>"""
 
+_SVG_JOIN = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <line x1="4" y1="22" x2="15" y2="19" stroke="#ffb74d" stroke-width="2"
+        stroke-linecap="round" opacity="0.6"/>
+  <line x1="21" y1="17" x2="32" y2="14" stroke="#ffb74d" stroke-width="2"
+        stroke-linecap="round" opacity="0.6"/>
+  <line x1="4" y1="22" x2="32" y2="14" stroke="#ffb74d" stroke-width="1.4"
+        stroke-linecap="round" stroke-dasharray="2,2"/>
+  <circle cx="4" cy="22" r="2" fill="#ffb74d"/>
+  <circle cx="32" cy="14" r="2" fill="#ffb74d"/>
+</svg>"""
+
 _SVG_INCLUDE = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
   <path d="M8,28 L18,8 L28,28" fill="none" stroke="#81c784" stroke-width="1.8"
@@ -524,6 +536,14 @@ _SVG_CONSTRAINT_PERP = """
         stroke-width="1.4" opacity="0.7"/>
 </svg>"""
 
+_SVG_CONSTRAINT_TANGENT = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <circle cx="16" cy="20" r="9" fill="none" stroke="#64b5f6" stroke-width="2.2"/>
+  <line x1="4" y1="11" x2="32" y2="11" stroke="#64b5f6" stroke-width="2.2"
+        stroke-linecap="round"/>
+  <circle cx="16" cy="11" r="2" fill="#64b5f6"/>
+</svg>"""
+
 _SVG_CONSTRAINT_HORIZ = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
   <line x1="6" y1="14" x2="30" y2="22" stroke="#64b5f6" stroke-width="2.2"
@@ -561,13 +581,14 @@ _SVG_CONSTRAINT_DIAMETER = """
   <polygon points="29,18 25,16 25,20" fill="#64b5f6"/>
 </svg>"""
 
-_CONSTRAINT_MODES = ['distance', 'diameter', 'equal', 'parallel', 'perpendicular', 'horizontal', 'vertical']
+_CONSTRAINT_MODES = ['distance', 'diameter', 'equal', 'parallel', 'perpendicular', 'tangent', 'horizontal', 'vertical']
 _CONSTRAINT_LABELS = {
-    'distance':     'Distance (line)',
+    'distance':     'Distance (length / gap / points)',
     'diameter':     'Diameter (arc/circle)',
     'equal':        'Equal',
     'parallel':     'Parallel',
     'perpendicular':'Perpendicular',
+    'tangent':      'Tangent (arc/circle + line/arc)',
     'horizontal':   'Horizontal',
     'vertical':     'Vertical',
 }
@@ -577,6 +598,7 @@ _CONSTRAINT_ICONS = {
     'equal':        _SVG_CONSTRAINT_EQUAL,
     'parallel':     _SVG_CONSTRAINT_PARALLEL,
     'perpendicular':_SVG_CONSTRAINT_PERP,
+    'tangent':      _SVG_CONSTRAINT_TANGENT,
     'horizontal':   _SVG_CONSTRAINT_HORIZ,
     'vertical':     _SVG_CONSTRAINT_VERT,
 }
@@ -640,6 +662,7 @@ class SketchToolbar(QToolBar):
     tool_circle_requested  = pyqtSignal(str)   # emits CircleMode value
     tool_trim_requested    = pyqtSignal()
     tool_divide_requested  = pyqtSignal()
+    tool_join_requested    = pyqtSignal()
     tool_fillet_requested  = pyqtSignal()
     tool_offset_requested  = pyqtSignal()
     tool_include_requested     = pyqtSignal()
@@ -684,6 +707,10 @@ class SketchToolbar(QToolBar):
             "Trim  T",   _SVG_TRIM,   self.tool_trim_requested,   "Trim  (T)")
         self._btn_divide = self._add_btn(
             "Divide  D", _SVG_DIVIDE, self.tool_divide_requested, "Divide  (D)")
+        self._btn_join = self._add_btn(
+            "Join  J", _SVG_JOIN, self.tool_join_requested,
+            "Join two lines into one  (J) — closes small gaps and angle "
+            "differences")
         self._btn_fillet = self._add_btn(
             "Fillet  F", _SVG_FILLET, self.tool_fillet_requested, "Fillet  (F)")
         self._btn_offset = self._add_btn(
@@ -844,6 +871,7 @@ class SketchToolbar(QToolBar):
             "CIRCLE":    self._btn_circle,
             "TRIM":      self._btn_trim,
             "DIVIDE":    self._btn_divide,
+            "JOIN":      self._btn_join,
             "FILLET":    self._btn_fillet,
             "OFFSET":    self._btn_offset,
             "DIMENSION": self._btn_constraint,
@@ -855,7 +883,8 @@ class SketchToolbar(QToolBar):
         }
         for btn in [self._btn_line, self._btn_arc, self._btn_square,
                     self._btn_spline, self._btn_circle,
-                    self._btn_trim, self._btn_divide, self._btn_fillet,
+                    self._btn_trim, self._btn_divide, self._btn_join,
+                    self._btn_fillet,
                     self._btn_offset, self._btn_include, self._btn_mirror,
                     self._btn_pattern, self._btn_construction,
                     self._btn_constraint]:

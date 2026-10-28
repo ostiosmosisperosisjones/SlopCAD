@@ -556,9 +556,24 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._position_offset_panel()
         self._position_fillet_panel()
 
+    def _refresh_cursor(self):
+        """Show the active tool next to the pointer (viewer/tool_cursor.py).
+        Runs per paint and mouse-move, so every tool switch is caught without
+        hooking each set_tool call site; only a changed key touches Qt."""
+        from viewer.tool_cursor import cursor_key, cursor_for
+        key = (cursor_key(self), self.devicePixelRatio())
+        if key == getattr(self, '_cursor_key', (None, None)):
+            return
+        self._cursor_key = key
+        if key[0] is None:
+            self.unsetCursor()
+        else:
+            self.setCursor(cursor_for(*key))
+
     def paintGL(self):
         from cad.profiler import profiler
         profiler.frame_begin()
+        self._refresh_cursor()
 
         # Advance the smooth-zoom animation from within the paint loop and
         # request the next frame. This rides the widget's own repaint cycle —
@@ -1562,6 +1577,14 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             tool_active = self._sketch.tool != SketchTool.NONE
             _NO_SNAP_TOOLS = {SketchTool.DIMENSION, SketchTool.GEOMETRIC}
             snap_active = tool_active and self._sketch.tool not in _NO_SNAP_TOOLS
+            # Distance tool: C / M / E pick a centre / midpoint / endpoint.
+            if self._sketch.tool == SketchTool.DIMENSION:
+                for name, st in (("snap_center", SnapType.CENTER),
+                                 ("snap_midpoint", SnapType.MIDPOINT),
+                                 ("snap_endpoint", SnapType.ENDPOINT)):
+                    if prefs.matches(name, e):
+                        self._sketch.snap.declare(st)
+                        self.sketch_mode_changed.emit(True); self.update(); return
 
             # Snap declarations only apply to drawing tools
             if snap_active and prefs.matches("snap_endpoint", e):
@@ -1638,6 +1661,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             elif prefs.matches("sketch_divide", e):
                 self._close_offset_panel()
                 self._sketch.set_tool(SketchTool.DIVIDE)
+            elif prefs.matches("sketch_join", e):
+                self._close_offset_panel()
+                self._sketch.set_tool(SketchTool.JOIN)
             elif prefs.matches("sketch_offset", e):
                 # Select-first: if lines/arcs are selected, offset them all and
                 # open the panel; otherwise fall back to click-to-select.
@@ -1756,6 +1782,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             self.camera.target = np.zeros(3)
             self.update()
             return
+        if self._chain_select(e):
+            return
         if self._sketch is not None:
             return
         # Try solid face first — opens a fresh sketch
@@ -1782,6 +1810,48 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         axis = self._pick_world_plane(origin, direction)
         if axis is not None:
             self._enter_sketch_on_plane(axis)
+
+    def _chain_select(self, e) -> bool:
+        """Double-click a sketch line/arc/spline → select its end-to-end chain
+        (stops at T/X junctions; Alt = the whole connected group).  Shift adds
+        to the selection.  Works on the active sketch and committed sketches.
+        Returns True if the double-click was consumed."""
+        from viewer.hover import parse_sketch_key
+        from cad.sketch_tools.chain import chain_from
+        from cad.sketch import SketchTool
+        hov_ebody, _ = self._hovered_edge
+        sk = parse_sketch_key(hov_ebody) if hov_ebody is not None else None
+        if sk is None:
+            return False
+        hidx, eidx = sk
+        if hidx == -1:
+            if self._sketch is None or self._sketch.tool != SketchTool.NONE:
+                return False
+            entities = self._sketch.entities
+        else:
+            entries = self.history.entries
+            se = (entries[hidx].params.get('sketch_entry')
+                  if 0 <= hidx < len(entries) else None)
+            if se is None:
+                return False
+            entities = se.entities
+        mods = e.modifiers()
+        chain = chain_from(entities, eidx,
+                           whole=bool(mods & Qt.KeyboardModifier.AltModifier))
+        if not chain:
+            return False
+        from cad.selection import SketchEdgeSel
+        if not mods & Qt.KeyboardModifier.ShiftModifier:
+            self.selection.clear()
+        have = set(self.selection.sketch_edges)
+        for i in chain:
+            if SketchEdgeSel(hidx, i) not in have:
+                self.selection.select_sketch_edge(hidx, i, additive=True)
+        print(f"[Sketch] Chain-selected {len(chain)} "
+              f"{'entity' if len(chain) == 1 else 'entities'}")
+        self.selection_changed.emit()
+        self.update()
+        return True
 
     def _pick_world_plane(self, ray_origin, ray_dir) -> str | None:
         """
@@ -1812,6 +1882,22 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
 
     def _delete_constraint_label(self, lbl: dict):
         """Shift+click — remove the constraint from sketch or committed entry."""
+        if lbl.get('snap'):
+            # Snap tag: drop the tie, keep the line where it is.
+            ents, ends = lbl['snap']
+            active = self._sketch is not None and ents is self._sketch.entities
+            if active:
+                self._sketch.push_undo_snapshot()
+            for i, which in ends:
+                setattr(ents[i], f'{which}_snap', None)
+            if active:
+                self.sketch_mode_changed.emit(True)
+            else:
+                self.history_changed.emit()
+            print(f"[Sketch] Removed snap tie on entity "
+                  f"{', '.join(str(i) for i, _ in ends)}")
+            self.update()
+            return
         ci = lbl['constraint_idx']
 
         if self._sketch is not None and ci < len(self._sketch.constraints):
@@ -1859,9 +1945,22 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         ci = lbl['constraint_idx']
         ei = lbl['entity_idx']
         is_diameter = lbl.get('is_diameter', False)
-        con_type    = 'diameter' if is_diameter else 'distance'
-        edit_title  = "Edit Diameter" if is_diameter else "Edit Length"
-        edit_label  = "Diameter:" if is_diameter else "Length:"
+        lcons = lbl.get('constraints') or []
+        is_gap = ci < len(lcons) and lcons[ci].type == 'gap'
+        is_sharp = ci < len(lcons) and lcons[ci].type == 'sharp_distance'
+        is_pt = ci < len(lcons) and lcons[ci].type == 'pt_distance'
+        con_type    = ('diameter' if is_diameter else 'gap' if is_gap
+                       else 'sharp_distance' if is_sharp
+                       else 'pt_distance' if is_pt else 'distance')
+        edit_title  = ("Edit Diameter" if is_diameter else "Edit Gap" if is_gap
+                       else "Edit Distance" if is_pt else "Edit Length")
+        edit_label  = ("Diameter:" if is_diameter else "Gap:" if is_gap
+                       else "Distance:" if is_pt else "Length:")
+
+        def _matches(con):
+            # A gap's / point distance's label carries its mover (indices[1]).
+            return con.type == con_type and \
+                con.indices[-1 if is_gap or is_pt else 0] == ei
 
         def _ask(con):
             """(ok, new constraint) — keeps label placement, swaps value/expr."""
@@ -1872,23 +1971,24 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 return False, None
             val, binding = answer
             return True, SketchConstraint(
-                con_type, (ei,), val,
+                con_type, con.indices, val,
                 label_offset=con.label_offset,
                 label_angle=getattr(con, 'label_angle', None),
                 expr=binding["expr"] if binding else None,
-                expr_unit=binding["unit"] if binding else "mm")
+                expr_unit=binding["unit"] if binding else "mm",
+                points=getattr(con, 'points', None))
 
         # Active sketch.
         if self._sketch is not None and ci < len(self._sketch.constraints):
             con = self._sketch.constraints[ci]
-            if con.type == con_type and con.indices[0] == ei:
+            if _matches(con):
                 ok, new_con = _ask(con)
                 if ok:
                     self._sketch.push_undo_snapshot()
                     self._sketch.constraints[ci] = new_con
                     from cad.sketch import SketchEntry, LineEntity, ArcEntity
                     tmp = SketchEntry.from_sketch_mode(self._sketch)
-                    if tmp.apply_last_constraint():
+                    if tmp.apply_constraints_local({ei}):
                         for i, ent in enumerate(tmp.entities):
                             if isinstance(ent, LineEntity):
                                 self._sketch.entities[i].p0 = ent.p0.copy()
@@ -1898,6 +1998,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                                 self._sketch.entities[i].radius      = ent.radius
                                 self._sketch.entities[i].start_angle = ent.start_angle
                                 self._sketch.entities[i].end_angle   = ent.end_angle
+                    else:
+                        self._sketch.constraints[ci] = con   # refused: keep old value
                     self._rebuild_sketch_faces()
                     self.sketch_mode_changed.emit(True)
                     self.update()
@@ -1911,12 +2013,13 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             if se is None or ci >= len(se.constraints):
                 continue
             con = se.constraints[ci]
-            if con.type != con_type or con.indices[0] != ei:
+            if not _matches(con):
                 continue
             ok, new_con = _ask(con)
             if ok:
                 se.constraints[ci] = new_con
-                se.apply_last_constraint()
+                if not se.apply_constraints_local({ei}):
+                    se.constraints[ci] = con   # refused: keep old value
                 self._rebuild_sketch_faces()
                 self.history_changed.emit()
                 self.update()
@@ -2256,6 +2359,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             self.camera.begin_pan(e.position())
 
     def mouseMoveEvent(self, e):
+        self._refresh_cursor()
         buttons = e.buttons()
         from viewer import busy
         if busy.active():               # no hover/drag while an op runs

@@ -18,6 +18,7 @@ from cad.sketch_tools.arc       import Arc3Tool
 from cad.sketch_tools.circle    import CircleTool, CircleMode
 from cad.sketch_tools.trim      import TrimTool
 from cad.sketch_tools.divide    import DivideTool
+from cad.sketch_tools.join      import JoinTool
 from cad.sketch_tools.point     import PointTool
 from cad.sketch_tools.offset    import OffsetTool
 from cad.sketch_tools.fillet    import FilletTool
@@ -41,6 +42,7 @@ TOOLS: dict[SketchTool, type[BaseTool]] = {
     SketchTool.SQUARE:    SquareTool,
     SketchTool.TRIM:      TrimTool,
     SketchTool.DIVIDE:    DivideTool,
+    SketchTool.JOIN:      JoinTool,
     SketchTool.POINT:     PointTool,
     SketchTool.OFFSET:    OffsetTool,
     SketchTool.FILLET:    FilletTool,

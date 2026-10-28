@@ -33,7 +33,7 @@ class DivideTool(BaseTool):
         from cad.sketch import LineEntity, ArcEntity
         from cad.sketch_tools.trim import (
             _closest_entity, _gather_split_params,
-            _split_line, _split_arc)
+            _split_line, _split_arc, _attach_cut_ends)
 
         click_pt = snap_result.cursor_raw
         entities = sketch.entities
@@ -57,10 +57,38 @@ class DivideTool(BaseTool):
         if len(pieces) <= 1:
             return False
 
+        _attach_cut_ends(target, pieces, entities)
+        joints = _tied_joints(target, target_idx, pieces, entities)
         sketch.push_undo_snapshot()
-        from cad.sketch import splice_entities
+        from cad.sketch import splice_entities, SketchConstraint
         splice_entities(sketch, target_idx, target_idx + 1, pieces)
+        # A mid/on tie at a cut point becomes a plain shared end; keep that
+        # end on the original line by keeping the pieces either side of it
+        # collinear (parallel + shared point) — "mid" downgrades to "on".
+        for k in joints:
+            sketch.constraints.append(SketchConstraint(
+                'parallel', (target_idx + k, target_idx + k + 1), 0.0))
         return True
 
     def cancel(self) -> None:
         self._cursor_2d = None
+
+
+def _tied_joints(target, target_idx, pieces, entities) -> list[int]:
+    """k for each joint between line pieces k and k+1 where some line end
+    was tied (MIDPOINT/NEAREST) to *target*."""
+    from cad.sketch import LineEntity
+    if not isinstance(target, LineEntity):
+        return []
+    tied = []
+    for ent in entities:
+        if not isinstance(ent, LineEntity):
+            continue
+        for which in ('p0', 'p1'):
+            snap = getattr(ent, f'{which}_snap', None)
+            if snap and snap[0] == target_idx and \
+                    getattr(snap[1], 'name', '') in ('MIDPOINT', 'NEAREST'):
+                tied.append(np.asarray(getattr(ent, which), float)[:2])
+    return [k for k in range(len(pieces) - 1)
+            if any(np.linalg.norm(pt - np.asarray(pieces[k].p1, float)[:2]) < 1e-3
+                   for pt in tied)]

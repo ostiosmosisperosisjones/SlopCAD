@@ -218,6 +218,7 @@ class TrimTool(BaseTool):
             from cad.sketch import splice_entities
             i = sketch.entities.index(target)
             splice_entities(sketch, i, i + 1, [])
+            _merge_left_behind(sketch, target)
             return True
 
         # Split target into pieces
@@ -261,12 +262,14 @@ class TrimTool(BaseTool):
                              key=lambda i: piece_nearest_dist(pieces[i]))
 
         survivors = [p for i, p in enumerate(pieces) if i != remove_idx]
+        _attach_cut_ends(target, survivors, entities)
 
         # Commit
         sketch.push_undo_snapshot()
         real_idx = entities.index(target)
         from cad.sketch import splice_entities
         splice_entities(sketch, real_idx, real_idx + 1, survivors)
+        _merge_left_behind(sketch, pieces[remove_idx])
         return True
 
     def cancel(self) -> None:
@@ -276,6 +279,62 @@ class TrimTool(BaseTool):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _attach_cut_ends(target, survivors, entities) -> None:
+    """A survivor end made by the cut sits on the line that cut it: snap it
+    there (MIDPOINT if it's that line's middle, else NEAREST) so the solver
+    keeps them together — a dimension on the trimmed line would otherwise
+    slide its end straight past the cutter.  Indices are pre-splice;
+    splice_entities remaps them."""
+    from cad.sketch import LineEntity, ArcEntity, _snap_on_piece
+    from cad.sketch_tools.snap import SnapType
+    for piece in survivors:
+        if not isinstance(piece, LineEntity):
+            continue
+        for which in ('p0', 'p1'):
+            pt = getattr(piece, which)
+            if getattr(piece, f'{which}_snap') is not None or \
+                    (isinstance(target, LineEntity) and
+                     min(np.linalg.norm(pt - target.p0),
+                         np.linalg.norm(pt - target.p1)) < 1e-6):
+                continue
+            for j, other in enumerate(entities):
+                if other is target:
+                    continue
+                if isinstance(other, LineEntity):
+                    kind = _snap_on_piece(pt, other, 'MIDPOINT')
+                elif isinstance(other, ArcEntity):
+                    # On the arc's circle, not at one of its ends (shared).
+                    on = abs(float(np.linalg.norm(pt - other.center))
+                             - other.radius) < 1e-3
+                    full = abs(other.end_angle - other.start_angle
+                               - 2 * np.pi) < 1e-6
+                    at_end = not full and min(
+                        np.linalg.norm(pt - other.p0),
+                        np.linalg.norm(pt - other.p1)) < 1e-3
+                    kind = 'NEAREST' if on and not at_end else None
+                else:
+                    continue
+                if kind:
+                    setattr(piece, f'{which}_snap', (j, SnapType[kind]))
+                    break
+
+
+def _merge_left_behind(sketch, removed) -> None:
+    """Joints the removed piece used to cross are now bare: two collinear
+    lines meeting there become one line again."""
+    from cad.sketch import LineEntity, merge_residual_joints
+    from cad.sketch_tools.snap import _nearest_on_segment, _nearest_on_arc
+
+    def on_removed(pt):
+        if isinstance(removed, LineEntity):
+            q = _nearest_on_segment(pt, removed.p0, removed.p1)
+        else:
+            q, _ = _nearest_on_arc(pt, removed)
+        return float(np.linalg.norm(q - pt)) < 1e-3
+
+    merge_residual_joints(sketch, on_removed)
+
 
 def _closest_entity(click_pt: np.ndarray, drawn: list, all_entities: list):
     """Return (entity, index_in_all_entities) of drawn entity closest to click."""

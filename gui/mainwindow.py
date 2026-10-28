@@ -70,6 +70,8 @@ class MainWindow(QMainWindow):
             lambda: self._sketch_set_tool("TRIM"))
         self._sketch_toolbar.tool_divide_requested.connect(
             lambda: self._sketch_set_tool("DIVIDE"))
+        self._sketch_toolbar.tool_join_requested.connect(
+            lambda: self._sketch_set_tool("JOIN"))
         self._sketch_toolbar.tool_fillet_requested.connect(
             lambda: self._sketch_set_tool("FILLET"))
         self._sketch_toolbar.tool_offset_requested.connect(
@@ -379,12 +381,13 @@ class MainWindow(QMainWindow):
                 SketchTool.CIRCLE: "CIRCLE — click to draw",
                 SketchTool.TRIM:   "TRIM — click segment to remove",
                 SketchTool.DIVIDE: "DIVIDE — click entity to split",
+                SketchTool.JOIN:   "JOIN — click two lines to make one",
                 SketchTool.FILLET:    "FILLET — click corner",
                 SketchTool.SQUARE:    "SQUARE — click two corners",
                 SketchTool.SPLINE:    "SPLINE — click points; Enter or click start to finish",
                 SketchTool.OFFSET:    "OFFSET — click entity or loop",
                 SketchTool.POINT:     "POINT — click to place",
-                SketchTool.DIMENSION: "DIMENSION — click a line",
+                SketchTool.DIMENSION: "DIMENSION — line twice = length · two parallel lines = gap · arc = diameter · C/M/E then click = centre/mid/end point",
                 SketchTool.GEOMETRIC: "CONSTRAINTS — click a line  (Tab=cycle mode)",
                 SketchTool.MIRROR:    "MIRROR — click a line to use as the axis",
                 SketchTool.PATTERN_LINEAR:   "LINEAR PATTERN — click a line for the direction",

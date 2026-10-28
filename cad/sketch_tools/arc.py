@@ -72,12 +72,27 @@ def _arc_angles(center: np.ndarray, p_start: np.ndarray,
         return a0 + d1, a0 + 2 * np.pi
 
 
+def _end_target(sketch, snap_result) -> int | None:
+    """Shift-click of an arc end onto a drawn line/arc (its end, or along
+    it): the entity the arc should be tangent to there, else None."""
+    from cad.sketch import LineEntity, ArcEntity
+    from cad.sketch_tools.snap import SnapType
+    j = getattr(snap_result, 'entity_idx', None)
+    if not sketch.snap.angle_snap_active or j is None or \
+            j >= len(sketch.entities) or snap_result.type not in (
+                SnapType.ENDPOINT, SnapType.TANGENT, SnapType.NEAREST,
+                SnapType.MIDPOINT):
+        return None
+    return j if isinstance(sketch.entities[j], (LineEntity, ArcEntity)) else None
+
+
 class Arc3Tool(BaseTool):
 
     def __init__(self):
         self._p1:         np.ndarray | None = None   # start
         self._p2:         np.ndarray | None = None   # on-arc
         self._cursor_2d:  np.ndarray | None = None
+        self._p1_target:  int | None = None   # Shift: be tangent to this at p1
 
     @property
     def cursor_2d(self) -> np.ndarray | None:
@@ -94,8 +109,10 @@ class Arc3Tool(BaseTool):
 
     def handle_mouse_move(self, snap_result, sketch) -> None:
         self._cursor_2d = snap_result.point.copy() if snap_result.point is not None else None
-        # Last confirmed point is the anchor for tangent snap
-        sketch.snap.anchor_pt = self._p2 if self._p2 is not None else self._p1
+        # p1 anchors the second click (angle lock, tangent snap).  The end
+        # click has none: Shift there means "tangent to what I land on",
+        # and an angle lock from the mid point would pull it off target.
+        sketch.snap.anchor_pt = self._p1 if self._p2 is None else None
 
     def handle_click(self, snap_result, sketch) -> bool:
         from cad.sketch import ArcEntity
@@ -105,6 +122,7 @@ class Arc3Tool(BaseTool):
 
         if self._p1 is None:
             self._p1 = pt.copy()
+            self._p1_target = _end_target(sketch, snap_result)
             return True
 
         if self._p2 is None:
@@ -126,6 +144,7 @@ class Arc3Tool(BaseTool):
             sketch.entities.append(LineEntity(self._p1, p3))
             self._p1 = p3.copy()
             self._p2 = None
+            self._p1_target = None
             return True
 
         center, radius = result
@@ -133,9 +152,22 @@ class Arc3Tool(BaseTool):
 
         sketch.push_undo_snapshot()
         sketch.entities.append(ArcEntity(center, radius, start_angle, end_angle))
-        # Chain: end of this arc becomes start of next
-        self._p1 = p3.copy()
+        idx = len(sketch.entities) - 1
+        targets = list(dict.fromkeys(
+            t for t in (self._p1_target, _end_target(sketch, snap_result))
+            if t is not None and t != idx))
+        if targets:
+            from cad.sketch import SketchConstraint
+            from cad.sketch_tools.line import _bake_constraints
+            _bake_constraints(sketch, idx, [
+                SketchConstraint('tangent', (idx, t), 0.0) for t in targets])
+        # Chain: end of this arc becomes start of next — and, Shift held,
+        # the next arc carries on tangent to this one.
+        arc = sketch.entities[idx]
+        self._p1 = min((arc.p0, arc.p1),
+                       key=lambda q: float(np.linalg.norm(q - p3))).copy()
         self._p2 = None
+        self._p1_target = idx if sketch.snap.angle_snap_active else None
         return True
 
     def cancel(self) -> None:
@@ -144,4 +176,5 @@ class Arc3Tool(BaseTool):
             self._p2 = None
         else:
             self._p1 = None
+            self._p1_target = None
         self._cursor_2d = None

@@ -115,15 +115,36 @@ class SketchModalMixin:
         print("[Sketch] Exited sketch mode.")
 
     def _on_dimension_requested(self, entity_idx: int, current_val: float,
-                                entity_type: str = 'line'):
-        """Show a spinbox for the user to enter a length or diameter constraint."""
+                                entity_type: str = 'line',
+                                ref_idx: int | None = None):
+        """Show a spinbox for the user to enter a length, gap or diameter
+        constraint.  A gap (entity_type 'gap') is between line *ref_idx*
+        and *entity_idx*; the latter is the one that moves.  A point
+        distance (entity_type 'pt') gets ref_idx = (indices, points)."""
         from gui.value_dialog import ask_value
         from cad.sketch import SketchConstraint
 
         is_arc = (entity_type == 'arc')
-        label  = "Diameter:" if is_arc else "Length:"
-        title  = "Set Diameter" if is_arc else "Set Length"
-        con_type = 'diameter' if is_arc else 'distance'
+        is_gap = (entity_type == 'gap')
+        is_pt  = (entity_type == 'pt')
+        points = ref_idx[1] if is_pt else None
+        label  = ("Diameter:" if is_arc else "Gap:" if is_gap
+                  else "Distance:" if is_pt else "Length:")
+        title  = ("Set Diameter" if is_arc else "Set Gap" if is_gap
+                  else "Set Distance" if is_pt else "Set Length")
+        con_type = ('diameter' if is_arc else 'gap' if is_gap
+                    else 'pt_distance' if is_pt else 'distance')
+        indices  = ((ref_idx, entity_idx) if is_gap else ref_idx[0] if is_pt
+                    else (entity_idx,))
+        if con_type == 'distance':
+            # A filleted line's length already measures to its sharp
+            # corner(s): edit that one rather than add a second length.
+            sharp = next((c for c in self._sketch.constraints
+                          if c.type == 'sharp_distance'
+                          and c.indices[0] == entity_idx), None)
+            if sharp is not None:
+                con_type, indices, current_val = \
+                    'sharp_distance', sharp.indices, sharp.value
 
         answer = ask_value(self, title, label, current_val)
         if answer is None:
@@ -131,19 +152,32 @@ class SketchModalMixin:
         val, binding = answer
 
         self._sketch.push_undo_snapshot()
-        # Replace any existing same-type constraint on this entity.
+        old_constraints = list(self._sketch.constraints)
+        # Replace any existing same-type constraint on this entity / pair.
         self._sketch.constraints = [
             c for c in self._sketch.constraints
-            if not (c.type == con_type and c.indices == (entity_idx,))
+            if not (c.type == con_type and
+                    set(c.indices) == set(indices) and
+                    (not is_pt or (c.indices, c.points) == (indices, points)))
         ]
-        self._sketch.constraints.append(
-            SketchConstraint(con_type, (entity_idx,), val,
-                             expr=binding["expr"] if binding else None,
-                             expr_unit=binding["unit"] if binding else "mm")
-        )
         from cad.sketch import SketchEntry, LineEntity, ArcEntity
+        if is_gap:
+            # A gap pins one point's distance: the lines must also be held
+            # parallel, unless other constraints already do that.
+            par = SketchConstraint('parallel', indices, 0.0)
+            self._sketch.constraints.append(par)
+            probe = SketchEntry.from_sketch_mode(self._sketch)
+            if len(self._sketch.constraints) - 1 in probe._implied_direction_cons():
+                self._sketch.constraints.pop()
+        self._sketch.constraints.append(
+            SketchConstraint(con_type, indices, val,
+                             expr=binding["expr"] if binding else None,
+                             expr_unit=binding["unit"] if binding else "mm",
+                             points=points)
+        )
         tmp = SketchEntry.from_sketch_mode(self._sketch)
-        if tmp.apply_all_constraints():
+        if tmp.apply_constraints_local({entity_idx} if is_gap or is_pt
+                                       else None):
             for i, ent in enumerate(tmp.entities):
                 if isinstance(ent, LineEntity):
                     self._sketch.entities[i].p0 = ent.p0.copy()
@@ -154,8 +188,9 @@ class SketchModalMixin:
                     self._sketch.entities[i].start_angle = ent.start_angle
                     self._sketch.entities[i].end_angle   = ent.end_angle
         else:
-            # Solver failed — roll back the constraint and snapshot.
-            self._sketch.constraints.pop()
+            # Solver failed — roll back the constraint (and the one it
+            # replaced) and the snapshot.
+            self._sketch.constraints = old_constraints
             self._sketch._entity_snapshots.pop()
         self._rebuild_sketch_faces()
         self.sketch_mode_changed.emit(True)

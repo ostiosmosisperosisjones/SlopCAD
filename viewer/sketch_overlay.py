@@ -526,6 +526,9 @@ class SketchOverlay:
         elif sketch.tool == SketchTool.DIVIDE:
             self._draw_divide_preview(sketch)
 
+        elif sketch.tool == SketchTool.JOIN:
+            self._draw_join_preview(sketch)
+
         elif sketch.tool == SketchTool.OFFSET:
             self._draw_offset_preview(sketch)
 
@@ -927,6 +930,31 @@ class SketchOverlay:
         glLineWidth(1.0)
         glDisable(GL_BLEND)
 
+    def _draw_join_preview(self, sketch: SketchMode):
+        """Highlight the first picked line and the hovered one; once both
+        are set, show the joined line (green) or nothing if not joinable."""
+        from cad.sketch_tools.join import JoinTool, joinable, joined_ends
+        tool = sketch._active_tool
+        if not isinstance(tool, JoinTool):
+            return
+        ents = sketch.entities
+        glEnable(GL_BLEND)
+        glLineWidth(3.0)
+        glBegin(GL_LINES)
+        glColor4f(0.30, 0.80, 1.00, 0.85)
+        for i in (tool.first, tool.hover):
+            if i is not None and i < len(ents):
+                glVertex3f(*self._pt(sketch.plane, *ents[i].p0[:2]))
+                glVertex3f(*self._pt(sketch.plane, *ents[i].p1[:2]))
+        if tool.first is not None and tool.first < len(ents) and \
+                tool.hover is not None and joinable(ents, tool.first, tool.hover):
+            a, b = joined_ends(ents, tool.first, tool.hover)
+            glColor4f(0.40, 1.00, 0.45, 0.95)
+            glVertex3f(*self._pt(sketch.plane, *a[:2]))
+            glVertex3f(*self._pt(sketch.plane, *b[:2]))
+        glEnd()
+        glLineWidth(1.0)
+
     def _draw_divide_preview(self, sketch: SketchMode):
         """Highlight the entity that would be divided, showing split points."""
         from cad.sketch_tools.trim import (_closest_entity,
@@ -1300,25 +1328,40 @@ class SketchOverlay:
         glEnable(GL_BLEND)
         glLineWidth(3.0)
 
-        # First selected line (drawn or straight include) — solid blue
-        if first_idx is not None and first_idx < len(sketch.entities):
-            ends = line_ends(sketch.entities[first_idx])
-            if ends is not None:
-                glColor4f(0.25, 0.60, 1.00, 0.95)
-                glBegin(GL_LINES)
-                glVertex3f(*self._pt(sketch.plane, ends[0][0], ends[0][1]))
-                glVertex3f(*self._pt(sketch.plane, ends[1][0], ends[1][1]))
-                glEnd()
+        def outline(idx):
+            from cad.sketch import ArcEntity
+            ent = sketch.entities[idx]
+            if isinstance(ent, ArcEntity):
+                a = np.linspace(ent.start_angle, ent.end_angle, 48)
+                return ent.center + ent.radius * np.stack([np.cos(a), np.sin(a)], 1)
+            ends = line_ends(ent)
+            return None if ends is None else np.array([ends[0][:2], ends[1][:2]])
 
-        # Hovered line — yellow
-        if hover_idx is not None and hover_idx != first_idx and hover_idx < len(sketch.entities):
-            ends = line_ends(sketch.entities[hover_idx])
-            if ends is not None:
-                glColor4f(1.00, 0.80, 0.20, 0.85)
-                glBegin(GL_LINES)
-                glVertex3f(*self._pt(sketch.plane, ends[0][0], ends[0][1]))
-                glVertex3f(*self._pt(sketch.plane, ends[1][0], ends[1][1]))
-                glEnd()
+        for idx, rgba in ((first_idx, (0.25, 0.60, 1.00, 0.95)),   # picked — blue
+                          (hover_idx, (1.00, 0.80, 0.20, 0.85))):  # hover — yellow
+            if idx is None or idx >= len(sketch.entities) or \
+                    (rgba[0] == 1.0 and idx == first_idx):
+                continue
+            pts = outline(idx)
+            if pts is None:
+                continue
+            glColor4f(*rgba)
+            glBegin(GL_LINE_STRIP)
+            for u, v in pts:
+                glVertex3f(*self._pt(sketch.plane, float(u), float(v)))
+            glEnd()
+
+        # Distance tool point picks (C / M / E): picked blue, hover yellow.
+        marks = getattr(tool, 'marker_points', None)
+        if marks is not None:
+            glPointSize(9.0)
+            glBegin(GL_POINTS)
+            for (u, v), picked in marks(sketch):
+                glColor4f(*((0.25, 0.60, 1.00, 0.95) if picked
+                            else (1.00, 0.80, 0.20, 0.95)))
+                glVertex3f(*self._pt(sketch.plane, float(u), float(v)))
+            glEnd()
+            glPointSize(1.0)
 
         glLineWidth(1.0)
         glDisable(GL_BLEND)
@@ -1342,15 +1385,41 @@ class SketchOverlay:
         glEnable(GL_BLEND)
         glLineWidth(1.2)
 
+        from cad.sketch import sharp_ends, pt_distance_ends
         for ci, con in enumerate(constraints):
-            if con.type != 'distance':
+            if con.type not in ('distance', 'sharp_distance', 'pt_distance'):
                 continue
-            ei = con.indices[0]
-            if ei >= len(entities) or not isinstance(entities[ei], LineEntity):
-                continue
-            ent = entities[ei]
-            p0 = np.array([float(ent.p0[0]), float(ent.p0[1])])
-            p1 = np.array([float(ent.p1[0]), float(ent.p1[1])])
+            if con.type == 'pt_distance':
+                # Between two points (or a point and its foot on a line),
+                # drawn straight across unless dragged aside.
+                ends = pt_distance_ends(entities, con)
+                if ends is None:
+                    continue
+                ei = con.indices[1]
+                p0, p1 = (np.array([float(q[0]), float(q[1])]) for q in ends)
+                glColor4f(0.35, 0.70, 1.00, 0.25 if dimmed else 0.90)
+                glPointSize(5.0)
+                glBegin(GL_POINTS)
+                glVertex3f(*_v3(to_3d(*p0)))
+                glVertex3f(*_v3(to_3d(*p1)))
+                glEnd()
+                glPointSize(1.0)
+            else:
+                ei = con.indices[0]
+                if ei >= len(entities) or not isinstance(entities[ei], LineEntity):
+                    continue
+                ent = entities[ei]
+                # A filleted line measures to its virtual sharp corner(s).
+                p0, p1 = (np.array([float(q[0]), float(q[1])])
+                          for q in sharp_ends(entities, con))
+            if con.type == 'sharp_distance':
+                glColor4f(0.35, 0.70, 1.00, 0.20 if dimmed else 0.45)
+                glBegin(GL_LINES)
+                for real, virt in ((ent.p0, p0), (ent.p1, p1)):
+                    if np.linalg.norm(np.asarray(real[:2]) - virt) > 1e-6:
+                        glVertex3f(*_v3(to_3d(float(real[0]), float(real[1]))))
+                        glVertex3f(*_v3(to_3d(*virt)))
+                glEnd()
 
             seg = p1 - p0
             seg_len = float(np.linalg.norm(seg))
@@ -1360,7 +1429,8 @@ class SketchOverlay:
             perp = np.array([-seg_dir[1], seg_dir[0]])  # 90° CCW
 
             # Use stored label_offset if dragged, otherwise default.
-            offset = float(con.label_offset) if con.label_offset is not None else default_offset
+            offset = float(con.label_offset) if con.label_offset is not None \
+                else 0.0 if con.type == 'pt_distance' else default_offset
 
             d0 = p0 + perp * offset
             d1 = p1 + perp * offset
@@ -1408,6 +1478,73 @@ class SketchOverlay:
                 'perp_uv':        perp,
                 'p0_uv':          p0,
                 'constraints':    constraints,  # reference for live update
+            })
+
+        # Gap between parallel lines — a dimension line straight across,
+        # centred on where they overlap; dragging slides it along them.
+        for ci, con in enumerate(constraints):
+            if con.type != 'gap':
+                continue
+            ref, mov = con.indices
+            if max(ref, mov) >= len(entities) or not all(
+                    isinstance(entities[k], LineEntity) for k in (ref, mov)):
+                continue
+            a0 = np.array([float(entities[ref].p0[0]), float(entities[ref].p0[1])])
+            a1 = np.array([float(entities[ref].p1[0]), float(entities[ref].p1[1])])
+            b0 = np.array([float(entities[mov].p0[0]), float(entities[mov].p0[1])])
+            b1 = np.array([float(entities[mov].p1[0]), float(entities[mov].p1[1])])
+            seg_len = float(np.linalg.norm(a1 - a0))
+            if seg_len < 1e-6:
+                continue
+            u = (a1 - a0) / seg_len
+            n = np.array([-u[1], u[0]])
+            h = float(np.dot(b0 - a0, n))                 # signed gap
+            ta = sorted((0.0, seg_len))
+            tb = sorted((float(np.dot(b0 - a0, u)), float(np.dot(b1 - a0, u))))
+            lo, hi = max(ta[0], tb[0]), min(ta[1], tb[1])
+            t_mid = (lo + hi) / 2 if lo <= hi else (ta[1] + tb[0]) / 2 \
+                if tb[0] > ta[1] else (tb[1] + ta[0]) / 2
+            base = a0 + u * t_mid
+            offset = float(con.label_offset) if con.label_offset is not None else 0.0
+            d0 = base + u * offset
+            d1 = d0 + n * h
+
+            alpha = 0.25 if dimmed else 0.90
+            glColor4f(0.35, 0.70, 1.00, alpha)
+            glBegin(GL_LINES)
+            glVertex3f(*_v3(to_3d(*d0)))
+            glVertex3f(*_v3(to_3d(*d1)))
+            # Extension lines when the dimension slides past a line's ends.
+            for p, (t0, t1), side in ((d0, ta, a0), (d1, tb, a0 + n * h)):
+                t = float(np.dot(p - side, u))
+                if t < t0 or t > t1:
+                    q = side + u * min(max(t, t0), t1)
+                    glVertex3f(*_v3(to_3d(*q)))
+                    glVertex3f(*_v3(to_3d(*p)))
+            glEnd()
+            sgn = 1.0 if h >= 0 else -1.0
+            for tip, away in ((d0, n * sgn), (d1, -n * sgn)):
+                base_centre = tip + away * arrow_size
+                base_half   = u * (arrow_size * 0.35)
+                glBegin(GL_TRIANGLES)
+                glVertex3f(*_v3(to_3d(*tip)))
+                glVertex3f(*_v3(to_3d(*(base_centre + base_half))))
+                glVertex3f(*_v3(to_3d(*(base_centre - base_half))))
+                glEnd()
+
+            mid_3d = to_3d(*((d0 + d1) * 0.5))
+            labels.append({
+                'world':          np.array([float(mid_3d[0]), float(mid_3d[1]), float(mid_3d[2])]),
+                'text':           _dim_text(con, ''),
+                'constraint_idx': ci,
+                'entity_idx':     mov,
+                'dimmed':         dimmed,
+                # Drag slides along the lines.
+                'perp_world':     np.array(_v3(to_3d(*u))) -
+                                  np.array(_v3(to_3d(0.0, 0.0))),
+                'perp_uv':        u,
+                'p0_uv':          base,
+                'constraints':    constraints,
             })
 
         # Diameter constraint annotations — full chord across circle, draggable.
@@ -1548,9 +1685,145 @@ class SketchOverlay:
                     'constraints':    constraints,
                 })
 
+        labels.extend(_snap_labels(entities, to_3d, camera_distance, dimmed,
+                                   constraints))
+        labels.extend(_tangent_labels(entities, constraints, to_3d,
+                                      camera_distance, dimmed))
+
         glLineWidth(1.0)
         glDisable(GL_BLEND)
         return labels
+
+
+def tangent_point(entities, con):
+    """Where a ('tangent', (arc, other)) constraint touches, or None."""
+    from cad.sketch import LineEntity, ArcEntity
+    a, b = con.indices
+    if max(a, b) >= len(entities) or not isinstance(entities[a], ArcEntity):
+        return None
+    A, B = entities[a], entities[b]
+    ends_a = [] if abs(A.end_angle - A.start_angle - 2 * np.pi) < 1e-6 \
+        else [A.p0, A.p1]
+    if isinstance(B, LineEntity):
+        for p in ends_a:
+            for q in (B.p0, B.p1):
+                if np.linalg.norm(p - q) < 1e-6:
+                    return np.asarray(p, float)
+        d = B.p1 - B.p0
+        t = float(np.dot(A.center - B.p0, d) / max(float(np.dot(d, d)), 1e-24))
+        return B.p0 + t * d
+    if isinstance(B, ArcEntity):
+        ends_b = [] if abs(B.end_angle - B.start_angle - 2 * np.pi) < 1e-6 \
+            else [B.p0, B.p1]
+        for p in ends_a:
+            for q in ends_b:
+                if np.linalg.norm(p - q) < 1e-6:
+                    return np.asarray(p, float)
+        n = B.center - A.center
+        nn = float(np.linalg.norm(n))
+        return A.center + (n / nn if nn > 1e-12 else np.array([1.0, 0])) * A.radius
+    return None
+
+
+def _tangent_labels(entities, constraints, to_3d, camera_distance, dimmed):
+    """'tan' tag at each tangent's touch point, nudged off the curve
+    towards its centre.  Shift+click deletes it like any constraint glyph."""
+    out = []
+    off = max(camera_distance * 0.02, 1.0)
+    for ci, con in enumerate(constraints):
+        if con.type != 'tangent':
+            continue
+        p = tangent_point(entities, con)
+        if p is None:
+            continue
+        A = entities[con.indices[0]]
+        n = A.center - p
+        nn = float(np.linalg.norm(n))
+        pos = p + (n / nn if nn > 1e-12 else np.zeros(2)) * off
+        w = to_3d(*pos)
+        out.append({
+            'world':          np.array([float(w[0]), float(w[1]), float(w[2])]),
+            'text':           'tan',
+            'constraint_idx': ci,
+            'entity_idx':     con.indices[1],
+            'parallel':       True,     # glyph-style: no value editor
+            'dimmed':         dimmed,
+            'perp_world':     np.zeros(3),
+            'perp_uv':        np.array([0.0, 1.0]),
+            'p0_uv':          pos,
+            'constraints':    [],       # nothing to drag
+        })
+    return out
+
+
+_SNAP_TAG = {'MIDPOINT': 'mid', 'NEAREST': 'on', 'TANGENT': 'on', 'CENTER': 'ctr'}
+
+
+def _snap_labels(entities, to_3d, camera_distance, dimmed,
+                 constraints=()) -> list[dict]:
+    """Tags for line ends the solver ties to another entity (midpoint of /
+    on a line, centre of an arc) — these act like constraints, so show them
+    like constraints; Shift+click removes one.  Plain shared endpoints are
+    just glue and get no tag."""
+    from cad.sketch import LineEntity, ArcEntity
+    groups: dict = {}       # (point, src) -> label; a shared joint tags once
+    # A tie under a tangent constraint is covered by its 'tan' tag.
+    tangent = {tuple(sorted(c.indices)) for c in constraints if c.type == 'tangent'}
+    off = max(camera_distance * 0.02, 1.0)
+    for i, ent in enumerate(entities):
+        if not isinstance(ent, LineEntity):
+            continue
+        for which in ('p0', 'p1'):
+            snap = getattr(ent, f'{which}_snap', None)
+            kind = getattr(snap[1], 'name', '') if snap else ''
+            if kind not in _SNAP_TAG or snap[0] >= len(entities):
+                continue
+            src = entities[snap[0]]
+            pt = np.asarray(getattr(ent, which), float)[:2]
+            other = np.asarray(ent.p1 if which == 'p0' else ent.p0, float)[:2]
+            if isinstance(src, LineEntity):
+                a, b = np.asarray(src.p0, float)[:2], np.asarray(src.p1, float)[:2]
+                if min(np.linalg.norm(pt - a), np.linalg.norm(pt - b)) < 1e-3:
+                    continue        # stale (the solver skips it too)
+                d = b - a
+                n = np.array([-d[1], d[0]]) / max(float(np.linalg.norm(d)), 1e-12)
+                # Tag on the side of the cutter away from this line.
+                side = -1.0 if np.dot(other - pt, n) > 0 else 1.0
+                pos = pt + n * side * off
+            elif isinstance(src, ArcEntity):
+                if kind == 'MIDPOINT':
+                    continue
+                if kind != 'CENTER' and not abs(src.end_angle - src.start_angle
+                                               - 2 * np.pi) < 1e-6 and min(
+                        np.linalg.norm(pt - src.p0), np.linalg.norm(pt - src.p1)) < 1e-3:
+                    continue        # it is the arc's end: shared, not tied
+                if tuple(sorted((i, snap[0]))) in tangent:
+                    continue
+                pos = pt + np.array([off, off]) * 0.7
+            else:
+                continue
+            key = (round(float(pt[0]), 4), round(float(pt[1]), 4), snap[0])
+            if key in groups:
+                g = groups[key]
+                g['snap'][1].append((i, which))
+                if kind == 'MIDPOINT':
+                    g['text'] = _SNAP_TAG[kind]
+                continue
+            w = to_3d(*pos)
+            groups[key] = {
+                'world':          np.array([float(w[0]), float(w[1]), float(w[2])]),
+                'text':           _SNAP_TAG[kind],
+                'constraint_idx': -1,
+                'entity_idx':     i,
+                'snap':           (entities, [(i, which)]),
+                'parallel':       True,   # glyph-style: no value editor
+                'dimmed':         dimmed,
+                'perp_world':     np.zeros(3),
+                'perp_uv':        np.array([0.0, 1.0]),
+                'p0_uv':          pos,
+                'constraints':    [],     # nothing to drag
+            }
+    return list(groups.values())
 
 
 def _v3(pt) -> tuple[float, float, float]:

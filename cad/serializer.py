@@ -288,6 +288,8 @@ def _constraint_to_dict(c) -> dict:
     if getattr(c, 'expr', None):
         d["expr"]      = c.expr
         d["expr_unit"] = c.expr_unit
+    if getattr(c, 'points', None):
+        d["points"] = list(c.points)
     return d
 
 
@@ -301,6 +303,7 @@ def _constraint_from_dict(d: dict):
         label_angle  = d.get("label_angle"),
         expr         = d.get("expr"),
         expr_unit    = d.get("expr_unit", "mm"),
+        points       = d.get("points"),
     )
 
 

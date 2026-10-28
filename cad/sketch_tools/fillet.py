@@ -402,11 +402,44 @@ def _apply_fillet_result(corner_pt, ent_a, end_a, ent_b, end_b,
     hi, lo = (idx_a, idx_b) if idx_a > idx_b else (idx_b, idx_a)
     hi_kept = kept_a if idx_a > idx_b else kept_b
     lo_kept = kept_b if idx_a > idx_b else kept_a
-    from cad.sketch import splice_entities
+    from cad.sketch import splice_entities, SketchConstraint
     splice_entities(sketch, hi, hi + 1, [hi_kept])
     splice_entities(sketch, lo, lo + 1, [lo_kept])
     splice_entities(sketch, lo + 1, lo + 1, [arc])
+    ai = lo + 1
+    na, nb = (hi + 1, lo) if idx_a > idx_b else (lo, hi + 1)
+    cons = getattr(sketch, 'constraints', None)
+    if cons is not None:
+        _measure_to_sharp(sketch, na, end_a, nb)
+        _measure_to_sharp(sketch, nb, end_b, na)
+        # The arc stays tangent to both sides when anything moves.
+        cons.append(SketchConstraint('tangent', (ai, na), 0.0))
+        cons.append(SketchConstraint('tangent', (ai, nb), 0.0))
     return True
+
+
+def _measure_to_sharp(sketch, i: int, end: int, other: int) -> None:
+    """A length dimension on line i keeps measuring to the corner the
+    fillet cut off (where i meets *other* extended) — the part keeps its
+    size instead of the dimension re-stretching the trimmed line."""
+    from cad.sketch import LineEntity, SketchConstraint
+    ents = sketch.entities
+    if not (isinstance(ents[i], LineEntity) and isinstance(ents[other], LineEntity)):
+        return
+    for k, c in enumerate(sketch.constraints):
+        if c.indices[:1] != (i,):
+            continue
+        if c.type == 'distance':
+            n = [-1, -1]
+        elif c.type == 'sharp_distance':
+            n = list(c.indices[1:3])
+        else:
+            continue
+        n[end] = other
+        sketch.constraints[k] = SketchConstraint(
+            'sharp_distance', (i, n[0], n[1]), c.value,
+            label_offset=c.label_offset, expr=getattr(c, 'expr', None),
+            expr_unit=getattr(c, 'expr_unit', 'mm'))
 
 
 def apply_fillet(corner_pt, ent_a, end_a, ent_b, end_b,

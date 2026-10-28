@@ -16,7 +16,7 @@ from cad.sketch_tools.base import BaseTool
 from cad.sketch_tools.dimension import _nearest_line, _pt_to_seg_dist
 
 
-MODES = ['parallel', 'perpendicular', 'horizontal', 'vertical', 'equal']
+MODES = ['parallel', 'perpendicular', 'tangent', 'horizontal', 'vertical', 'equal']
 
 
 def _writeback_entities(sketch, tmp):
@@ -34,6 +34,7 @@ def _writeback_entities(sketch, tmp):
 MODE_LABELS = {
     'parallel':      'PARALLEL  (Tab→)',
     'perpendicular': 'PERP  (Tab→)',
+    'tangent':       'TANGENT  (Tab→)',
     'horizontal':    'HORIZONTAL  (Tab→)',
     'vertical':      'VERTICAL  (Tab→)',
     'equal':         'EQUAL  (Tab→)',
@@ -95,6 +96,9 @@ class GeometricConstraintTool(BaseTool):
     def _pick(self, pt, sketch) -> int | None:
         if self._mode in ('horizontal', 'vertical'):
             return _nearest_line(pt, sketch.entities)
+        if self._mode == 'tangent':
+            from cad.sketch_tools.dimension import _nearest_dimensionable
+            return _nearest_dimensionable(pt, sketch.entities)
         return _nearest_line_or_include(pt, sketch.entities)
 
     def handle_click(self, snap_result, sketch) -> bool:
@@ -110,7 +114,7 @@ class GeometricConstraintTool(BaseTool):
             sketch.push_undo_snapshot()
             sketch.constraints.append(SketchConstraint(self._mode, (idx,), 0.0))
             tmp = SketchEntry.from_sketch_mode(sketch)
-            if tmp.apply_all_constraints():
+            if tmp.apply_constraints_local():
                 _writeback_entities(sketch, tmp)
             else:
                 sketch.constraints.pop()
@@ -130,7 +134,15 @@ class GeometricConstraintTool(BaseTool):
         is_ref = lambda i: isinstance(sketch.entities[i], ReferenceEntity)
         if is_ref(ref_idx) and is_ref(mov_idx):
             return True          # both fixed: nothing for the solver to move
-        if is_ref(mov_idx):
+        if self._mode == 'tangent':
+            from cad.sketch import ArcEntity
+            arc = lambda i: isinstance(sketch.entities[i], ArcEntity)
+            if not arc(ref_idx):
+                ref_idx, mov_idx = mov_idx, ref_idx     # (arc, other)
+            if not arc(ref_idx) or is_ref(mov_idx):
+                print("[Sketch] Tangent needs an arc/circle and a line or arc")
+                return True
+        elif is_ref(mov_idx):
             # The solver treats the first index as the reference; an include
             # can't move, so it must be that one.
             ref_idx, mov_idx = mov_idx, ref_idx
@@ -140,7 +152,7 @@ class GeometricConstraintTool(BaseTool):
             SketchConstraint(self._mode, (ref_idx, mov_idx), 0.0)
         )
         tmp = SketchEntry.from_sketch_mode(sketch)
-        if tmp.apply_all_constraints():
+        if tmp.apply_constraints_local():
             _writeback_entities(sketch, tmp)
         else:
             sketch.constraints.pop()

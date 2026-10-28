@@ -783,6 +783,7 @@ def _resolve_bound_dimensions(se, history: History, pins: dict | None = None,
         return True, ""
     values = history.param_values()
     changed = False
+    seed: set[int] = set()
     for c in bound:
         try:
             v = parse_expr(c.expr, c.expr_unit, values)
@@ -793,8 +794,15 @@ def _resolve_bound_dimensions(se, history: History, pins: dict | None = None,
         if abs(v - c.value) > 1e-9:
             c.value = v
             changed = True
-    if (changed or follow) and not se.apply_all_constraints(
-            pins=pins, attachments=attachments):
+            # A gap moves its second line, like the dimension tool does.
+            seed.update(c.indices[1:] if c.type == 'gap' else c.indices)
+    # A parameter edit moves only what it has to (apply_constraints_local);
+    # following moved includes stays a global solve.
+    if follow:
+        ok = se.apply_all_constraints(pins=pins, attachments=attachments)
+    else:
+        ok = not changed or se.apply_constraints_local(seed, attachments=attachments)
+    if (changed or follow) and not ok:
         if follow and not changed:
             return False, ("Sketch can't follow its included geometry: "
                            "the constraint solver failed")

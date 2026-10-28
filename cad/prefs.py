@@ -53,6 +53,7 @@ KEYBIND_DEFAULTS: dict[str, str] = {
     "sketch_circle":     "C",
     "sketch_trim":       "T",
     "sketch_divide":     "D",
+    "sketch_join":       "J",
     "sketch_point":      "P",
     "sketch_offset":     "O",
     "sketch_fillet":     "F",
@@ -90,7 +91,7 @@ KEYBINDS_3D: frozenset[str] = frozenset({
 # Actions that are only active in sketch mode
 KEYBINDS_SKETCH: frozenset[str] = frozenset({
     "sketch_line", "sketch_arc", "sketch_circle", "sketch_trim",
-    "sketch_divide", "sketch_point", "sketch_offset", "sketch_fillet",
+    "sketch_divide", "sketch_join", "sketch_point", "sketch_offset", "sketch_fillet",
     "sketch_include", "sketch_dimension", "sketch_geometric", "sketch_square",
     "sketch_spline", "sketch_construction", "sketch_mirror",
     "sketch_import_image",
@@ -113,6 +114,7 @@ KEYBIND_LABELS: dict[str, tuple[str, str]] = {
     "sketch_circle":            ("Sketch",     "Circle tool"),
     "sketch_trim":              ("Sketch",     "Trim tool"),
     "sketch_divide":            ("Sketch",     "Divide tool"),
+    "sketch_join":              ("Sketch",     "Join tool (two lines into one)"),
     "sketch_point":             ("Sketch",     "Point tool"),
     "sketch_offset":            ("Sketch",     "Offset tool"),
     "sketch_fillet":            ("Sketch",     "Fillet tool"),
