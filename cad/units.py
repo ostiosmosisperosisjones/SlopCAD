@@ -78,6 +78,30 @@ def format_op_label(operation: str, params: dict) -> str:
         dist  = params.get("distance", 0.0)
         angle = params.get("angle_deg", 45.0)
         return f"Chamfer  {format_value(dist, unit, decimals)} × {angle:.1f}°"
+    if operation == "sweep":
+        return "Sweep"
+    if operation == "sweep_cut":
+        return "Sweep cut"
+    if operation == "transform":
+        what = "Copy" if params.get("copy") else "Move"
+        if params.get("mode") == "rotate":
+            ax = params.get("axis", "Z")
+            return f"{what}  ⟳ {params.get('angle_deg', 0.0):g}° about {'edge' if ax == 'edge' else ax}"
+        d = [format_value(params.get(k, 0.0), unit, decimals) for k in ("dx", "dy", "dz")]
+        return f"{what}  ({', '.join(d)})"
+    if operation == "helix":
+        turns = (f"pitch {format_value(params['pitch'], unit, decimals)}"
+                 if params.get("pitch") else f"{params.get('turns', 0):g} turns")
+        h = (format_value(params["height"], unit, decimals)
+             if params.get("height") else "face length")
+        return f"Helix  {turns} × {h}"
+    if operation in ("coil", "coil_cut"):
+        h = format_value(params.get("height", 0.0), unit, decimals)
+        return (f"Coil{' cut' if operation == 'coil_cut' else ''}  "
+                f"{params.get('turns', 0):g} turns × {h}")
+    if operation == "shell":
+        side = "out" if params.get("outside") else "in"
+        return f"Shell  {format_value(params.get('thickness', 0.0), unit, decimals)} {side}"
     if operation == "union":
         n = len(params.get("body_ids", []))
         return f"Union  ({n} bodies)"

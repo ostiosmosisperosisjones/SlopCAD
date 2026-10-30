@@ -46,11 +46,16 @@ class MainWindow(QMainWindow):
         self._ops_toolbar = OpsToolbar(self)
         self._ops_toolbar.extrude_requested.connect(self._toolbar_extrude)
         self._ops_toolbar.thicken_requested.connect(self._toolbar_thicken)
+        self._ops_toolbar.shell_requested.connect(self._toolbar_shell)
         self._ops_toolbar.fillet_requested.connect(self._toolbar_fillet)
         self._ops_toolbar.sketch_requested.connect(self._toolbar_sketch)
         self._ops_toolbar.revolve_requested.connect(self._toolbar_revolve)
         self._ops_toolbar.offset_plane_requested.connect(self._toolbar_offset_plane)
         self._ops_toolbar.loft_requested.connect(self._toolbar_loft)
+        self._ops_toolbar.sweep_requested.connect(self._toolbar_sweep)
+        self._ops_toolbar.coil_requested.connect(self._toolbar_coil)
+        self._ops_toolbar.transform_requested.connect(self._toolbar_transform)
+        self._ops_toolbar.helix_requested.connect(self._toolbar_helix)
         self._ops_toolbar.chamfer_requested.connect(self._toolbar_chamfer)
         self._ops_toolbar.boolean_requested.connect(self._toolbar_boolean)
         self.addToolBar(self._ops_toolbar)
@@ -226,6 +231,31 @@ class MainWindow(QMainWindow):
             return
         self._viewport._try_thicken()
 
+    def _toolbar_sweep(self):
+        if not self._viewport:
+            return
+        self._viewport._try_sweep()
+
+    def _toolbar_coil(self):
+        if not self._viewport:
+            return
+        self._viewport._try_coil()
+
+    def _toolbar_helix(self):
+        if not self._viewport:
+            return
+        self._viewport._try_helix()
+
+    def _toolbar_transform(self):
+        if not self._viewport:
+            return
+        self._viewport._try_transform()
+
+    def _toolbar_shell(self):
+        if not self._viewport:
+            return
+        self._viewport._try_shell()
+
     def _toolbar_fillet(self):
         if not self._viewport:
             return
@@ -387,7 +417,7 @@ class MainWindow(QMainWindow):
                 SketchTool.SPLINE:    "SPLINE — click points; Enter or click start to finish",
                 SketchTool.OFFSET:    "OFFSET — click entity or loop",
                 SketchTool.POINT:     "POINT — click to place",
-                SketchTool.DIMENSION: "DIMENSION — line twice = length · two parallel lines = gap · line, circle = edge gap · arc = diameter · C/M/E then click = centre/mid/end point",
+                SketchTool.DIMENSION: "DIMENSION — line twice = length · two parallel lines = gap · two other lines = angle · line, circle = edge gap · arc = diameter · C/M/E then click = centre/mid/end point",
                 SketchTool.GEOMETRIC: "CONSTRAINTS — click a line  (Tab=cycle mode)",
                 SketchTool.MIRROR:    "MIRROR — click a line to use as the axis",
                 SketchTool.PATTERN_LINEAR:   "LINEAR PATTERN — click a line for the direction",
@@ -732,6 +762,11 @@ class MainWindow(QMainWindow):
         sidebar.history_panel.reenter_sketch_requested.connect(vp._reenter_sketch)
         sidebar.history_panel.reopen_extrude_requested.connect(vp.reopen_extrude)
         sidebar.history_panel.reopen_thicken_requested.connect(vp.reopen_thicken)
+        sidebar.history_panel.reopen_shell_requested.connect(vp.reopen_shell)
+        sidebar.history_panel.reopen_sweep_requested.connect(vp.reopen_sweep)
+        sidebar.history_panel.reopen_coil_requested.connect(vp.reopen_coil)
+        sidebar.history_panel.reopen_transform_requested.connect(vp.reopen_transform)
+        sidebar.history_panel.reopen_helix_requested.connect(vp.reopen_helix)
         sidebar.history_panel.reopen_revolve_requested.connect(vp.reopen_revolve)
         sidebar.history_panel.reopen_fillet_requested.connect(vp.reopen_fillet)
         sidebar.history_panel.reopen_loft_requested.connect(vp.reopen_loft)

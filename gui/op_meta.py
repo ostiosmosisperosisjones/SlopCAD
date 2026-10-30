@@ -74,6 +74,41 @@ OP_META: dict[str, OpMeta] = {
         long="Bevel selected edges by a distance and angle, producing a flat "
              "transition instead of a rounded one.",
     ),
+    "sweep": OpMeta(
+        action="",
+        short="Sweep a sketch profile along a path of sketch edges",
+        long="Run a closed profile along connected sketch lines, arcs or "
+             "splines to make a solid, or cut one away. Pick the profile, "
+             "then the path edges.",
+    ),
+    "coil": OpMeta(
+        action="",
+        short="Coil — a helix around a sketch circle",
+        long="Wind a circle or square section along a helix around a sketch "
+             "circle: the circle sets the axis and diameter; set the height, "
+             "turns and section. New body, merge, or cut (threads, springs).",
+    ),
+    "helix": OpMeta(
+        action="",
+        short="Helix — a helical curve to sweep along",
+        long="Wrap a helix around a cylindrical face (its full length, or a "
+             "set height) or a sketch circle. Set turns or pitch and the hand. "
+             "Then Sweep a sketch profile along it — cut for a thread, "
+             "new body for a spring.",
+    ),
+    "transform": OpMeta(
+        action="",
+        short="Move / rotate a body, or a copy of it",
+        long="Translate a body by X/Y/Z, or rotate it about a world axis or "
+             "one of its own straight / circular edges. Copy keeps the original. "
+             "Values take parameters.",
+    ),
+    "shell": OpMeta(
+        action="",
+        short="Shell — hollow a body into walls, picked faces left open",
+        long="Hollow a solid into walls of uniform thickness. Pick the faces "
+             "to remove (open); with none, the body becomes a closed hollow.",
+    ),
     "boolean": OpMeta(
         action="",
         short="Boolean union / subtract / intersect between bodies",

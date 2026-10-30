@@ -372,6 +372,157 @@ class Doc:
     def chamfer(self, body: Body, edges=None, faces=None, d=1.0) -> Body:
         return self._edge_op("chamfer", body, edges, faces, distance=d)
 
+    def _push_body_op(self, op, operation: str, cut, into, fields=None) -> Body:
+        """Push a SketchLoftOp-family op: a new body (cut/into None), or cut
+        from / fused into a body.  *fields* bind as in _bind."""
+        if into is not None:
+            op.merge_body_id = into.id
+        if cut is not None:
+            op.cut_body_id = cut.id
+            operation += "_cut"
+        params = self._bind(op.to_params(), **(fields or {}))
+        target = cut or into
+        if target is None:
+            # New body: same shape the GUI's finalize leaves behind.
+            body = self.workspace.add_body(self.workspace.next_part_name(), None)
+            params["child_body_ids"] = [body.id]
+            entry = self.history.push(
+                label=operation, operation=operation, params=params,
+                body_id=body.id, face_ref=None, shape_before=None, shape_after=None)
+            body.created_at_entry_id = entry.entry_id
+            self._commit(entry)
+            return Body(self, body.id)
+        entry = self.history.push(
+            label=operation, operation=operation, params=params,
+            body_id=target.id, face_ref=None,
+            shape_before=target.shape, shape_after=None)
+        self._commit(entry)
+        return target
+
+    def sweep(self, profile: Sketch, path: Sketch, region: int | None = None,
+              edges: list[int] | None = None, cut: Body | None = None,
+              into: Body | None = None, frenet: bool = True) -> Body:
+        """Sweep one closed region of *profile* (the only one, or *region*)
+        along *path*'s drawn entities (all, or the *edges* indices), or
+        along a helix entry (doc.helix).  New body, or fused into *into* /
+        cut from *cut*."""
+        from cad.op_sweep import SketchSweepOp, HELIX_PATH
+        sk_entry = self.commit_sketch(profile)
+        if isinstance(path, Sketch):
+            path_entry = self.commit_sketch(path)
+            ents = path.se.entities
+            idx = list(range(len(ents))) if edges is None else list(edges)
+            uids = [ents[i].uid for i in idx]
+        else:
+            path_entry, uids = path, [HELIX_PATH]
+        op = SketchSweepOp(from_profiles=[(sk_entry.entry_id, region)],
+                           path_sketch_id=path_entry.entry_id,
+                           path_uids=uids, frenet=frenet)
+        return self._push_body_op(op, "sweep", cut, into)
+
+    def coil(self, sk: Sketch, circle: int = 0, height=20.0, turns=5.0,
+             size=1.0, section: str = "circle", left_hand: bool = False,
+             flip: bool = False, cut: Body | None = None,
+             into: Body | None = None) -> Body:
+        """Helical coil around the sketch's *circle* (entity index): its
+        centre + the sketch normal are the axis, its diameter the coil's.
+        height / turns / size (section diameter or side) take expressions."""
+        from cad.op_coil import CoilOp
+        entry = self.commit_sketch(sk)
+        op = CoilOp(circle_sketch_id=entry.entry_id,
+                    circle_uid=sk.se.entities[circle].uid, section=section,
+                    left_hand=left_hand, flip=flip)
+        return self._push_body_op(op, "coil", cut, into,
+                                  dict(height=height, turns=turns, section_size=size))
+
+    def helix(self, on, face: int | None = None, circle: int = 0, height=0.0,
+              turns=5.0, pitch=0.0, left_hand: bool = False,
+              flip: bool = False):
+        """Helix curve around a cylindrical face of a Body (*face* index; the
+        first cylindrical one by default) or a Sketch's *circle*.  height 0
+        = the face's full length; pitch > 0 drives (else turns).  height /
+        pitch take expressions.  Returns the history entry — sweep along
+        it with doc.sweep(profile, path=entry)."""
+        from cad.op_helix import HelixOp, cylinder_axis
+        from cad.face_ref import AnyFaceRef
+        if isinstance(on, Body):
+            faces = list(on.shape.faces())
+            if face is None:
+                face = next((i for i, f in enumerate(faces)
+                             if cylinder_axis(f.wrapped) is not None), None)
+                if face is None:
+                    raise ApiError("body has no cylindrical face")
+            op = HelixOp(body_id=on.id,
+                         face_ref=AnyFaceRef.from_occ_face(faces[face].wrapped))
+        else:
+            entry = self.commit_sketch(on)
+            op = HelixOp(circle_sketch_id=entry.entry_id,
+                         circle_uid=on.se.entities[circle].uid)
+        op.turns, op.left_hand, op.flip = float(turns), left_hand, flip
+        params = self._bind(op.to_params(), height=height, pitch=pitch)
+        entry = self.history.push(label="helix", operation="helix", params=params,
+                                  body_id=None, face_ref=None,
+                                  shape_before=None, shape_after=None)
+        return self._commit(entry)
+
+    def _transform(self, body: Body, copy: bool, fields: dict, **kw) -> Body:
+        from cad.op_transform import TransformOp
+        op = TransformOp(source_body_id=body.id, copy=copy, **kw)
+        params = self._bind(op.to_params(), **fields)
+        if "angle_deg" in params.get("exprs", {}):
+            params["exprs"]["angle_deg"]["unit"] = "deg"
+        if not copy:
+            entry = self.history.push(
+                label="transform", operation="transform", params=params,
+                body_id=body.id, face_ref=None, shape_before=body.shape,
+                shape_after=None)
+            self._commit(entry)
+            return body
+        new = self.workspace.add_body(f"{self.workspace.bodies[body.id].name} copy", None)
+        params["child_body_ids"] = [new.id]
+        entry = self.history.push(
+            label="transform", operation="transform", params=params,
+            body_id=new.id, face_ref=None, shape_before=None, shape_after=None)
+        new.created_at_entry_id = entry.entry_id
+        self._commit(entry)
+        return Body(self, new.id)
+
+    def move(self, body: Body, dx=0.0, dy=0.0, dz=0.0, copy: bool = False) -> Body:
+        """Translate *body* (or, copy=True, a new copy of it).  Distances
+        take expressions (a bound one must evaluate >= 0)."""
+        return self._transform(body, copy, dict(dx=dx, dy=dy, dz=dz))
+
+    def rotate(self, body: Body, angle, axis="Z", edge=None, flip: bool = False,
+               copy: bool = False) -> Body:
+        """Rotate *body* by *angle* degrees about a world axis ('X'|'Y'|'Z',
+        through the origin) or one of its straight / circular *edge*s."""
+        ref = None
+        if edge is not None:
+            from cad.edge_ref import EdgeRef
+            ref = EdgeRef.for_edge(self.history, body.id, edge.wrapped,
+                                   body.shape.wrapped, self.history.cursor + 1)
+            axis = "edge"
+        return self._transform(body, copy, dict(angle_deg=angle), mode="rotate",
+                               axis=axis, axis_edge_ref=ref, flip_axis=flip)
+
+    def shell(self, body: Body, open=(), t=1.0, outside: bool = False) -> Body:
+        """Hollow *body* into walls *t* thick; *open* faces (selectors) are
+        removed.  No open faces = a closed hollow."""
+        from cad.op_shell import ShellOp
+        from cad.face_ref import AnyFaceRef
+        shape = body.shape
+        idx = [self.face_index(body, f) for f in open]
+        faces = list(shape.faces())
+        op = ShellOp(source_body_id=body.id, face_indices=idx, thickness=1.0,
+                     outside=outside,
+                     face_refs=[AnyFaceRef.from_occ_face(faces[i].wrapped) for i in idx])
+        params = self._bind(op.to_params(), thickness=t)
+        entry = self.history.push(
+            label="shell", operation="shell", params=params,
+            body_id=body.id, face_ref=None, shape_before=shape, shape_after=None)
+        self._commit(entry)
+        return body
+
 
 def _main(argv):
     if len(argv) < 2:

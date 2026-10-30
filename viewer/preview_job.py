@@ -74,7 +74,10 @@ class PreviewJob(QObject):
         except Exception as ex:
             result, error = None, ex
             print(f"[{self._name}] {ex}")
-        self._finished.emit(gen, result, error)
+        try:
+            self._finished.emit(gen, result, error)
+        except RuntimeError:
+            pass        # the viewport (and this job) was deleted mid-compute
 
     def _deliver(self, gen: int, result, error) -> None:
         self._inflight = False
@@ -134,6 +137,14 @@ def loft_preview_meshes(faces, ruled: bool, continuity: str):
     from cad.op_loft import build_loft_solid
     tris, edges = preview_mesh_data(
         build_loft_solid(faces, ruled, continuity).wrapped, 0.15, 24)
+    return pack_preview([tris], [edges])
+
+
+def sweep_preview_meshes(faces, path_edges, frenet: bool, binormal=None):
+    """Packed preview of the sweep (built in a kernel worker)."""
+    from cad.operations.sweep import sweep_task
+    tris, edges = preview_mesh_data(
+        sweep_task(faces, path_edges, frenet, binormal=binormal).wrapped, 0.15, 24)
     return pack_preview([tris], [edges])
 
 

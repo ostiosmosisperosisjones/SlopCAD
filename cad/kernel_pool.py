@@ -30,6 +30,7 @@ CAD_KERNEL_POOL=0 runs everything in-process (debugging, profiling).
 
 from __future__ import annotations
 
+import atexit
 import functools
 import importlib
 import io
@@ -302,6 +303,11 @@ class KernelPool:
         self._idle: list[_Worker] = []
         self._count = 0
         self._cv = threading.Condition()
+        # Set at interpreter exit: no new workers.  A background call still
+        # in flight then sees its worker killed by multiprocessing's exit
+        # hook; a replacement spawned after that hook is never reaped and
+        # keeps the resource tracker's pipe open, hanging the exit.
+        self._closing = False
 
     def warm(self, n: int | None = None):
         """Start up to n workers now so the first real call doesn't pay the
@@ -324,6 +330,8 @@ class KernelPool:
                         return w
                     w.kill()
                     self._count -= 1
+                if self._closing:
+                    raise KernelWorkerDied("kernel pool is shut down")
                 if self._count < self.size:
                     self._count += 1
                     break
@@ -338,7 +346,10 @@ class KernelPool:
 
     def _release(self, w: _Worker, healthy: bool):
         with self._cv:
-            if healthy:
+            if self._closing:
+                w.kill()
+                self._count -= 1
+            elif healthy:
                 self._idle.append(w)
             else:
                 # Killed (timeout/cancel) or died: start a replacement now so
@@ -391,6 +402,7 @@ class KernelPool:
 
     def shutdown(self):
         with self._cv:
+            self._closing = True
             for w in self._idle:
                 try:
                     w.conn.send(None)
@@ -399,6 +411,7 @@ class KernelPool:
                 w.kill()
             self._idle.clear()
             self._count = 0
+            self._cv.notify_all()
 
 
 _pool: KernelPool | None = None
@@ -411,6 +424,13 @@ def pool() -> KernelPool:
         if _pool is None:
             _pool = KernelPool()
         return _pool
+
+
+@atexit.register
+def _shutdown_at_exit():
+    # Registered after multiprocessing's own exit hook, so runs before it.
+    if _pool is not None:
+        _pool.shutdown()
 
 
 def offload(timeout: float | None = None):

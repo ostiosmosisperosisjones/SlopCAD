@@ -128,17 +128,23 @@ class SketchModalMixin:
         is_gap = (entity_type == 'gap')
         is_pt  = (entity_type == 'pt')
         is_edge = (entity_type == 'edge')
+        is_angle = (entity_type == 'angle')
         is_gap = is_gap or is_edge
         points = ref_idx[1] if is_pt else None
+        if is_angle:
+            from cad.sketch import angle_ray_ends
+            points = angle_ray_ends(self._sketch.entities, (ref_idx, entity_idx))
         label  = ("Diameter:" if is_arc else "Gap:" if is_gap
+                  else "Angle:" if is_angle
                   else "Distance:" if is_pt else "Length:")
         title  = ("Set Diameter" if is_arc else "Set Gap" if is_gap
+                  else "Set Angle" if is_angle
                   else "Set Distance" if is_pt else "Set Length")
         con_type = ('diameter' if is_arc else 'edge_gap' if is_edge
-                    else 'gap' if is_gap
+                    else 'gap' if is_gap else 'angle' if is_angle
                     else 'pt_distance' if is_pt else 'distance')
-        indices  = ((ref_idx, entity_idx) if is_gap else ref_idx[0] if is_pt
-                    else (entity_idx,))
+        indices  = ((ref_idx, entity_idx) if is_gap or is_angle
+                    else ref_idx[0] if is_pt else (entity_idx,))
         if con_type == 'distance':
             # A filleted line's length already measures to its sharp
             # corner(s): edit that one rather than add a second length.
@@ -149,7 +155,11 @@ class SketchModalMixin:
                 con_type, indices, current_val = \
                     'sharp_distance', sharp.indices, sharp.value
 
-        answer = ask_value(self, title, label, current_val)
+        if is_angle:
+            answer = ask_value(self, title, label, current_val,
+                               unit="deg", max_value=180.0)
+        else:
+            answer = ask_value(self, title, label, current_val)
         if answer is None:
             return
         val, binding = answer
@@ -175,12 +185,22 @@ class SketchModalMixin:
         self._sketch.constraints.append(
             SketchConstraint(con_type, indices, val,
                              expr=binding["expr"] if binding else None,
-                             expr_unit=binding["unit"] if binding else "mm",
+                             expr_unit=binding["unit"] if binding
+                             else "deg" if is_angle else "mm",
                              points=points)
         )
         tmp = SketchEntry.from_sketch_mode(self._sketch)
-        if tmp.apply_constraints_local({entity_idx} if is_gap or is_pt
-                                       else None):
+        if is_angle and len(self._sketch.constraints) - 1 in \
+                tmp._implied_direction_cons():
+            # Both lines' directions are already fixed (or tied together):
+            # the angle would be ignored by the solve, so refuse it.
+            print("[Sketch] Those lines' directions are already fixed — "
+                  "remove a constraint before adding this angle")
+            ok = False
+        else:
+            ok = tmp.apply_constraints_local({entity_idx} if is_gap or is_pt
+                                             or is_angle else None)
+        if ok:
             for i, ent in enumerate(tmp.entities):
                 if isinstance(ent, LineEntity):
                     self._sketch.entities[i].p0 = ent.p0.copy()

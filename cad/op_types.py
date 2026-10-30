@@ -7,6 +7,11 @@ Implementation lives in:
   cad/op_extrude.py          — FaceExtrudeOp, CrossBodyCutOp, SketchExtrudeOp, SketchOp, ImportOp
   cad/op_fillet.py           — FaceFilletOp
   cad/op_revolve_thicken.py  — ThickenOp, FaceRevolveOp, SketchRevolveOp
+  cad/op_shell.py            — ShellOp
+  cad/op_sweep.py            — SketchSweepOp
+  cad/op_coil.py             — CoilOp
+  cad/op_transform.py        — TransformOp
+  cad/op_helix.py            — HelixOp
 """
 
 from cad.op_base import Op, _push_result
@@ -28,6 +33,11 @@ from cad.op_offset_plane import OffsetPlaneOp
 from cad.op_loft import SketchLoftOp
 from cad.op_chamfer import ChamferOp
 from cad.op_boolean import BooleanOp
+from cad.op_shell import ShellOp
+from cad.op_sweep import SketchSweepOp
+from cad.op_coil import CoilOp
+from cad.op_transform import TransformOp
+from cad.op_helix import HelixOp
 
 from typing import Any
 
@@ -67,6 +77,13 @@ _FROM_PARAMS: dict[str, Any] = {
     "union":        lambda op, p: BooleanOp._from_params(p),
     "subtract":     lambda op, p: BooleanOp._from_params(p),
     "intersect":    lambda op, p: BooleanOp._from_params(p),
+    "shell":        lambda op, p: ShellOp._from_params(p),
+    "sweep":        lambda op, p: SketchSweepOp._from_params(p),
+    "sweep_cut":    lambda op, p: SketchSweepOp._from_params(p),
+    "coil":         lambda op, p: CoilOp._from_params(p),
+    "coil_cut":     lambda op, p: CoilOp._from_params(p),
+    "transform":    lambda op, p: TransformOp._from_params(p),
+    "helix":        lambda op, p: HelixOp._from_params(p),
 }
 
 __all__ = [
@@ -78,5 +95,10 @@ __all__ = [
     "SketchLoftOp",
     "ChamferOp",
     "BooleanOp",
+    "ShellOp",
+    "SketchSweepOp",
+    "CoilOp",
+    "TransformOp",
+    "HelixOp",
     "_FROM_PARAMS", "_extrude_or_cut_from_params",
 ]

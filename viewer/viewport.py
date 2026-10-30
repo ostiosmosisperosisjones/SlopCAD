@@ -29,6 +29,7 @@ from viewer.sketch_modal import SketchModalMixin
 from viewer.vp_history import HistoryMixin
 from viewer.vp_extrude import ExtrudeMixin
 from viewer.vp_thicken import ThickenMixin
+from viewer.vp_shell import ShellMixin
 from viewer.vp_revolve import RevolveMixin
 from viewer.vp_async import AsyncOpMixin
 from viewer.vp_offset import VpOffsetMixin
@@ -37,6 +38,10 @@ from viewer.vp_fillet import VpFilletMixin
 from viewer.vp_fillet3d import Fillet3DMixin
 from viewer.vp_offset_plane import OffsetPlaneMixin
 from viewer.vp_loft import LoftMixin
+from viewer.vp_sweep import SweepMixin
+from viewer.vp_coil import CoilMixin
+from viewer.vp_transform import TransformMixin
+from viewer.vp_helix import HelixMixin
 from viewer.vp_chamfer import ChamferMixin
 from viewer.vp_boolean import BooleanMixin
 from cad.workspace import Workspace
@@ -44,7 +49,7 @@ from cad.history import History
 from cad.selection import SelectionSet
 
 
-class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, ExtrudeMixin, ThickenMixin, RevolveMixin, VpOffsetMixin, VpPatternMixin, VpFilletMixin, Fillet3DMixin, OffsetPlaneMixin, LoftMixin, ChamferMixin, BooleanMixin, QOpenGLWidget):
+class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, ExtrudeMixin, ThickenMixin, ShellMixin, RevolveMixin, VpOffsetMixin, VpPatternMixin, VpFilletMixin, Fillet3DMixin, OffsetPlaneMixin, LoftMixin, SweepMixin, CoilMixin, TransformMixin, HelixMixin, ChamferMixin, BooleanMixin, QOpenGLWidget):
     history_changed     = pyqtSignal()
     selection_changed   = pyqtSignal()
     sketch_mode_changed = pyqtSignal(bool)
@@ -165,6 +170,19 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._loft_preview_mesh        = None
         self._loft_preview_is_cut      = False
         self._editing_loft_idx         = None
+        self._sweep_panel              = None
+        self._sweep_preview_mesh       = None
+        self._editing_sweep_idx        = None
+        self._coil_panel               = None
+        self._coil_preview_mesh        = None
+        self._editing_coil_idx         = None
+        self._transform_panel          = None
+        self._helix_panel              = None
+        self._editing_helix_idx        = None
+        self._helix_pick_active        = False
+        self._helix_preview_pts        = None
+        self._transform_preview_mesh   = None
+        self._editing_transform_idx    = None
         self._chamfer_panel            = None
         self._chamfer_body_id          = None
         self._chamfer_face_indices     = []
@@ -205,6 +223,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         self._revolve_axis_dir       = None
 
         self._thicken_panel               = None
+        self._shell_panel                 = None
+        self._shell_body_id               = None
+        self._shell_face_indices          = []
+        self._shell_preview_mesh          = None
+        self._editing_shell_idx           = None
         self._thicken_body_id             = None
         self._thicken_preview_mesh        = None
         self._thicken_preview_dist        = 0.0
@@ -349,6 +372,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         if ch_preview is not None and ch_body is not None and ch_body in meshes:
             meshes = dict(meshes)
             meshes[ch_body] = ch_preview
+        sh_preview = getattr(self, '_shell_preview_mesh', None)
+        sh_body    = getattr(self, '_shell_body_id', None)
+        if sh_preview is not None and sh_body is not None and sh_body in meshes:
+            meshes = dict(meshes)
+            meshes[sh_body] = sh_preview
         # Boolean preview: swap first body mesh with preview mesh
         bool_preview = getattr(self, '_boolean_preview_mesh', None)
         bool_body_ids = getattr(self, '_boolean_body_ids', [])
@@ -635,6 +663,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         # Offset plane datums + in-progress panel preview
         from viewer.plane_overlay import draw_offset_planes
         draw_offset_planes(self)
+        from viewer.curve_overlay import draw_helices
+        draw_helices(self)
 
         self._modelview  = glGetDoublev(GL_MODELVIEW_MATRIX)
         self._projection = glGetDoublev(GL_PROJECTION_MATRIX)
@@ -691,6 +721,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             self._draw_chamfer_preview()
             self._draw_boolean_preview()
             self._draw_loft_preview()
+            self._draw_sweep_preview()
+            self._draw_coil_preview()
+            self._draw_transform_preview()
 
         # Selection and hover highlights are indexed against LIVE meshes
         # (because selection was captured before any preview swap). Drawing
@@ -937,7 +970,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             getattr(self, '_fillet3d_pick_face', False) or
             getattr(self, '_chamfer_pick_face', False) or
             getattr(self, '_offset_plane_face_active', False) or
-            (thicken is not None and getattr(thicken, '_picking_face', False)))
+            getattr(self, '_helix_pick_active', False) or
+            (thicken is not None and getattr(thicken, '_picking_face', False)) or
+            (getattr(self, '_shell_panel', None) is not None and
+             self._shell_panel._picking_face))
 
     def _route_active_pick(self, e, hov_ebody, hov_eidx) -> bool:
         """When an "Add Edge/Face" pick mode is active, route the click to the
@@ -948,6 +984,14 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         face-pick then tries sketch-face, then body-face (ray pick). Each
         route self-guards on its own mode flag, so only the active op consumes.
         """
+        # A helix curve as the sweep path: it has no mesh, so hover never
+        # offers it — test it in screen space.
+        if getattr(self, '_sweep_path_pick_active', False):
+            from viewer.curve_overlay import pick_helix
+            hidx = pick_helix(self, e.position().x(), e.position().y())
+            if hidx is not None and self.route_helix_pick_for_sweep(hidx):
+                self.update(); return True
+
         edge_active = self._edge_pick_mode_active()
         face_active = self._face_pick_mode_active()
         if not edge_active and not face_active:
@@ -987,11 +1031,15 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     return True
                 if self.route_face_pick_for_thicken(body_id, idx):
                     return True
+                if self.route_face_pick_for_shell(body_id, idx):
+                    return True
                 if self.route_face_pick_for_extrude(body_id, idx):
                     return True
                 if self.route_face_pick_for_revolve(body_id, idx):
                     return True
                 if self.route_face_pick_for_offset_plane(body_id, idx):
+                    return True
+                if self.route_face_pick_for_helix(body_id, idx):
                     return True
         return False
 
@@ -1295,7 +1343,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 self._hit_thicken_arrow(mx, my) or
                 self._hit_revolve_arrow(mx, my) or
                 self._hit_fillet3d_arrow(mx, my) or
-                self._hit_chamfer_arrow(mx, my))
+                self._hit_chamfer_arrow(mx, my) or
+                self._hit_transform_gizmo(mx, my))
 
     def _update_arrow_drag(self, mx: int, my: int):
         import numpy as np
@@ -1308,6 +1357,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             return
 
         grab_off = getattr(self, '_drag_arrow_grab_offset', 0.0)
+
+        if op == 'transform':
+            self._update_transform_drag(ray_o, ray_d)
+            return
 
         if op == 'extrude':
             arrow_dir = getattr(self, '_extrude_arrow_dir', None)
@@ -1755,6 +1808,21 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             if getattr(self, '_thicken_panel', None) is not None:
                 self._close_thicken_panel()
                 return
+            if getattr(self, '_shell_panel', None) is not None:
+                self._close_shell_panel()
+                return
+            if getattr(self, '_sweep_panel', None) is not None:
+                self._close_sweep_panel()
+                return
+            if getattr(self, '_coil_panel', None) is not None:
+                self._close_coil_panel()
+                return
+            if getattr(self, '_transform_panel', None) is not None:
+                self._close_transform_panel()
+                return
+            if getattr(self, '_helix_panel', None) is not None:
+                self._close_helix_panel()
+                return
             if getattr(self, '_revolve_panel', None) is not None:
                 self._close_revolve_panel()
                 return
@@ -2005,24 +2073,29 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         is_gap = ci < len(lcons) and lcons[ci].type == 'gap'
         is_sharp = ci < len(lcons) and lcons[ci].type == 'sharp_distance'
         is_pt = ci < len(lcons) and lcons[ci].type in ('pt_distance', 'edge_gap')
+        is_angle = ci < len(lcons) and lcons[ci].type == 'angle'
         con_type    = ('diameter' if is_diameter else 'gap' if is_gap
-                       else 'sharp_distance' if is_sharp
+                       else 'sharp_distance' if is_sharp else 'angle' if is_angle
                        else lcons[ci].type if is_pt else 'distance')
         edit_title  = ("Edit Diameter" if is_diameter else "Edit Gap" if is_gap
+                       else "Edit Angle" if is_angle
                        else "Edit Distance" if is_pt else "Edit Length")
         edit_label  = ("Diameter:" if is_diameter else "Gap:" if is_gap
+                       else "Angle:" if is_angle
                        else "Distance:" if is_pt else "Length:")
 
         def _matches(con):
-            # A gap's / point distance's label carries its mover (indices[1]).
+            # A gap's / point distance's / angle's label carries its mover
+            # (indices[1]).
             return con.type == con_type and \
-                con.indices[-1 if is_gap or is_pt else 0] == ei
+                con.indices[-1 if is_gap or is_pt or is_angle else 0] == ei
 
         def _ask(con):
             """(ok, new constraint) — keeps label placement, swaps value/expr."""
+            extra = {"unit": "deg", "max_value": 180.0} if is_angle else {}
             answer = ask_value(self, edit_title, edit_label, con.value,
                                getattr(con, 'expr', None),
-                               getattr(con, 'expr_unit', None))
+                               getattr(con, 'expr_unit', None), **extra)
             if answer is None:
                 return False, None
             val, binding = answer
@@ -2031,7 +2104,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 label_offset=con.label_offset,
                 label_angle=getattr(con, 'label_angle', None),
                 expr=binding["expr"] if binding else None,
-                expr_unit=binding["unit"] if binding else "mm",
+                expr_unit=binding["unit"] if binding
+                else "deg" if is_angle else "mm",
                 points=getattr(con, 'points', None))
 
         # Active sketch.
@@ -2151,6 +2225,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     if pn > 1e-9:
                         perp_w /= pn
                         cur_offset = con.label_offset or 0.0
+                        # Angle arcs drag relative to the radius shown.
+                        self._drag_base_offset = lbl.get('drag_offset')
+                        if self._drag_base_offset is not None:
+                            cur_offset = self._drag_base_offset
                         self._drag_constraint  = con
                         self._drag_perp_world  = perp_w
                         self._drag_line_mid    = lbl['world'] - perp_w * cur_offset
@@ -2269,6 +2347,15 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     if history_idx != -1 and self.route_sketch_edge_pick_for_revolve(
                             history_idx, entity_idx):
                         return
+                    if history_idx != -1 and self.route_sketch_edge_pick_for_sweep(
+                            history_idx, entity_idx):
+                        return
+                    if history_idx != -1 and self.route_sketch_edge_pick_for_coil(
+                            history_idx, entity_idx):
+                        return
+                    if history_idx != -1 and self.route_sketch_edge_pick_for_helix(
+                            history_idx, entity_idx):
+                        return
                     self.selection.select_sketch_edge(
                         history_idx, entity_idx, additive=additive)
                     if history_idx == -1:
@@ -2279,6 +2366,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 else:
                     # Route to revolve axis-pick (body edge) if active
                     if self.route_edge_pick_for_revolve(hov_eidx, hov_ebody):
+                        return
+                    if self.route_edge_pick_for_transform(hov_eidx, hov_ebody):
                         return
                     # Route to extrude panel pick-edge mode if active
                     if self.route_edge_pick_for_extrude(hov_eidx, hov_ebody):
@@ -2315,6 +2404,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         if self.route_sketch_face_pick_for_loft(hidx, fidx):
                             self.update()
                             return
+                        if self.route_sketch_face_pick_for_sweep(hidx, fidx):
+                            self.update()
+                            return
                         if self.route_sketch_face_pick_for_revolve(hidx, fidx):
                             self.update()
                             return
@@ -2336,6 +2428,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     return
                 if idx is not None and self.route_face_pick_for_thicken(body_id, idx):
                     return
+                if idx is not None and self.route_face_pick_for_shell(body_id, idx):
+                    return
                 if idx is not None and self.route_face_pick_for_extrude(body_id, idx):
                     return
                 if idx is not None and self.route_body_pick_for_extrude(body_id):
@@ -2347,6 +2441,12 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 if idx is not None and self.route_face_pick_for_offset_plane(body_id, idx):
                     return
                 if idx is not None and self.route_body_pick_for_loft(body_id):
+                    return
+                if idx is not None and self.route_body_pick_for_sweep(body_id):
+                    return
+                if idx is not None and self.route_body_pick_for_coil(body_id):
+                    return
+                if idx is not None and self.route_body_pick_for_transform(body_id):
                     return
                 if idx is not None and self.route_body_pick_for_boolean(body_id):
                     return
@@ -2706,7 +2806,12 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             if screen_perp_len < 1e-3:
                 return
             dot = (dx * spx + dy * spy) / screen_perp_len
-            self._drag_constraint.label_offset = dot / screen_perp_len
+            base = getattr(self, '_drag_base_offset', None)
+            if base is not None:
+                self._drag_constraint.label_offset = max(
+                    base + dot / screen_perp_len, 1e-3)
+            else:
+                self._drag_constraint.label_offset = dot / screen_perp_len
 
         self.update()
 

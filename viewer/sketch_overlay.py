@@ -1550,6 +1550,60 @@ class SketchOverlay:
                 'constraints':    constraints,
             })
 
+        # Angle between two lines — an arc about where they cross, between
+        # their rays; dragging moves it in / out along the bisector.
+        from cad.sketch import angle_rays
+        for ci, con in enumerate(constraints):
+            if con.type != 'angle':
+                continue
+            rays = angle_rays(entities, con)
+            if rays is None:
+                continue
+            x, ra, rb = rays
+            bis = ra + rb
+            nb = float(np.linalg.norm(bis))
+            bis = bis / nb if nb > 1e-9 else np.array([-ra[1], ra[0]])
+            r = float(con.label_offset) if con.label_offset is not None \
+                else default_offset * 2.0
+            r = max(abs(r), 1e-3)
+            a0 = float(np.arctan2(ra[1], ra[0]))
+            sweep = float(np.arctan2(ra[0] * rb[1] - ra[1] * rb[0],
+                                     float(ra @ rb)))
+            alpha = 0.25 if dimmed else 0.90
+            glColor4f(0.35, 0.70, 1.00, alpha)
+            glBegin(GL_LINE_STRIP)
+            for t in np.linspace(0.0, 1.0, 33):
+                a = a0 + sweep * t
+                glVertex3f(*_v3(to_3d(*(x + r * np.array([np.cos(a), np.sin(a)])))))
+            glEnd()
+            # Extension lines when the arc lies past a line's end.
+            glBegin(GL_LINES)
+            for k, ray in zip(con.indices, (ra, rb)):
+                ends = [np.asarray(p, float)[:2] for p in
+                        (entities[k].p0, entities[k].p1)] \
+                    if isinstance(entities[k], LineEntity) else []
+                reach = max((float(np.dot(p - x, ray)) for p in ends),
+                            default=r)
+                if reach < r:
+                    glVertex3f(*_v3(to_3d(*(x + ray * reach))))
+                    glVertex3f(*_v3(to_3d(*(x + ray * r))))
+            glEnd()
+            mid_3d = to_3d(*(x + bis * r))
+            labels.append({
+                'world':          np.array([float(mid_3d[0]), float(mid_3d[1]), float(mid_3d[2])]),
+                'text':           _angle_text(con),
+                'constraint_idx': ci,
+                'entity_idx':     con.indices[1],
+                'dimmed':         dimmed,
+                # Drag moves the arc along the bisector (label_offset = r).
+                'perp_world':     np.array(_v3(to_3d(*bis))) -
+                                  np.array(_v3(to_3d(0.0, 0.0))),
+                'perp_uv':        bis,
+                'p0_uv':          x,
+                'drag_offset':    r,
+                'constraints':    constraints,
+            })
+
         # Diameter constraint annotations — full chord across circle, draggable.
         from cad.sketch import ArcEntity as _AE
         from cad.prefs import prefs
@@ -1901,5 +1955,13 @@ def _dim_text(con, prefix: str) -> str:
     from cad.prefs import prefs
     txt = prefix + format_value(con.value, prefs.default_unit,
                                 prefs.display_decimals)
+    expr = getattr(con, 'expr', None)
+    return f"{expr} = {txt}" if expr else txt
+
+
+def _angle_text(con) -> str:
+    """Angle label: "30.00°", or "a/2 = 30.00°" when parameter-driven."""
+    from cad.prefs import prefs
+    txt = f"{con.value:.{prefs.display_decimals}f}°"
     expr = getattr(con, 'expr', None)
     return f"{expr} = {txt}" if expr else txt

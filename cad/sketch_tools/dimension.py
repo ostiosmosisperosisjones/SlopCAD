@@ -1,10 +1,11 @@
 """
 cad/sketch_tools/dimension.py
 
-DimensionTool — length, gap or diameter constraint.
+DimensionTool — length, gap, angle or diameter constraint.
 
   Line, same line again   → length of that line
   Line, a parallel line   → gap between them (perpendicular distance)
+  Line, any other line    → angle between them (second line turns)
   Line, an arc / circle   → gap from the line to its edge
   Arc / circle            → diameter (one click)
 
@@ -104,9 +105,16 @@ class DimensionTool(BaseTool):
             return True
         gap = parallel_gap(sketch.entities[first], ent)
         if gap is None:
-            print("[Sketch] Gap needs two parallel lines (apart) — "
-                  "starting over from this line")
-            self.first_idx = idx
+            from cad.sketch import SketchConstraint, ray_angle_deg
+            ang = ray_angle_deg(sketch.entities,
+                                SketchConstraint('angle', (first, idx), 0.0))
+            if ang is None:
+                print("[Sketch] Those lines are collinear — "
+                      "starting over from this line")
+                self.first_idx = idx
+                return True
+            if cb:
+                cb(idx, ang, 'angle', first)
             return True
         if cb:
             cb(idx, gap, 'gap', first)

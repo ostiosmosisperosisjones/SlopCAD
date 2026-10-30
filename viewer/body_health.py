@@ -22,7 +22,7 @@ from __future__ import annotations
 from viewer.preview_job import PreviewJob
 
 # Ops whose shape_after isn't a new result of their own.
-_SKIP_OPS = {"sketch", "offset_plane"}
+_SKIP_OPS = {"sketch", "offset_plane", "helix"}
 SELF_INTERSECT_TIMEOUT = 120.0
 
 

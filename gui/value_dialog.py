@@ -12,8 +12,10 @@ from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QDialogButtonBox
 
 
 def ask_value(parent, title: str, label: str, current_mm: float,
-              expr: str | None = None, expr_unit: str | None = None):
+              expr: str | None = None, expr_unit: str | None = None,
+              unit: str | None = None, max_value: float | None = None):
     """Returns (value_mm, binding | None) on OK, or None on cancel.
+    unit="deg" asks for an angle; max_value is an exclusive upper bound.
     binding is {"expr", "unit"} when the value references a parameter."""
     from gui.expr_spinbox import ExprSpinBox
 
@@ -21,7 +23,7 @@ def ask_value(parent, title: str, label: str, current_mm: float,
     dlg.setWindowTitle(title)
     lay = QVBoxLayout(dlg)
     lay.addWidget(QLabel(label))
-    box = ExprSpinBox()
+    box = ExprSpinBox(unit=unit) if unit else ExprSpinBox()
     box.set_binding({"expr": expr, "unit": expr_unit or box.unit} if expr else None,
                     current_mm)
     lay.addWidget(box)
@@ -35,7 +37,7 @@ def ask_value(parent, title: str, label: str, current_mm: float,
     def _accept():
         box._on_commit()
         v = box.mm_value()
-        if v is not None and v > 0:
+        if v is not None and v > 0 and (max_value is None or v < max_value):
             dlg.accept()
     buttons.accepted.connect(_accept)
     buttons.rejected.connect(dlg.reject)

@@ -433,7 +433,7 @@ class History:
                     entry.shape_after  = current_shape
                     continue
 
-                if isinstance(op, OffsetPlaneOp):
+                if isinstance(op, OffsetPlaneOp) or getattr(op, "DATUM", False):
                     # Datum plane — no shape change.  Resolve to surface
                     # parametric errors (e.g. parent face vanished).  body_id
                     # is None for offset planes, so no chain-broken cascade.

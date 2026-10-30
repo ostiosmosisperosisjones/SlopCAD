@@ -111,6 +111,18 @@ _SVG_THICKEN = """
 </svg>
 """
 
+# Shell: open-topped box, its rim drawn as an inner outline
+_SVG_SHELL = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <polygon points="5,12 18,7 31,12 31,26 18,31 5,26"
+           fill="#81c784" fill-opacity="0.15" stroke="#81c784" stroke-width="1.4"
+           stroke-linejoin="round"/>
+  <polygon points="9,13 18,9.6 27,13 18,16.4"
+           fill="#1e1e1e" stroke="#81c784" stroke-width="1.1" stroke-linejoin="round"/>
+  <line x1="18" y1="17" x2="18" y2="31" stroke="#81c784" stroke-width="1"/>
+</svg>
+"""
+
 # Sketch: pencil on a plane grid
 _SVG_SKETCH = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
@@ -150,6 +162,56 @@ _SVG_REVOLVE = """
 """
 
 # Loft: two profiles connected by smooth ruled surface
+_SVG_SWEEP = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <!-- path -->
+  <path d="M7,29 C7,16 18,22 29,9" fill="none" stroke="#b39ddb" stroke-width="1.3"
+        stroke-dasharray="3,2" stroke-linecap="round"/>
+  <!-- tube walls along the path -->
+  <path d="M3,29 C3,12 18,18 26,6" fill="none" stroke="#b39ddb" stroke-width="1.4"
+        stroke-linecap="round" opacity="0.85"/>
+  <path d="M11,29 C11,20 18,26 32,12" fill="none" stroke="#b39ddb" stroke-width="1.4"
+        stroke-linecap="round" opacity="0.85"/>
+  <!-- start profile -->
+  <ellipse cx="7" cy="29" rx="4" ry="1.6" fill="#b39ddb" fill-opacity="0.3"
+           stroke="#b39ddb" stroke-width="1.3"/>
+</svg>
+"""
+
+_SVG_COIL = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <!-- back halves of the turns (faint), then front halves -->
+  <path d="M8,9 Q18,4 28,11 M8,15 Q18,10 28,17 M8,21 Q18,16 28,23 M8,27 Q18,22 28,29"
+        fill="none" stroke="#b39ddb" stroke-width="1.2" opacity="0.4"/>
+  <path d="M28,11 Q18,16 8,15 M28,17 Q18,22 8,21 M28,23 Q18,28 8,27"
+        fill="none" stroke="#b39ddb" stroke-width="1.8" stroke-linecap="round"/>
+</svg>
+"""
+
+_SVG_HELIX = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <!-- a cylinder outline with a helix line wrapped round it -->
+  <rect x="9" y="5" width="18" height="26" rx="2" fill="none"
+        stroke="#7a7a7a" stroke-width="1" opacity="0.5"/>
+  <path d="M9,9 Q18,6 27,11 M9,17 Q18,14 27,19 M9,25 Q18,22 27,27"
+        fill="none" stroke="#e0b84a" stroke-width="1" opacity="0.4"/>
+  <path d="M27,11 Q18,16 9,17 M27,19 Q18,24 9,25"
+        fill="none" stroke="#e0b84a" stroke-width="1.8" stroke-linecap="round"/>
+</svg>
+"""
+
+_SVG_TRANSFORM = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
+  <!-- ghost at the start, solid box moved, arrow between -->
+  <rect x="5" y="17" width="12" height="12" fill="none" stroke="#b39ddb"
+        stroke-width="1.2" stroke-dasharray="3,2" opacity="0.6"/>
+  <rect x="19" y="7" width="12" height="12" fill="#b39ddb" fill-opacity="0.25"
+        stroke="#b39ddb" stroke-width="1.4"/>
+  <path d="M13,21 L22,12 M22,12 L17,12 M22,12 L22,17" fill="none" stroke="#b39ddb"
+        stroke-width="1.6" stroke-linecap="round"/>
+</svg>
+"""
+
 _SVG_LOFT = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">
   <!-- side walls (rendered first so the profile ellipses sit on top) -->
@@ -233,12 +295,17 @@ _SVG_OFFSET_PLANE = """
 class OpsToolbar(QToolBar):
     extrude_requested      = pyqtSignal()
     thicken_requested      = pyqtSignal()
+    shell_requested        = pyqtSignal()
     sketch_requested       = pyqtSignal()
     revolve_requested      = pyqtSignal()
     fillet_requested       = pyqtSignal()
     chamfer_requested      = pyqtSignal()
     offset_plane_requested = pyqtSignal()
     loft_requested         = pyqtSignal()
+    sweep_requested        = pyqtSignal()
+    coil_requested         = pyqtSignal()
+    transform_requested    = pyqtSignal()
+    helix_requested        = pyqtSignal()
     boolean_requested      = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -266,6 +333,8 @@ class OpsToolbar(QToolBar):
             "extrude", "Extrude", _SVG_EXTRUDE, self.extrude_requested)
         self._btn_thicken = self._add_op_button(
             "thicken", "Thicken", _SVG_THICKEN, self.thicken_requested)
+        self._btn_shell = self._add_op_button(
+            "shell", "Shell", _SVG_SHELL, self.shell_requested)
 
         self._add_separator()
 
@@ -274,6 +343,14 @@ class OpsToolbar(QToolBar):
             "revolve", "Revolve", _SVG_REVOLVE, self.revolve_requested)
         self._btn_loft = self._add_op_button(
             "loft", "Loft", _SVG_LOFT, self.loft_requested)
+        self._btn_sweep = self._add_op_button(
+            "sweep", "Sweep", _SVG_SWEEP, self.sweep_requested)
+        self._btn_helix = self._add_op_button(
+            "helix", "Helix", _SVG_HELIX, self.helix_requested)
+        self._btn_coil = self._add_op_button(
+            "coil", "Coil", _SVG_COIL, self.coil_requested)
+        self._btn_transform = self._add_op_button(
+            "transform", "Move", _SVG_TRANSFORM, self.transform_requested)
 
         self._btn_fillet = self._add_op_button(
             "fillet", "Fillet", _SVG_FILLET, self.fillet_requested)
@@ -328,8 +405,13 @@ class OpsToolbar(QToolBar):
         self._btn_offset_plane.setEnabled(enabled)
         self._btn_extrude.setEnabled(enabled)
         self._btn_thicken.setEnabled(enabled)
+        self._btn_shell.setEnabled(enabled)
         self._btn_revolve.setEnabled(enabled)
         self._btn_loft.setEnabled(enabled)
+        self._btn_sweep.setEnabled(enabled)
+        self._btn_coil.setEnabled(enabled)
+        self._btn_helix.setEnabled(enabled)
+        self._btn_transform.setEnabled(enabled)
         self._btn_fillet.setEnabled(enabled)
         self._btn_chamfer.setEnabled(enabled)
         self._btn_boolean.setEnabled(enabled)
@@ -590,7 +672,7 @@ _SVG_CONSTRAINT_DIAMETER = """
 
 _CONSTRAINT_MODES = ['distance', 'diameter', 'equal', 'parallel', 'perpendicular', 'tangent', 'concentric', 'horizontal', 'vertical']
 _CONSTRAINT_LABELS = {
-    'distance':     'Distance (length / gap / points)',
+    'distance':     'Distance (length / gap / angle / points)',
     'diameter':     'Diameter (arc/circle)',
     'equal':        'Equal (length / radius)',
     'concentric':   'Concentric (arcs/circles)',

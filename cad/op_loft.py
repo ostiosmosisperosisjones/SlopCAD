@@ -65,9 +65,19 @@ class SketchLoftOp(Op):
         if self.continuity not in self._CONTINUITY_VALID:
             self.continuity = self._CONTINUITY_DEFAULT
 
+    # Subclass hooks (SketchSweepOp): history operation name ("<op>_cut" for
+    # the cut variant), fewest profiles, and the kernel task.
+    _OP           = "loft"
+    _MIN_PROFILES = 2
+
+    def _task(self, faces: list, target=None, mode=None):
+        """The solid through `faces`, or target with it cut / fused (mode
+        "cut" / "fuse"); runs in a kernel worker."""
+        return _loft_task(faces, self.ruled, self.continuity, target, mode)
+
     def _build_loft(self, faces: list):
         """The loft solid through `faces` (built in a kernel worker)."""
-        return _loft_task(faces, self.ruled, self.continuity)
+        return self._task(faces)
 
     @property
     def from_sketch_ids(self) -> list[str]:
@@ -92,8 +102,9 @@ class SketchLoftOp(Op):
         the loft would be ambiguous).
         """
         from cad.history import _replay_sketch_entry
-        if len(self.from_profiles) < 2:
-            raise RuntimeError("SketchLoftOp: loft requires at least 2 profiles")
+        if len(self.from_profiles) < self._MIN_PROFILES:
+            raise RuntimeError(f"{type(self).__name__}: {self._OP} requires at "
+                               f"least {self._MIN_PROFILES} profile(s)")
         faces = []
         for n, (sid, face_idx) in enumerate(self.from_profiles, start=1):
             idx = history.id_to_index(sid)
@@ -149,8 +160,7 @@ class SketchLoftOp(Op):
                 raise RuntimeError(
                     f"SketchLoftOp: no shape for cut target '{self.cut_body_id}'")
             try:
-                return _loft_task(faces, self.ruled, self.continuity,
-                                  target, "cut")
+                return self._task(faces, target, "cut")
             except RuntimeError as ex:
                 raise RuntimeError(f"SketchLoftOp: {ex}")
 
@@ -161,8 +171,7 @@ class SketchLoftOp(Op):
                 raise RuntimeError(
                     f"SketchLoftOp: no shape for merge target '{self.merge_body_id}'")
             try:
-                return _loft_task(faces, self.ruled, self.continuity,
-                                  target, "fuse")
+                return self._task(faces, target, "fuse")
             except RuntimeError as ex:
                 raise RuntimeError(f"SketchLoftOp: {ex}")
 
@@ -229,7 +238,6 @@ class SketchLoftOp(Op):
         op_params = self.to_params()
         if extra_params:
             op_params.update(extra_params)
-        ruled, continuity = self.ruled, self.continuity
 
         # ---- Cut path ----
         if self.cut_body_id is not None:
@@ -241,10 +249,10 @@ class SketchLoftOp(Op):
             cut_body_id          = self.cut_body_id
 
             def compute():
-                return _loft_task(faces, ruled, continuity, target_shape, "cut")
+                return self._task(faces, target_shape, "cut")
 
             def finalize(result):
-                _push_result(viewport, "loft_cut", op_params, cut_body_id,
+                _push_result(viewport, self._OP + "_cut", op_params, cut_body_id,
                              None, target_shape, result, original_solid_count,
                              split_key="split_from")
                 viewport._selected_sketch_entry = None
@@ -261,10 +269,10 @@ class SketchLoftOp(Op):
             merge_body_id        = self.merge_body_id
 
             def compute():
-                return _loft_task(faces, ruled, continuity, target_shape, "fuse")
+                return self._task(faces, target_shape, "fuse")
 
             def finalize(merged):
-                _push_result(viewport, "loft", op_params, merge_body_id,
+                _push_result(viewport, self._OP, op_params, merge_body_id,
                              None, target_shape, merged, original_solid_count)
                 viewport._selected_sketch_entry = None
                 viewport._selected_sketch_face  = None
@@ -272,10 +280,8 @@ class SketchLoftOp(Op):
             return compute, finalize
 
         # ---- New body ----
-        first_sketch_id = self.from_profiles[0][0]
-
         def compute():
-            return as_compound(_loft_task(faces, ruled, continuity))
+            return as_compound(self._task(faces))
 
         preserved_body_ids = list((extra_params or {}).get("_preserved_body_ids", []))
         if extra_params:
@@ -285,9 +291,14 @@ class SketchLoftOp(Op):
             from cad.units import format_op_label as _lbl
             ws = viewport.workspace
             from cad.solid_ref import solid_refs_to_dicts
-            solids = list(shape_after.solids())
+            # Failed compute: the error is already printed, and a new-body
+            # entry with no body has nothing to show or replay.
+            solids = list(shape_after.solids()) if shape_after is not None else []
             if not solids:
-                raise RuntimeError("Loft produced no solids.")
+                if shape_after is not None:
+                    print(f"[Op] FAILED: {self._OP.capitalize()} produced no solids.")
+                viewport.history_changed.emit()
+                return
             op_params["child_body_ids"] = []
             op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
             new_bodies = []
@@ -303,7 +314,7 @@ class SketchLoftOp(Op):
             primary_body = new_bodies[0] if new_bodies else None
             tag_body_id  = primary_body.id if primary_body else None
             parent_entry = viewport.history.push(
-                label=_lbl("loft", op_params), operation="loft",
+                label=_lbl(self._OP, op_params), operation=self._OP,
                 params=op_params, body_id=tag_body_id, face_ref=None,
                 shape_before=None, shape_after=shape_after)
             for new_body in new_bodies:

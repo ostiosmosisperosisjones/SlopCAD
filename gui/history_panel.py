@@ -62,6 +62,13 @@ _OP_ACCENT = {
     "offset_plane": "#6acce0",
     "loft":         "#7a9e44",
     "loft_cut":     "#9e7a44",
+    "sweep":        "#7a9e44",
+    "sweep_cut":    "#9e7a44",
+    "coil":         "#7a9e44",
+    "coil_cut":     "#9e7a44",
+    "transform":    "#5a8ab0",
+    "helix":        "#c9a13b",
+    "shell":        "#5a8a5a",
     "chamfer":      "#4a8a82",
 }
 
@@ -80,6 +87,13 @@ def _op_icon(op: str) -> str:
         "offset_plane": "▱",
         "loft":         "⌬",
         "loft_cut":     "⌬",
+        "sweep":        "∿",
+        "sweep_cut":    "∿",
+        "coil":         "➰",
+        "coil_cut":     "➰",
+        "transform":    "✥",
+        "helix":        "🌀",
+        "shell":        "◫",
         "chamfer":      "◢",
     }.get(op, "•")
 
@@ -218,8 +232,10 @@ class _EntryWidget(QFrame):
         # Show ✎ for any op the panel can reopen — EDIT_SCHEMA covers the
         # generic-dialog path; the hard-coded reopen branches below cover
         # the rest (thicken, revolve, loft, …).
-        _REOPENABLE = {"extrude", "cut", "thicken", "revolve", "revolve_cut",
-                       "fillet", "chamfer", "loft", "loft_cut", "offset_plane"}
+        _REOPENABLE = {"extrude", "cut", "thicken", "shell", "revolve", "revolve_cut",
+                       "fillet", "chamfer", "loft", "loft_cut", "sweep", "sweep_cut",
+                       "coil", "coil_cut", "transform", "helix",
+                       "offset_plane"}
         editable = ((entry.operation in EDIT_SCHEMA
                      or entry.operation in _REOPENABLE)
                     and not is_future)
@@ -228,7 +244,7 @@ class _EntryWidget(QFrame):
         outer.setContentsMargins(10, 4, 10, 4)
         outer.setSpacing(1)
 
-        if entry.operation not in ("import", "offset_plane"):
+        if entry.operation not in ("import", "offset_plane", "helix"):
             body_lbl = QLabel(body_name)
             body_lbl.setStyleSheet(prefs.scale_stylesheet(
                 "color: #333; font-size: 10px; "
@@ -251,6 +267,9 @@ class _EntryWidget(QFrame):
                     if entry.operation in ("extrude", "cut",
                                             "revolve", "revolve_cut",
                                             "loft", "loft_cut",
+                                            "sweep", "sweep_cut", "shell",
+                                            "coil", "coil_cut", "transform",
+                                            "helix",
                                             "chamfer")
                     else entry.label)
         if entry.editing:
@@ -429,9 +448,14 @@ class HistoryPanel(QWidget):
     reenter_sketch_requested = pyqtSignal(int)
     reopen_extrude_requested      = pyqtSignal(int)
     reopen_thicken_requested      = pyqtSignal(int)
+    reopen_shell_requested        = pyqtSignal(int)
     reopen_revolve_requested      = pyqtSignal(int)
     reopen_fillet_requested       = pyqtSignal(int)
     reopen_loft_requested         = pyqtSignal(int)
+    reopen_sweep_requested        = pyqtSignal(int)
+    reopen_coil_requested         = pyqtSignal(int)
+    reopen_transform_requested    = pyqtSignal(int)
+    reopen_helix_requested        = pyqtSignal(int)
     reopen_offset_plane_requested = pyqtSignal(int)
     reopen_chamfer_requested      = pyqtSignal(int)
     reopen_boolean_requested      = pyqtSignal(int)
@@ -634,6 +658,15 @@ class HistoryPanel(QWidget):
             self.reopen_thicken_requested.emit(index)
             return
 
+        if entry.operation == "shell":
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_shell_requested.emit(index)
+            return
+
         # Revolve / revolve-cut: reopen RevolvePanel
         if entry.operation in ("revolve", "revolve_cut"):
             if index > self._history.cursor:
@@ -662,6 +695,42 @@ class HistoryPanel(QWidget):
                     "Single-click to seek here first, then double-click to edit.")
                 return
             self.reopen_loft_requested.emit(index)
+            return
+
+        if entry.operation in ("sweep", "sweep_cut"):
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_sweep_requested.emit(index)
+            return
+
+        if entry.operation in ("coil", "coil_cut"):
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_coil_requested.emit(index)
+            return
+
+        if entry.operation == "helix":
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_helix_requested.emit(index)
+            return
+
+        if entry.operation == "transform":
+            if index > self._history.cursor:
+                QMessageBox.information(
+                    self, "Can't edit future entry",
+                    "Single-click to seek here first, then double-click to edit.")
+                return
+            self.reopen_transform_requested.emit(index)
             return
 
         # Offset plane: reopen OffsetPlanePanel

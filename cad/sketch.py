@@ -534,6 +534,8 @@ class SketchConstraint:
                    'edge_gap' (line, arc): line to the arc/circle's edge
                    'equal' (a, b): equal length — or radius, for two arcs
                    'concentric' (a, b): two arcs/circles share a centre
+                   'angle' (ref, mov): degrees between two lines' rays
+                   from where they cross (see angle_rays)
     indices      : tuple of entity indices the constraint applies to
     value        : numeric value (mm for distance/diameter; 0 for geometric)
     label_offset : for 'distance'  — perpendicular offset of label from line (mm)
@@ -765,6 +767,13 @@ def line_ends(ent):
 
 _LENGTH_CONSTRAINTS = ('distance', 'equal', 'sharp_distance')
 
+
+def _xy_extent(pts) -> float:
+    """Diagonal of the (n, 2) points' bounding box."""
+    if not len(pts):
+        return 0.0
+    return float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+
 # Constraints with no value: safe to drop when SolveSpace calls them
 # redundant, provided they still hold afterwards (see apply_constraints).
 _GEOMETRIC_CONSTRAINTS = ('horizontal', 'vertical', 'parallel',
@@ -850,6 +859,75 @@ def edge_gap_ends(entities, con):
     if n < 1e-12:
         return None
     return foot, c + v / n * A.radius
+
+
+def angle_ray_ends(entities, indices):
+    """('p0'|'p1', 'p0'|'p1'): the end of each line its ray points to — away
+    from where the two lines (extended) cross, so two lines meeting at a
+    corner measure the corner's own (interior) angle.  None if parallel.
+    Stored on the constraint (points) when it's made: re-deciding on every
+    solve flips to the supplement once a line slides past the crossing."""
+    x = _line_cross(entities, indices)
+    if x is None:
+        return None
+    out = []
+    for i in indices:
+        p0, p1 = (np.asarray(p, float)[:2] for p in line_ends(entities[i]))
+        out.append('p1' if np.linalg.norm(p1 - x) >= np.linalg.norm(p0 - x)
+                   else 'p0')
+    return tuple(out)
+
+
+def _line_cross(entities, indices):
+    if len(indices) != 2 or not all(0 <= i < len(entities) for i in indices):
+        return None
+    ends = [line_ends(entities[i]) for i in indices]
+    if None in ends:
+        return None
+    (a0, a1), (b0, b1) = ([np.asarray(p, float)[:2] for p in e] for e in ends)
+    da, db = a1 - a0, b1 - b0
+    den = float(da[0] * db[1] - da[1] * db[0])
+    if abs(den) < 1e-12 * max(float(np.dot(da, da) * np.dot(db, db)), 1e-24):
+        return None                                 # parallel: no vertex
+    w = b0 - a0
+    return a0 + da * float(w[0] * db[1] - w[1] * db[0]) / den
+
+
+def _angle_dirs(entities, con):
+    """Unit ray directions of an 'angle' constraint's two lines, or None."""
+    if len(con.indices) != 2 or not all(
+            0 <= i < len(entities) for i in con.indices):
+        return None
+    ends = con.points or angle_ray_ends(entities, con.indices)
+    if ends is None or None in [line_ends(entities[i]) for i in con.indices]:
+        return None
+    dirs = []
+    for i, w in zip(con.indices, ends):
+        p0, p1 = (np.asarray(p, float)[:2] for p in line_ends(entities[i]))
+        v = p1 - p0 if w == 'p1' else p0 - p1
+        n = float(np.linalg.norm(v))
+        if n < 1e-12:
+            return None
+        dirs.append(v / n)
+    return dirs
+
+
+def angle_rays(entities, con):
+    """(vertex, ray_a, ray_b) an 'angle' measures between, or None (also
+    while the lines are parallel: no vertex to draw at)."""
+    x = _line_cross(entities, con.indices)
+    dirs = _angle_dirs(entities, con)
+    if x is None or dirs is None:
+        return None
+    return x, dirs[0], dirs[1]
+
+
+def ray_angle_deg(entities, con) -> float | None:
+    """The angle (degrees, 0–180) an 'angle' constraint measures now."""
+    dirs = _angle_dirs(entities, con)
+    if dirs is None:
+        return None
+    return float(np.degrees(np.arccos(np.clip(float(dirs[0] @ dirs[1]), -1.0, 1.0))))
 
 
 def _firm_lock(sketch, i, group) -> bool:
@@ -1459,6 +1537,15 @@ class SketchEntry:
                 ref, mov = con.indices
                 if ref in slvs_lines and mov in slvs_lines:
                     slvs.perpendicular(slvs_lines[ref], slvs_lines[mov], wp)
+            elif con.type == 'angle':
+                ref, mov = con.indices
+                ends = con.points or angle_ray_ends(self.entities, con.indices)
+                if ref in slvs_lines and mov in slvs_lines and ends:
+                    # libslvs measures between p0→p1 directions; a ray that
+                    # runs p1→p0 flips its line, so measure the supplement.
+                    flip = (ends[0] == 'p0') != (ends[1] == 'p0')
+                    slvs.angle(slvs_lines[ref], slvs_lines[mov], con.value,
+                               wp, inverse=flip)
             elif con.type == 'horizontal':
                 if i in slvs_lines:
                     slvs.horizontal(slvs_lines[i], wp)
@@ -1950,7 +2037,14 @@ class SketchEntry:
         sweeps = {j: self.entities[j].end_angle - self.entities[j].start_angle
                   for j in tan if isinstance(self.entities[j], ArcEntity)}
         saved = [copy.deepcopy(e.__dict__) for e in self.entities]
+        for c in self.constraints:
+            if c.type == 'angle':
+                turned_line = self._turn_for_angle(c, attachments)
+                if turned_line is not None:
+                    seed = seed | {turned_line}     # its ends must be free
         if not self._solve_local_stages(seed, pins, attachments):
+            for e, st in zip(self.entities, saved):
+                e.__dict__.update(st)
             if self.solve_error is None:
                 self.solve_error = ("Constraint refused: it conflicts with "
                                     "(or repeats) other constraints")
@@ -2000,6 +2094,68 @@ class SketchEntry:
         print(f"[Sketch] {self.solve_error}")
         return False
 
+    def _turn_for_angle(self, con, attachments=None) -> int | None:
+        """Start an angle's solve from geometry that already meets it: turn
+        one of its lines about the vertex to the target.  Newton can't get
+        there from far off — a sliver corner asked for 120° doesn't converge
+        at all, others land on lines thousands of mm long.  Turns the second
+        (moving) line unless something else holds its direction; other
+        lines' ends on the turned ends move with them.  Skipped when an arc,
+        spline or include holds one of those ends (moving it would detach
+        it: coincidence is by position)."""
+        cur = ray_angle_deg(self.entities, con)
+        x = _line_cross(self.entities, con.indices)
+        if cur is None or x is None or abs(cur - con.value) < 1e-9:
+            return
+        held = {i for c in self.constraints if c is not con and c.type in (
+                    'horizontal', 'vertical', 'parallel', 'perpendicular',
+                    'angle') for i in c.indices}
+        ref, mov = con.indices
+        if mov in held:
+            ref, mov = mov, ref
+        if mov in held:
+            return
+        dirs = _angle_dirs(self.entities, con)
+        r_ref, r_mov = (dirs if mov == con.indices[1] else dirs[::-1])
+        s = float(np.arctan2(r_ref[0] * r_mov[1] - r_ref[1] * r_mov[0],
+                             float(r_ref @ r_mov)))
+        phi = (1.0 if s >= 0 else -1.0) * np.radians(con.value) - s
+        c_, s_ = np.cos(phi), np.sin(phi)
+        rot = np.array([[c_, -s_], [s_, c_]])
+        tol = _MERGE_TOL
+        line = self.entities[mov]
+        moves = []                       # (entity, attr, new uv)
+        for w in ('p0', 'p1'):
+            p = np.asarray(getattr(line, w), float)[:2]
+            if float(np.linalg.norm(p - x)) < tol:
+                continue                 # the corner itself stays
+            q = x + rot @ (p - x)
+            for e in self.entities:
+                if isinstance(e, LineEntity):
+                    for a in ('p0', 'p1'):
+                        if float(np.linalg.norm(
+                                np.asarray(getattr(e, a), float)[:2] - p)) < tol:
+                            moves.append((e, a, q))
+                elif isinstance(e, ArcEntity):
+                    if any(float(np.linalg.norm(np.asarray(v, float)[:2] - p)) < tol
+                           for v in (e.center, e.p0, e.p1)):
+                        return
+                elif isinstance(e, (SplineEntity, ReferenceEntity)):
+                    if any(float(np.linalg.norm(np.asarray(v, float)[:2] - p)) < tol
+                           for v in e.points):
+                        return
+        if attachments is None:
+            attachments = include_attachments(self)
+        keyed = {k for k, *_ in attachments}
+        at = {id(e): i for i, e in enumerate(self.entities)}
+        if any((at[id(e)], a) in keyed for e, a, _q in moves):
+            return
+        for e, a, q in moves:
+            pt = np.array(getattr(e, a), float)
+            pt[:2] = q
+            setattr(e, a, pt)
+        return mov
+
     def _line_dir(self, i):
         e = self.entities[i]
         if not isinstance(e, LineEntity):
@@ -2009,6 +2165,24 @@ class SketchEntry:
         return d / n if n > 1e-12 else None
 
     def _solve_local_stages(self, seed, pins, attachments) -> bool:
+        # Locked directions can be met by stretching lines enormously
+        # (angles around a closed outline, lines held parallel-ish): such a
+        # result is no "local" edit, so the next tier tries; if even the
+        # global solve runs off, the constraint is refused.
+        before = self._drawn_xy()
+        reach = 3.0 * max(_xy_extent(before), *(
+            abs(c.value) for c in self.constraints if c.type != 'angle'), 1.0)
+        saved = [copy.deepcopy(e.__dict__) for e in self.entities]
+
+        def stayed() -> bool:
+            moved = self._drawn_xy() - before
+            if not len(moved) or float(np.max(
+                    np.linalg.norm(moved, axis=1))) <= reach:
+                return True
+            for e, st in zip(self.entities, saved):
+                e.__dict__.update(st)
+            return False
+
         built = self._build_solver_system(pins) if seed else None
         if built is not None:
             canon_map = built[3]
@@ -2029,9 +2203,27 @@ class SketchEntry:
             for lock in tiers:
                 for free in rings:
                     if self.apply_constraints(free_points=free, lock_lines=lock,
-                                              pins=pins, attachments=attachments):
+                                              pins=pins, attachments=attachments) \
+                            and stayed():
                         return True
-        return self.apply_all_constraints(pins=pins, attachments=attachments)
+        if not self.apply_all_constraints(pins=pins, attachments=attachments):
+            return False
+        if stayed():
+            return True
+        self.solve_error = ("Constraint refused: solving it sends lines off "
+                            "to enormous lengths")
+        return False
+
+    def _drawn_xy(self) -> np.ndarray:
+        """Line ends and arc centres, (n, 2) — what _solve_local_stages
+        measures a result's motion by."""
+        pts = []
+        for e in self.entities:
+            if isinstance(e, LineEntity):
+                pts += [e.p0[:2], e.p1[:2]]
+            elif isinstance(e, ArcEntity):
+                pts.append(e.center[:2])
+        return np.asarray(pts, float).reshape(-1, 2)
 
     def _independent_locks(self, canon_map, rings, pins, attachments) -> list:
         """Direction locks for the lines the local solve may move, minus any
@@ -2160,7 +2352,7 @@ class SketchEntry:
         for k, c in enumerate(self.constraints):
             if any(not 0 <= i < len(self.entities) for i in c.indices):
                 continue
-            if c.type in ('parallel', 'perpendicular') and len(c.indices) == 2:
+            if c.type in ('parallel', 'perpendicular', 'angle') and len(c.indices) == 2:
                 a, b = (find(i) for i in c.indices)
                 if a == b or (a in fixed and b in fixed):
                     implied.add(k)
@@ -2193,7 +2385,7 @@ class SketchEntry:
 
         fixed = set()
         for c in self.constraints:
-            if c.type in ('parallel', 'perpendicular') and len(c.indices) == 2:
+            if c.type in ('parallel', 'perpendicular', 'angle') and len(c.indices) == 2:
                 a, b = (find(i) for i in c.indices)
                 parent[a] = b
         for c in self.constraints:
@@ -2233,7 +2425,7 @@ class SketchEntry:
         elif con.type == 'diameter':
             # Diameter only changes radius, not point positions — free nothing.
             pass
-        elif con.type in ('parallel', 'perpendicular', 'equal', 'gap'):
+        elif con.type in ('parallel', 'perpendicular', 'angle', 'equal', 'gap'):
             mov = con.indices[1]
             if mov < len(self.entities) and isinstance(self.entities[mov], LineEntity):
                 free.add(canon_map[(mov, 'p0')])
@@ -2266,7 +2458,7 @@ class SketchEntry:
         while changed:
             changed = False
             for con in self.constraints[:-1]:
-                if con.type in ('parallel', 'perpendicular', 'equal'):
+                if con.type in ('parallel', 'perpendicular', 'angle', 'equal'):
                     ref, mov = con.indices
                     involved = {canon_map.get((ref, 'p0')), canon_map.get((ref, 'p1')),
                                 canon_map.get((mov, 'p0')), canon_map.get((mov, 'p1'))} - {None}
@@ -2418,6 +2610,9 @@ class SketchEntry:
             return abs(u[0][0] * u[1][1] - u[0][1] * u[1][0]) < tol
         if con.type == 'perpendicular':
             return abs(float(u[0] @ u[1])) < tol
+        if con.type == 'angle':
+            cos = abs(float(u[0] @ u[1]))      # either supplement: ray sides
+            return abs(cos - abs(np.cos(np.radians(con.value)))) < tol
         if con.type == 'equal':
             return abs(n[0] - n[1]) < tol * max(1.0, n[0])
         return True
@@ -3103,6 +3298,42 @@ class SketchEntry:
                     uv_loops.append(open_loop)
         return uv_loops
 
+    def entity_edge(self, ent):
+        """World-space TopoDS_Edge of a drawn line / arc / spline, else None.
+        Raises if OCCT can't build it."""
+        import math as _math
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+        from OCP.Geom import Geom_Circle
+        from OCP.gp import gp_Ax2, gp_Pnt, gp_Dir
+
+        def uv3d(u, v):
+            return gp_Pnt(*(self.plane_origin + float(u) * self.plane_x_axis
+                            + float(v) * self.plane_y_axis).tolist())
+        if isinstance(ent, LineEntity):
+            return BRepBuilderAPI_MakeEdge(uv3d(*ent.p0[:2]), uv3d(*ent.p1[:2])).Edge()
+        if isinstance(ent, ArcEntity):
+            ax2 = gp_Ax2(uv3d(*ent.center[:2]),
+                         gp_Dir(*map(float, self.plane_normal)),
+                         gp_Dir(*map(float, self.plane_x_axis)))
+            circ = Geom_Circle(ax2, ent.radius)
+            span = ent.end_angle - ent.start_angle
+            if abs(span - 2 * _math.pi) < 1e-9 or abs(span) < 1e-9:
+                return BRepBuilderAPI_MakeEdge(circ).Edge()
+            return BRepBuilderAPI_MakeEdge(circ, ent.start_angle, ent.end_angle).Edge()
+        if isinstance(ent, SplineEntity):
+            from OCP.collections import Array1_gp_Pnt as TColgp_Array1OfPnt
+            from OCP.GeomAPI import GeomAPI_PointsToBSpline
+            pts = list(ent.points)
+            if ent.closed and pts:
+                pts = pts + [pts[0]]
+            if len(pts) < 2:
+                return None
+            arr = TColgp_Array1OfPnt(1, len(pts))
+            for i, p in enumerate(pts, start=1):
+                arr.SetValue(i, uv3d(p[0], p[1]))
+            return BRepBuilderAPI_MakeEdge(GeomAPI_PointsToBSpline(arr).Curve()).Edge()
+        return None
+
     def build_wire(self, tol: float = 1e-3):
         """Convert LineEntity segments into a build123d Wire (for DXF export etc.)."""
         from build123d import Polyline, Vector, Compound
@@ -3265,64 +3496,20 @@ class SketchEntry:
 
         tools_list = TopTools_ListOfShape()
 
-        # ── Drawn LineEntity edges — each edge is its own wire tool ──────
+        # ── Drawn edges — each edge is its own wire tool ─────────────────
         for ei, ent in enumerate(self.entities):
             # Construction geometry is reference-only — never part of a profile.
             if getattr(ent, "construction", False):
                 continue
-            if isinstance(ent, LineEntity):
-                e = BRepBuilderAPI_MakeEdge(_uv3d(ent.p0[0], ent.p0[1]),
-                                            _uv3d(ent.p1[0], ent.p1[1])).Edge()
-                w = _single_edge_wire(e, ei)
+            if isinstance(ent, (LineEntity, ArcEntity, SplineEntity)):
+                try:
+                    e = self.entity_edge(ent)
+                except Exception as ex:
+                    print(f"[Sketch] build_faces: {type(ent).__name__} edge error — {ex}")
+                    continue
+                w = _single_edge_wire(e, ei) if e is not None else None
                 if w is not None:
                     tools_list.Append(w)
-
-            elif isinstance(ent, ArcEntity):
-                try:
-                    cx, cy = float(ent.center[0]), float(ent.center[1])
-                    c3d = (self.plane_origin
-                           + cx * self.plane_x_axis
-                           + cy * self.plane_y_axis)
-                    ax2 = gp_Ax2(
-                        gp_Pnt(*c3d.tolist()),
-                        gp_Dir(float(self.plane_normal[0]),
-                               float(self.plane_normal[1]),
-                               float(self.plane_normal[2])),
-                        gp_Dir(float(self.plane_x_axis[0]),
-                               float(self.plane_x_axis[1]),
-                               float(self.plane_x_axis[2])),
-                    )
-                    geom_circ = _GCircle(ax2, ent.radius)
-                    span = ent.end_angle - ent.start_angle
-                    if abs(span - 2 * _math.pi) < 1e-9 or abs(span) < 1e-9:
-                        arc_edge = BRepBuilderAPI_MakeEdge(geom_circ).Edge()
-                    else:
-                        arc_edge = BRepBuilderAPI_MakeEdge(
-                            geom_circ, ent.start_angle, ent.end_angle).Edge()
-                    w = _single_edge_wire(arc_edge, ei)
-                    if w is not None:
-                        tools_list.Append(w)
-                except Exception as ex:
-                    print(f"[Sketch] build_faces: arc edge error — {ex}")
-
-            elif isinstance(ent, SplineEntity):
-                try:
-                    from OCP.collections import Array1_gp_Pnt as TColgp_Array1OfPnt
-                    from OCP.GeomAPI import GeomAPI_PointsToBSpline
-                    pts = list(ent.points)
-                    if ent.closed and pts:
-                        pts = pts + [pts[0]]
-                    if len(pts) >= 2:
-                        arr = TColgp_Array1OfPnt(1, len(pts))
-                        for i, p in enumerate(pts, start=1):
-                            arr.SetValue(i, _uv3d(p[0], p[1]))
-                        curve = GeomAPI_PointsToBSpline(arr).Curve()
-                        sp_edge = BRepBuilderAPI_MakeEdge(curve).Edge()
-                        w = _single_edge_wire(sp_edge, ei)
-                        if w is not None:
-                            tools_list.Append(w)
-                except Exception as ex:
-                    print(f"[Sketch] build_faces: spline edge error — {ex}")
 
         # ── ReferenceEntity closed loops — add as wire tools ─────────────
         def _project_ref_edge(edge):
