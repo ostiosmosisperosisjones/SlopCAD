@@ -1920,14 +1920,47 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                   f"{', '.join(str(i) for i, _ in ends)}")
             self.update()
             return
+        from cad.sketch import pinch_pairs, unpinch_arcs
+        if lbl.get('pinch'):
+            # Implicit tangent of a pinch: split it, nothing to delete.
+            ents, pair = lbl['pinch']
+            active = self._sketch is not None and ents is self._sketch.entities
+            if active:
+                self._sketch.push_undo_snapshot()
+            unpinch_arcs(ents, *pair)
+            print(f"[Sketch] Released tangent: arcs {pair[0]} and {pair[1]} "
+                  f"cross again")
+            self._rebuild_sketch_faces()
+            if active:
+                self.sketch_mode_changed.emit(True)
+            else:
+                self.history_changed.emit()
+            self.update()
+            return
         ci = lbl['constraint_idx']
+
+        def _release_pinch(ents, con) -> bool:
+            """A pinch's tangent: split the touch point back into two
+            crossing points.  No re-solve — the dimension that made it
+            tangent would pinch it straight back; the user edits it next."""
+            pair = tuple(sorted(con.indices))
+            if con.type != 'tangent' or pair not in pinch_pairs(ents):
+                return False
+            unpinch_arcs(ents, *pair)
+            print(f"[Sketch] Released tangent: arcs {pair[0]} and {pair[1]} "
+                  f"cross again")
+            return True
 
         if self._sketch is not None and ci < len(self._sketch.constraints):
             self._sketch.push_undo_snapshot()
-            del self._sketch.constraints[ci]
+            con = self._sketch.constraints.pop(ci)
             from cad.sketch import SketchEntry, LineEntity, ArcEntity
-            tmp = SketchEntry.from_sketch_mode(self._sketch)
-            if tmp.apply_last_constraint() if tmp.constraints else True:
+            if _release_pinch(self._sketch.entities, con):
+                ok = False
+            else:
+                tmp = SketchEntry.from_sketch_mode(self._sketch)
+                ok = tmp.apply_last_constraint() if tmp.constraints else True
+            if ok:
                 for i, ent in enumerate(tmp.entities):
                     if isinstance(ent, LineEntity):
                         self._sketch.entities[i].p0 = ent.p0.copy()
@@ -1948,8 +1981,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             se = entry.params.get('sketch_entry')
             if se is None or ci >= len(se.constraints):
                 continue
-            del se.constraints[ci]
-            se.apply_last_constraint()
+            con = se.constraints.pop(ci)
+            if not _release_pinch(se.entities, con):
+                se.apply_last_constraint()
             self._rebuild_sketch_faces()
             self.history_changed.emit()
             self.update()

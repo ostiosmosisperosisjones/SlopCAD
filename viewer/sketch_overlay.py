@@ -1790,6 +1790,32 @@ def _tangent_labels(entities, constraints, to_3d, camera_distance, dimmed):
             'p0_uv':          pos,
             'constraints':    [],       # nothing to drag
         })
+    # Pinches are tangents nobody added (the solver emits them); tag them
+    # too so it shows why the arcs are stuck — Shift+click splits it.
+    from cad.sketch import SketchConstraint, pinch_pairs
+    have = {tuple(sorted(c.indices)) for c in constraints if c.type == 'tangent'}
+    for pair in pinch_pairs(entities):
+        if pair in have:
+            continue
+        p = tangent_point(entities, SketchConstraint('tangent', pair, 0.0))
+        A = entities[pair[0]]
+        n = A.center - p
+        nn = float(np.linalg.norm(n))
+        pos = p + (n / nn if nn > 1e-12 else np.zeros(2)) * off
+        w = to_3d(*pos)
+        out.append({
+            'world':          np.array([float(w[0]), float(w[1]), float(w[2])]),
+            'text':           'tan',
+            'constraint_idx': -1,
+            'entity_idx':     pair[1],
+            'pinch':          (entities, pair),
+            'parallel':       True,
+            'dimmed':         dimmed,
+            'perp_world':     np.zeros(3),
+            'perp_uv':        np.array([0.0, 1.0]),
+            'p0_uv':          pos,
+            'constraints':    [],
+        })
     return out
 
 

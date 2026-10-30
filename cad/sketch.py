@@ -862,6 +862,43 @@ def _is_full_circle(arc) -> bool:
     return abs(arc.end_angle - arc.start_angle - 2.0 * np.pi) < 1e-6
 
 
+# _build_solver_system merges points closer than this into one.
+_MERGE_TOL = 1e-3
+
+
+def _is_pinched(arc) -> bool:
+    """An arc whose ends merged into one solver point (it grew to a nearly
+    closed loop).  A SolveSpace arc with start == end is degenerate, so the
+    solver treats it as a circle through that point."""
+    return isinstance(arc, ArcEntity) and not _is_full_circle(arc) and \
+        float(np.linalg.norm(arc.p0 - arc.p1)) < _MERGE_TOL
+
+
+def pinch_pairs(entities) -> list[tuple[int, int]]:
+    """Arc pairs pinched at one shared point: two arcs that shared both
+    ends (a lens / snowman outline) whose circles became tangent, so both
+    crossing points collapsed into the touch point."""
+    pinched = [i for i, e in enumerate(entities) if _is_pinched(e)]
+    return [(a, b) for k, a in enumerate(pinched) for b in pinched[k + 1:]
+            if float(np.linalg.norm(entities[a].p0 - entities[b].p0)) < _MERGE_TOL]
+
+
+def unpinch_arcs(entities, a: int, b: int, gap: float = 0.01) -> None:
+    """Split a pinch back into two crossing points `gap` apart, so the arcs
+    can cross again (the tangent between them was removed).  Arc a opens by
+    gap; arc b's ends move onto a's new ends, b keeping its long way round."""
+    A, B = entities[a], entities[b]
+    d = 0.5 * gap / max(float(A.radius), 1e-9)
+    A.start_angle += d
+    A.end_angle -= d
+    angs = [float(np.arctan2(*(p - B.center)[::-1])) for p in (A.p0, A.p1)]
+    s, e = angs
+    if (e - s) % (2.0 * np.pi) < np.pi:
+        s, e = e, s
+    B.start_angle = s
+    B.end_angle = s + (e - s) % (2.0 * np.pi)
+
+
 _OVERHEAD_DOF: int | None = None
 
 
@@ -1336,10 +1373,15 @@ class SketchEntry:
             arc_end_pts[i]    = ep
 
             is_full_circle = abs(ent.end_angle - ent.start_angle - TWO_PI) < 1e-6
-            if is_full_circle:
+            if is_full_circle or sp is ep:
                 dist_ent = slvs.add_distance(float(ent.radius), wp)
                 arc_dist_ents[i] = dist_ent
                 slvs_arcs[i] = slvs.add_circle(nm3d, cp, dist_ent, wp)
+                if not is_full_circle:
+                    # Pinched (see _is_pinched): its one end stays on it.
+                    from python_solvespace import Constraint as K, Entity as E
+                    slvs.add_constraint(K.PT_ON_CIRCLE, wp, 0.0, sp, E.NONE,
+                                        slvs_arcs[i], E.NONE)
             else:
                 slvs_arcs[i] = slvs.add_arc(nm3d, cp, sp, ep, wp)
 
@@ -1383,6 +1425,14 @@ class SketchEntry:
             return slvs_pts[canon_map[(ei, which)]]
 
         implied = {id(self.constraints[k]) for k in self._implied_direction_cons()}
+        # A pinch (see pinch_pairs) is a tangent nobody added: emit it
+        # unless the user's own tangent covers it.  Shift+click on its
+        # 'tan' tag splits the pinch (unpinch_arcs).
+        have = {tuple(sorted(c.indices)) for c in self.constraints
+                if c.type == 'tangent'}
+        constraints = list(constraints) + [
+            SketchConstraint('tangent', p, 0.0)
+            for p in pinch_pairs(self.entities) if p not in have]
         for con in constraints:
             if id(con) in implied:
                 continue                      # repeat of other constraints
@@ -1553,9 +1603,10 @@ class SketchEntry:
             return
         A, B = ents[a], ents[b]
         ck = lambda i, w: canon_map.get((i, w))
-        a_full = _is_full_circle(A)
+        # A pinched arc is a circle to the solver (_build_solver_system).
+        a_full = _is_full_circle(A) or ck(a, 'p0') == ck(a, 'p1')
         b_arc = isinstance(B, ArcEntity)
-        b_full = b_arc and _is_full_circle(B)
+        b_full = b_arc and (_is_full_circle(B) or ck(b, 'p0') == ck(b, 'p1'))
 
         def tied(i, which, target):
             snap = getattr(ents[i], f'{which}_snap', None) \
@@ -1608,14 +1659,18 @@ class SketchEntry:
                                             slvs_arcs[b], other=bool(ka),
                                             other2=bool(kb))
                         return
-        # Two circles: touch point on both, centres in line with it.
-        n = B.center - A.center
-        nn = float(np.linalg.norm(n))
-        n = n / nn if nn > 1e-12 else np.array([1.0, 0.0])
-        t0 = A.center + n * A.radius
-        T = slvs.add_point_2d(float(t0[0]), float(t0[1]), wp)
-        on_circle(T, a)
-        on_circle(T, b)
+        # Two circles: touch point on both, centres in line with it.  A
+        # pinched pair's shared end is that point, already on both.
+        if b_arc and ck(a, 'p0') == ck(a, 'p1') == ck(b, 'p0'):
+            T = slvs_pts[ck(a, 'p0')]
+        else:
+            n = B.center - A.center
+            nn = float(np.linalg.norm(n))
+            n = n / nn if nn > 1e-12 else np.array([1.0, 0.0])
+            t0 = A.center + n * A.radius
+            T = slvs.add_point_2d(float(t0[0]), float(t0[1]), wp)
+            on_circle(T, a)
+            on_circle(T, b)
         slvs.parallel(slvs.add_line_2d(center_a, T, wp),
                       slvs.add_line_2d(center_b, T, wp), wp)
 
@@ -1635,7 +1690,7 @@ class SketchEntry:
         if not has_geometry:
             return ('none', -1)
 
-        def _solve(with_attachments: bool):
+        def _solve(with_attachments: bool, drop=None):
             built = self._build_solver_system()
             if built is None:
                 return None, None
@@ -1653,10 +1708,15 @@ class SketchEntry:
             self._add_snap_coincidences(slvs, wp, slvs_pts, slvs_lines,
                                         slvs_arcs, canon_map, self.constraints,
                                         implicit_lengths=False)
+            cons = [c for c in self.constraints if c is not drop]
             self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
                                               slvs_lines, slvs_arcs,
-                                              arc_dist_ents, self.constraints)
-            return slvs.solve(), slvs
+                                              arc_dist_ents, cons)
+            r = slvs.solve()
+            if r == 0 and drop is not None and not self._constraint_holds(
+                    drop, slvs, canon_map, slvs_pts, ref_geo, arc_dist_ents):
+                r = 1           # dropped one was a real conflict
+            return r, slvs
 
         result, slvs = _solve(with_attachments=True)
         if result is None:
@@ -1668,6 +1728,11 @@ class SketchEntry:
             result, slvs = _solve(with_attachments=False)
             if result is None:
                 return ('none', -1)
+        # A dimension a pinch tangent implies (see apply_constraints).
+        for k in self._pinch_redundant_cands() if result != 0 else ():
+            result, slvs = _solve(True, drop=self.constraints[k])
+            if result == 0:
+                break
         if result != 0:
             return ('over', -1)
 
@@ -1889,6 +1954,11 @@ class SketchEntry:
             if self.solve_error is None:
                 self.solve_error = ("Constraint refused: it conflicts with "
                                     "(or repeats) other constraints")
+                pairs = pinch_pairs(self.entities)
+                if pairs:
+                    self.solve_error += (
+                        " — arcs " + ", ".join(f"{a}/{b}" for a, b in pairs) +
+                        " are tangent (Shift+click 'tan' to release)")
                 print(f"[Sketch] {self.solve_error}")
             return False
         def _sin(d, e):
@@ -2295,6 +2365,16 @@ class SketchEntry:
     def _constraint_holds(self, con, slvs, canon_map, slvs_pts, ref_geo,
                           arc_dist_ents=None) -> bool:
         """Whether a geometric constraint is satisfied by the solved points."""
+        if con.type == 'diameter' and arc_dist_ents and \
+                con.indices[0] in arc_dist_ents:
+            r = float(slvs.params(arc_dist_ents[con.indices[0]].params)[0])
+            return abs(2.0 * r - con.value) < 1e-6 * max(1.0, con.value)
+        if con.type == 'pt_distance' and None not in (con.points or (None,)) \
+                and 'mid' not in con.points:
+            a, b = (np.array(slvs.params(slvs_pts[canon_map[(i, w)]].params)[:2])
+                    for i, w in zip(con.indices, con.points))
+            return abs(float(np.linalg.norm(a - b)) - con.value) < \
+                1e-6 * max(1.0, con.value)
         if con.type in ('equal', 'concentric') and all(
                 0 <= i < len(self.entities) and
                 isinstance(self.entities[i], ArcEntity) for i in con.indices):
@@ -2367,7 +2447,8 @@ class SketchEntry:
         """
         if attachments is None:
             attachments = include_attachments(self)
-        if not self.constraints and not pins and not attachments:
+        if not self.constraints and not pins and not attachments \
+                and not pinch_pairs(self.entities):
             return True
         pins = pins or {}
 
@@ -2575,6 +2656,17 @@ class SketchEntry:
                     result, state = r3, s3
                     break
 
+        if result != 0:
+            # A pinch tangent fixes the centre distance: a dimension that
+            # says the same (centres r1 + r2 apart) is redundant, which
+            # SolveSpace rejects.  Drop it if it still holds without.
+            for k in self._pinch_redundant_cands():
+                dc = frozenset([k])
+                r4, s4 = _attempt(not no_pin, drop_con=dc)
+                if r4 == 0 and _dropped_hold(s4, frozenset(), dc):
+                    result, state = r4, s4
+                    break
+
         slvs, wp, canon_map, slvs_pts, slvs_lines, slvs_arcs, arc_dist_ents, \
             _ref_geo, _att_checks = state
         if result != 0:
@@ -2614,6 +2706,14 @@ class SketchEntry:
                 if i in arc_dist_ents:
                     r_val = slvs.params(arc_dist_ents[i].params)
                     ent.radius = float(r_val[0])
+            elif i in arc_dist_ents:
+                # Pinched: a circle with its one end on it; keep the sweep.
+                ent.radius = float(slvs.params(arc_dist_ents[i].params)[0])
+                uv = slvs.params(slvs_pts[canon_map[(i, 'p0')]].params)
+                d = np.array([uv[0], uv[1]]) - ent.center
+                sweep = ent.end_angle - ent.start_angle
+                ent.start_angle = float(np.arctan2(d[1], d[0]))
+                ent.end_angle = ent.start_angle + sweep
             else:
                 ck0 = canon_map.get((i, 'p0'))
                 ck1 = canon_map.get((i, 'p1'))
@@ -2661,6 +2761,19 @@ class SketchEntry:
                         ent.p1 = coord.copy()
 
         return True
+
+    def _pinch_redundant_cands(self) -> list[int]:
+        """Dimensions on pinched arcs that their tangent can make redundant:
+        point-to-point distances and diameters (see _constraint_holds)."""
+        pinched = {i for p in pinch_pairs(self.entities) for i in p}
+        if not pinched:
+            return []
+        return [k for k, c in enumerate(self.constraints)
+                if set(c.indices) & pinched and (
+                    c.type == 'diameter' or (
+                        c.type == 'pt_distance' and
+                        None not in (c.points or (None,)) and
+                        'mid' not in c.points))]
 
     # ------------------------------------------------------------------
     # Derived geometry — built on demand, never cached
