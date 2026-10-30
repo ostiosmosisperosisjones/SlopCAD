@@ -22,6 +22,9 @@ class ThickenMixin:
             body_id      = None
             face_indices = []
         self._show_thicken_panel(body_id, face_indices)
+        if not face_indices:
+            p = self._thicken_panel
+            self._arm_pick(p._pick_face_btn, p._on_pick_face_toggle)
 
     def _show_thicken_panel(self, body_id: str | None, face_indices: list, editing_entry=None):
         from gui.thicken_panel import ThickenPanel

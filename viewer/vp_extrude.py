@@ -40,6 +40,8 @@ class ExtrudeMixin:
             self._show_extrude_panel(body_id=sf.body_id, face_idx=sf.face_idx)
         else:
             self._show_extrude_panel()
+            p = self._extrude_panel
+            self._arm_pick(p._pick_face_btn, p._on_pick_face_toggle)
 
     def _show_extrude_panel(self, sketch_idx: int | None = None,
                              body_id: str | None = None,
@@ -608,19 +610,12 @@ class ExtrudeMixin:
         #     same body_id domain — they have shape_before=None and were
         #     pushed in the same commit call (identified by matching op type
         #     and original op's body neighborhood).
+        #   - For a no-target cut: its fan-out siblings (one per body cut).
         original_op    = entry.op
-        group_indices  = [idx]
-        group_body_ids = {entry.body_id}
-
-        entry_id = entry.entry_id
-        for j in range(idx + 1, len(entries)):
-            e = entries[j]
-            # Collect any entry that was produced by this op — both regular
-            # split imports (operation="import") and force_new_body children
-            # (operation="extrude"/"cut") all share source_entry_id == this entry_id.
-            if e.params.get("source_entry_id") == entry_id:
-                group_indices.append(j)
-                group_body_ids.add(e.body_id)
+        # Split imports (operation="import") and force_new_body children
+        # (operation="extrude"/"cut") share source_entry_id == this entry_id.
+        group_indices  = self.history.op_group(idx)
+        group_body_ids = {entries[j].body_id for j in group_indices}
 
         # Source bodies — used only by the pre-commit guard below to ensure
         # the op's input still has a valid shape at idx-1.

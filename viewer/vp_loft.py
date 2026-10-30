@@ -19,6 +19,13 @@ class LoftMixin:
     # Panel lifecycle
     # ------------------------------------------------------------------
 
+    def _try_loft(self):
+        if getattr(self, '_loft_panel', None) is not None:
+            return
+        self._show_loft_panel()
+        p = self._loft_panel
+        self._arm_pick(p._pick_profile_btn, p._on_pick_profile_toggle)
+
     def _show_loft_panel(self):
         from gui.loft_panel import LoftPanel
         if getattr(self, '_loft_panel', None) is not None:
@@ -105,7 +112,8 @@ class LoftMixin:
             panel.add_profile(sid, label, face_idx=face_idx)
 
         # Restore mode + target body
-        if op.cut_body_id is not None:
+        # A fan-out member's cut_body_id is just one of the bodies it hit.
+        if op.cut_body_id is not None and "fanout_id" not in entry.params:
             panel._radio_cut.setChecked(True)
             panel._on_mode_changed(1)
             if op.cut_body_id in self.workspace.bodies:
@@ -135,19 +143,15 @@ class LoftMixin:
         entry = entries[idx]
         entry.editing = False
 
-        group_indices = [idx]
-        entry_id = entry.entry_id
-        for j in range(idx + 1, len(entries)):
-            e = entries[j]
-            if e.params.get("source_entry_id") == entry_id:
-                group_indices.append(j)
+        # Split children + fan-out siblings (a cut-thru-all is one group).
+        group_indices = self.history.op_group(idx)
 
         child_body_ids = entry.params.get("child_body_ids", []) or []
         group_entry_ids = {entries[j].entry_id for j in group_indices}
         removable_bodies = set()
         candidate_body_ids = set(child_body_ids)
-        if entry.body_id:
-            candidate_body_ids.add(entry.body_id)
+        candidate_body_ids |= {entries[j].body_id for j in group_indices
+                               if entries[j].body_id}
         for bid in candidate_body_ids:
             body = self.workspace.bodies.get(bid)
             if body is not None and body.created_at_entry_id in group_entry_ids:

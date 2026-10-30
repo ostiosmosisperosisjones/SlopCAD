@@ -73,16 +73,19 @@ class _DeletedEntry:
 
 class DeleteCommand(HistoryCommand):
     def __init__(self, index: int, entries_snapshot: list,
-                 removed_bodies: list):
+                 removed_bodies: list, cursor: int | None = None):
         """
         index             : position of the primary entry being deleted
         entries_snapshot  : deep-copy of the relevant entries (primary +
                             split/child entries) before deletion
         removed_bodies    : list of (body_id, Body) tuples that were removed
+        cursor            : history cursor before the delete, restored on
+                            revert (else the restored entries sit in the future)
         """
         self.index = index
         self.entries_snapshot = entries_snapshot   # [(original_index, entry), ...]
         self.removed_bodies = removed_bodies       # [(body_id, Body), ...]
+        self.cursor = cursor
 
     def apply(self, vp) -> None:
         vp._do_delete(self.index)
@@ -99,6 +102,9 @@ class DeleteCommand(HistoryCommand):
             entries = vp.history._entries
             insert_at = min(orig_idx, len(entries))
             entries.insert(insert_at, entry)
+
+        if self.cursor is not None:
+            vp.history.seek(self.cursor)
 
         # Replay from the earliest restored position to recompute shapes.
         if self.entries_snapshot:

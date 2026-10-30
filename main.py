@@ -9,6 +9,24 @@ import multiprocessing
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
+# `slopcad --selftest [OUT]`: headless kernel-worker check of this build (see
+# cad/selftest.py), for CI and packaging/*.  Results go to stdout, or to OUT —
+# the windowed Windows exe has no stdout at all, so it defaults to
+# <config>/cadapp/selftest.json there.
+if __name__ == "__main__" and "--selftest" in sys.argv:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    _i = sys.argv.index("--selftest")
+    _out = sys.argv[_i + 1] if len(sys.argv) > _i + 1 else None
+    if _out is None and sys.stdout is None:
+        _base = (os.environ.get("APPDATA", os.path.expanduser("~")) if os.name == "nt"
+                 else os.path.join(os.path.expanduser("~"), ".config"))
+        os.makedirs(os.path.join(_base, "cadapp"), exist_ok=True)
+        _out = os.path.join(_base, "cadapp", "selftest.json")
+    if _out is not None:
+        sys.stdout = sys.stderr = open(_out, "w", buffering=1, encoding="utf-8")
+    from cad.selftest import run as _selftest
+    sys.exit(_selftest())
+
 # In a frozen build (PyInstaller AppImage/exe) there is no console, so any
 # startup crash or our diagnostic prints (e.g. the GPU-pick CPU fallback) vanish
 # — a friend just sees "it didn't open" with nothing to send back. Tee stdout/
@@ -192,6 +210,12 @@ def main():
         if pc is not None:
             pc.background(delta, name)
     set_activity_hook(_activity)
+    if "--smoke-gui" in sys.argv:                  # packaging/: see cad/selftest.py
+        from PyQt6.QtCore import QTimer
+        from cad.selftest import gui_check
+        _i = sys.argv.index("--smoke-gui")
+        _out = sys.argv[_i + 1] if len(sys.argv) > _i + 1 else None
+        QTimer.singleShot(4000, lambda: gui_check(app, window, _out))
     sys.exit(app.exec())
 
 

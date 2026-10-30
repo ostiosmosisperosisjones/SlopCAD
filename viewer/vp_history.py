@@ -180,33 +180,28 @@ class HistoryMixin:
         body_id = entries[index].body_id
         print(f"[History] Deleting entry {index}: '{entries[index].label}'")
 
-        deleted_entry = entries[index]
-        child_body_ids = list(deleted_entry.params.get("child_body_ids", []))
-        entry_id = deleted_entry.entry_id
-        split_body_ids = [
-            e.body_id for e in entries
-            if e.params.get("source_entry_id") == entry_id
-        ]
-        split_indices = sorted(
-            [i for i, e in enumerate(entries)
-             if e.params.get("source_entry_id") == entry_id],
-            reverse=True
-        )
+        # The entry, its fan-out siblings and their split children go together.
+        group = self.history.op_group(index)
+        members = self.history.fanout_members(index)
+        child_body_ids = [bid for i in members
+                          for bid in entries[i].params.get("child_body_ids", [])]
+        split_body_ids = [entries[i].body_id for i in group if i not in members]
+        member_body_ids = {entries[i].body_id for i in members} | {body_id}
 
-        for i in split_indices:
+        for i in reversed(group):
             self.history.delete(i)
         for bid in split_body_ids + child_body_ids:
             self.workspace.remove_body(bid)
-        self.history.delete(index)
 
-        # If the primary body now has no history entries at all, it has no
-        # source of geometry — remove it so it doesn't linger as a ghost.
-        if not any(e.body_id == body_id for e in self.history.entries):
-            self.workspace.remove_body(body_id)
+        # If a body now has no history entries at all, it has no source of
+        # geometry — remove it so it doesn't linger as a ghost.
+        for bid in member_body_ids:
+            if not any(e.body_id == bid for e in self.history.entries):
+                self.workspace.remove_body(bid)
 
         # Replay all surviving body chains in a single ordered pass so that
         # cross-body ops see up-to-date dependency shapes.
-        self.history.replay_all_from(index)
+        self.history.replay_all_from(group[0])
 
         # Full rebuild — equivalent to clicking the last history entry — so any
         # ghost meshes for removed bodies are guaranteed to be flushed.
@@ -238,29 +233,21 @@ class HistoryMixin:
         if index < 0 or index >= len(entries):
             return
 
-        # Snapshot the primary entry and any split/child entries before deletion.
-        entry_id = entries[index].entry_id
-        split_indices = sorted(
-            [i for i, e in enumerate(entries)
-             if e.params.get("source_entry_id") == entry_id]
-        )
-        all_indices = [index] + split_indices
+        # Snapshot the whole op group (fan-out siblings, split children).
+        all_indices = self.history.op_group(index)
         entries_snapshot = [(i, copy.deepcopy(entries[i])) for i in all_indices]
 
         # Snapshot bodies that will be removed.
-        child_body_ids = list(entries[index].params.get("child_body_ids", []))
-        split_body_ids = [entries[i].body_id for i in split_indices]
-        primary_body_id = entries[index].body_id
-        # If this is the only entry for the primary body, deleting it will also
-        # remove the body itself — snapshot it so undo can restore it.
-        primary_will_be_removed = not any(
-            e.body_id == primary_body_id
-            for i, e in enumerate(entries)
-            if i != index and i not in split_indices
-        )
-        bodies_to_snapshot = split_body_ids + child_body_ids
-        if primary_will_be_removed:
-            bodies_to_snapshot = [primary_body_id] + bodies_to_snapshot
+        members = self.history.fanout_members(index)
+        child_body_ids = [bid for i in members
+                          for bid in entries[i].params.get("child_body_ids", [])]
+        split_body_ids = [entries[i].body_id for i in all_indices if i not in members]
+        # A body whose only entries are in the group goes with it — snapshot
+        # it so undo can restore it.
+        doomed = [bid for bid in dict.fromkeys(entries[i].body_id for i in members)
+                  if not any(e.body_id == bid for i, e in enumerate(entries)
+                             if i not in all_indices)]
+        bodies_to_snapshot = doomed + split_body_ids + child_body_ids
         removed_bodies = [
             (bid, copy.deepcopy(self.workspace.bodies[bid]))
             for bid in bodies_to_snapshot
@@ -268,7 +255,8 @@ class HistoryMixin:
         ]
 
         from viewer.history_commands import DeleteCommand
-        cmd = DeleteCommand(index, entries_snapshot, removed_bodies)
+        cmd = DeleteCommand(index, entries_snapshot, removed_bodies,
+                            cursor=self.history.cursor)
         # Apply directly (skip push so we don't double-apply).
         self._cmd_stack._do_push_no_apply(cmd)
         self._do_delete(index)
@@ -277,6 +265,15 @@ class HistoryMixin:
         """Reorder with undo support via command stack."""
         entries = self.history.entries
         if src == dst or src < 0 or src >= len(entries):
+            return
+        # A fan-out cut's entries must stay contiguous (one row, one step).
+        # (pop src, insert at dst: moving down shifts the group up by one)
+        span = self.history.fanout_span(src)
+        dspan = self.history.fanout_span(dst)
+        splits = dspan is not None and (dspan[0] < dst <= dspan[1] if src > dst
+                                        else dspan[0] <= dst < dspan[1])
+        if (span is not None and span[0] != span[1]) or splits:
+            print("[History] Can't reorder into or out of a multi-body cut.")
             return
         from viewer.history_commands import ReorderCommand
         cmd = ReorderCommand(src, dst)

@@ -80,6 +80,9 @@ class Fillet3DMixin:
             face_indices = []
             edge_indices = []
         self._show_fillet3d_panel(body_id, face_indices, edge_indices=edge_indices)
+        if body_id is None:
+            p = self._fillet3d_panel
+            self._arm_pick(p._pick_edge_btn, p._on_pick_edge_toggle)
 
     # ------------------------------------------------------------------
     # Panel lifecycle

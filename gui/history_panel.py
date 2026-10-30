@@ -49,6 +49,9 @@ _BORDER_DIM    = "#282828"
 _BORDER_FUTURE = "#2a2a2a"
 _BORDER_DIVERGED = "#6e5a20"
 _BORDER_ERROR  = "#8a2020"
+_BG_WARN       = "#2a2014"
+_TEXT_WARN     = "#d08a3a"
+_BORDER_WARN   = "#c06a1a"
 
 _OP_ACCENT = {
     "import":       "#505050",
@@ -61,6 +64,10 @@ _OP_ACCENT = {
     "loft_cut":     "#9e7a44",
     "chamfer":      "#4a8a82",
 }
+
+
+# Item data: the index a click seeks to (end of a fan-out group).
+_SEEK_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
 def _op_icon(op: str) -> str:
@@ -183,6 +190,9 @@ class _EntryWidget(QFrame):
             bg, text_color, border = _BG_EDITING, _TEXT_EDITING, _BORDER_EDITING
         elif entry.error:
             bg, text_color, border = _BG_ERROR, _TEXT_ERROR, _BORDER_ERROR
+        elif (entry.warning or entry.health_warning) and not is_future:
+            bg, text_color = _BG_WARN, _TEXT_WARN
+            border = _BORDER_SEL if is_current else _BORDER_WARN
         elif is_future and entry.diverged:
             bg, text_color, border = _BG_DIVERGED, _TEXT_DIVERGED, _BORDER_DIVERGED
         elif is_future:
@@ -247,7 +257,7 @@ class _EntryWidget(QFrame):
             lbl_text = "✎ " + lbl_text
         elif entry.error:
             lbl_text = "⚠ " + lbl_text
-        elif entry.warning:
+        elif entry.warning or entry.health_warning:
             lbl_text = "△ " + lbl_text
         lbl = QLabel(lbl_text)
         lbl.setStyleSheet(prefs.scale_stylesheet(
@@ -257,8 +267,9 @@ class _EntryWidget(QFrame):
                           QSizePolicy.Policy.Preferred)
         if entry.error and entry.error_msg:
             lbl.setToolTip(entry.error_msg)
-        elif entry.warning:
-            lbl.setToolTip(entry.warning)
+        elif entry.warning or entry.health_warning:
+            lbl.setToolTip("\n".join(w for w in (entry.warning,
+                                                    entry.health_warning) if w))
         row.addWidget(lbl)
 
         if editable:
@@ -492,13 +503,13 @@ class HistoryPanel(QWidget):
         self._undo_btn.setStyleSheet(
             btn_style + "QPushButton { border-right: 1px solid #2a2a2a; }")
         self._undo_btn.clicked.connect(
-            lambda: self.seek_requested.emit(self._history.cursor - 1))
+            lambda: self.seek_requested.emit(self._history.step_target(-1)))
         btn_row.addWidget(self._undo_btn)
 
         self._redo_btn = QPushButton("Redo ↪")
         self._redo_btn.setStyleSheet(btn_style)
         self._redo_btn.clicked.connect(
-            lambda: self.seek_requested.emit(self._history.cursor + 1))
+            lambda: self.seek_requested.emit(self._history.step_target(+1)))
         btn_row.addWidget(self._redo_btn)
 
         bc = QWidget()
@@ -521,18 +532,30 @@ class HistoryPanel(QWidget):
                          or "source_entry_id" in entry.params)):
                 continue
 
-            body      = self._workspace.bodies.get(entry.body_id)
-            body_name = body.name if body else "?"
+            # A no-target cut fanned out over several bodies is one row: the
+            # first member stands for the group, clicking it seeks to the end.
+            fid = entry.params.get("fanout_id")
+            if fid and any(e.params.get("fanout_id") == fid for e in entries[:i]):
+                continue
+            span = self._history.fanout_span(i) if fid else None
+            last = span[1] if span else i
+            group_bodies = ([e.body_id for e in entries
+                             if e.params.get("fanout_id") == fid]
+                            if fid else [entry.body_id])
+
+            names = [b.name if b else "?" for b in
+                     (self._workspace.bodies.get(bid) for bid in group_bodies)]
+            body_name = ", ".join(names)
 
             is_selected_body = (
                 self._selected_body is None
-                or entry.body_id == self._selected_body
+                or self._selected_body in group_bodies
             )
-            is_hidden_body = entry.body_id in self._hidden_bodies
+            is_hidden_body = all(b in self._hidden_bodies for b in group_bodies)
 
             w = _EntryWidget(
                 entry, i,
-                is_current       = (i == cursor),
+                is_current       = (i <= cursor <= last),
                 is_future        = (i > cursor),
                 body_name        = body_name,
                 is_selected_body = is_selected_body,
@@ -543,6 +566,7 @@ class HistoryPanel(QWidget):
 
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, i)  # store real history index
+            item.setData(_SEEK_ROLE, last)
             item.setSizeHint(QSize(0, w.sizeHint().height() + 2))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled)
             self._list.addItem(item)
@@ -558,7 +582,7 @@ class HistoryPanel(QWidget):
         return item.data(Qt.ItemDataRole.UserRole)
 
     def _on_item_clicked(self, item: QListWidgetItem):
-        self.seek_requested.emit(self._item_index(item))
+        self.seek_requested.emit(item.data(_SEEK_ROLE))
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
         self._on_item_double_clicked_idx(self._item_index(item))

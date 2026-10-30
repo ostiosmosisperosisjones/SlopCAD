@@ -66,25 +66,39 @@ def fan_out_cut(viewport, tool_solid, build_op: Callable[[str], Any],
         print(f"[{op_label}] No-target: tool doesn't intersect any body.")
         return 0
 
+    # Every per-body entry carries the same fanout_id, so the history panel,
+    # delete, seek and edit treat the whole cut as one action (History.op_group).
+    import uuid
+    fanout_id = uuid.uuid4().hex
+    history = viewport.history
+
     n_cut = 0
     for bid in candidates:
         shape_before = viewport.workspace.current_shape(bid)
         vol_before   = (sum(s.volume for s in shape_before.solids())
                         if shape_before is not None else 0.0)
 
+        ids_before = {e.entry_id for e in history.entries}
         op = build_op(bid)
         op.commit(viewport, extra)
+        entries = history.entries
+        pushed = next((i for i, e in enumerate(entries)
+                       if e.entry_id not in ids_before and e.body_id == bid
+                       and e.operation != "import"), None)
 
         # Roll back if the bbox prefilter was a false positive.
         shape_after = viewport.workspace.current_shape(bid)
         vol_after   = (sum(s.volume for s in shape_after.solids())
                        if shape_after is not None else 0.0)
-        if abs(vol_after - vol_before) < 1e-3 and viewport.history.entries:
-            last_idx = len(viewport.history.entries) - 1
-            if viewport.history.entries[last_idx].body_id == bid:
-                viewport.history.delete(last_idx)
+        if abs(vol_after - vol_before) < 1e-3:
+            if pushed is not None:
+                history.delete(pushed)
+                if history.cursor >= pushed:     # mid-history (edit) push
+                    history.seek(pushed - 1)
         else:
             n_cut += 1
+            if pushed is not None:
+                entries[pushed].params["fanout_id"] = fanout_id
 
     if n_cut == 0:
         print(f"[{op_label}] No-target: tool didn't actually intersect any body.")

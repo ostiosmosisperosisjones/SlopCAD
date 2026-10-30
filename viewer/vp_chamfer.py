@@ -37,6 +37,9 @@ class ChamferMixin:
             face_indices = []
             edge_indices = []
         self._show_chamfer_panel(body_id, face_indices, edge_indices=edge_indices)
+        if body_id is None:
+            p = self._chamfer_panel
+            self._arm_pick(p._pick_edge_btn, p._on_pick_edge_toggle)
 
     # ------------------------------------------------------------------
     # Panel lifecycle

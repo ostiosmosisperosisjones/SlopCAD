@@ -114,6 +114,8 @@ class BooleanMixin:
                 target_body_id=body_id, keep_inputs=False)
         else:
             self._show_boolean_panel(keep_inputs=False)
+        p = self._boolean_panel
+        self._arm_pick(p._pick_btn, p._on_pick_toggle)
 
     # ------------------------------------------------------------------
     # Panel lifecycle

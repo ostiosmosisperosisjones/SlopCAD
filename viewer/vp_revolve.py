@@ -23,12 +23,17 @@ class RevolveMixin:
     def _try_revolve(self):
         if self._selected_sketch_entry is not None:
             self._show_revolve_panel(sketch_idx=self._selected_sketch_entry)
-            return
-        if self.selection.face_count > 0:
+        elif self.selection.face_count > 0:
             sf = self.selection.single_face or self.selection.faces[0]
             self._show_revolve_panel(body_id=sf.body_id, face_idx=sf.face_idx)
         else:
             self._show_revolve_panel()
+        # Arm the next empty field: the axis when a profile came pre-filled.
+        p = self._revolve_panel
+        if p._face_list.has_valid_entries:
+            self._arm_pick(p._pick_axis_btn, p._on_pick_axis_toggle)
+        else:
+            self._arm_pick(p._pick_face_btn, p._on_pick_face_toggle)
 
     def _show_revolve_panel(self, sketch_idx: int | None = None,
                              body_id: str | None = None,
@@ -907,14 +912,9 @@ class RevolveMixin:
         entry = entries[idx]
         entry.editing = False
 
-        entry_id = entry.entry_id
-        group_indices  = [idx]
-        group_body_ids = {entry.body_id}
-        for j in range(idx + 1, len(entries)):
-            e = entries[j]
-            if e.params.get("source_entry_id") == entry_id:
-                group_indices.append(j)
-                group_body_ids.add(e.body_id)
+        # Split children + fan-out siblings (a no-target cut is one group).
+        group_indices  = self.history.op_group(idx)
+        group_body_ids = {entries[j].body_id for j in group_indices}
 
         self.history.seek(max(idx - 1, 0))
 

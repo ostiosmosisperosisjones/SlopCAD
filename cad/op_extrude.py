@@ -882,7 +882,10 @@ class CrossBodyCutOp(Op):
         panel._radio_cut.setChecked(True)
         panel._on_mode_changed(1)
 
-        if self.cut_body_id in vp.workspace.bodies:
+        # A fan-out member's cut_body_id is just one of the bodies it hit:
+        # leave the target empty so the edit re-fans (no-target cut).
+        if (self.cut_body_id in vp.workspace.bodies
+                and "fanout_id" not in entry.params):
             panel.set_merge_body(
                 self.cut_body_id,
                 vp.workspace.bodies[self.cut_body_id].name)

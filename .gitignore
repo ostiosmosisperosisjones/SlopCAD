@@ -12,3 +12,7 @@ QWEN.md
 *_PLAN.md
 FILLET_ROBUSTNESS_PLAN.md
 REPLAY_RELIABILITY_PLAN.md
+.build-venv*/
+AppDir/
+packaging/.cache/
+slopcad.ico

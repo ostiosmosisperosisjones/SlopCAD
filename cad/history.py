@@ -58,6 +58,9 @@ class HistoryEntry:
     # Non-fatal: the entry replayed but not as authored (e.g. an included
     # edge couldn't be re-found and kept its last position).  Set by replay.
     warning:      str  = ""
+    # Non-fatal: the result solid is damaged (inside-out, non-manifold,
+    # self-intersecting).  Set by viewer/body_health.py, never saved.
+    health_warning: str = ""
     editing:      bool = False   # True while the ExtrudePanel is open editing this entry
     # Typed operation object — mirrors params, set by history.push()
     op:           Any  = field(default=None, repr=False)
@@ -159,6 +162,43 @@ class History:
             return self._entries[index].entry_id
         return None
 
+    def op_group(self, index: int) -> list[int]:
+        """Sorted indices of everything one user action produced: the entry,
+        its fan-out siblings (a no-target cut pushes one entry per body it hit,
+        all tagged with the same params["fanout_id"]) and their split-body
+        children (params["source_entry_id"])."""
+        entries = self._entries
+        if not 0 <= index < len(entries):
+            return []
+        members = self.fanout_members(index)
+        ids = {entries[i].entry_id for i in members}
+        children = [i for i, e in enumerate(entries)
+                    if e.params.get("source_entry_id") in ids]
+        return sorted(set(members) | set(children))
+
+    def fanout_members(self, index: int) -> list[int]:
+        """*index* plus its fan-out siblings (no split children)."""
+        fid = (self._entries[index].params.get("fanout_id")
+               if 0 <= index < len(self._entries) else None)
+        if not fid:
+            return [index]
+        return [i for i, e in enumerate(self._entries)
+                if e.params.get("fanout_id") == fid]
+
+    def fanout_span(self, index: int) -> tuple[int, int] | None:
+        """(first, last) index of the fan-out group *index* belongs to (as a
+        member or a member's split child), or None if it isn't in one."""
+        if not 0 <= index < len(self._entries):
+            return None
+        e = self._entries[index]
+        if "fanout_id" not in e.params:
+            src = self.id_to_index(e.params.get("source_entry_id") or "")
+            if src is None or "fanout_id" not in self._entries[src].params:
+                return None
+            index = src
+        g = self.op_group(index)
+        return g[0], g[-1]
+
     def delete(self, index: int) -> None:
         """
         Remove the entry at *index* and clamp the cursor.
@@ -190,17 +230,26 @@ class History:
             self._cursor += 1
         self._cursor = max(0, min(self._cursor, len(self._entries) - 1))
 
+    def step_target(self, delta: int) -> int:
+        """Cursor index one undo (-1) / redo (+1) step away.  A fan-out group
+        is one step: never land part-way through it."""
+        t = self._cursor + delta
+        span = self.fanout_span(t)
+        if span is not None and t < span[1]:
+            t = span[0] - 1 if delta < 0 else span[1]
+        return t
+
     def undo(self) -> HistoryEntry | None:
         if self._cursor <= 0:
             return None
         entry = self._entries[self._cursor]
-        self._cursor -= 1
+        self._cursor = max(self.step_target(-1), 0)
         return entry
 
     def redo(self) -> HistoryEntry | None:
         if self._cursor >= len(self._entries) - 1:
             return None
-        self._cursor += 1
+        self._cursor = self.step_target(+1)
         return self._entries[self._cursor]
 
     def seek(self, index: int) -> bool:

@@ -3444,7 +3444,7 @@ class SketchEntry:
                 if not wire_uvs:
                     continue
                 wire_uvs.sort(key=_uv_area, reverse=True)
-                faces.append(Face(occ_face))
+                faces.append(Face(_drop_open_wires(occ_face)))
                 regions.append((wire_uvs[0], wire_uvs[1:]))
                 bounds.append(_face_entities(occ_face))
             except Exception as ex:
@@ -3456,6 +3456,31 @@ class SketchEntry:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _drop_open_wires(occ_face):
+    """The splitter leaves a dangling sketch line that ends inside a region
+    (e.g. a duplicate or overhanging include) on that face as an open wire
+    holding one INTERNAL edge.  The face still checks valid, but extruding
+    it gives an invalid solid (an internal face), and booleans against that
+    tool return garbage: inside-out (negative-volume) and phantom solids
+    that a cut then keeps as split bodies.  An open wire bounds nothing and
+    region extraction already ignores it, so dropping it changes neither
+    the face's area nor face numbering."""
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_WIRE
+    from OCP.ShapeBuild import ShapeBuild_ReShape
+    from OCP.BRep import BRep_Tool
+    from OCP.TopoDS import TopoDS
+    reshape = None
+    wexp = TopExp_Explorer(occ_face, TopAbs_WIRE)
+    while wexp.More():
+        w = TopoDS.Wire(wexp.Current())
+        if not BRep_Tool.IsClosed_s(w):
+            reshape = reshape or ShapeBuild_ReShape()
+            reshape.Remove(w)
+        wexp.Next()
+    return TopoDS.Face(reshape.Apply(occ_face)) if reshape else occ_face
+
 
 def _chain_segments(
     segs: list[tuple[np.ndarray, np.ndarray]],

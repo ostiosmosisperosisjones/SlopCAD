@@ -135,6 +135,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         from viewer.history_commands import CommandStack
         self._cmd_stack = CommandStack()
 
+        # Connected before anyone else so rows repaint with fresh warnings.
+        from viewer.body_health import BodyHealth
+        self._body_health = BodyHealth(self)
+        self.history_changed.connect(self._body_health.scan)
+
         self._sketch = None                              # SketchMode | None
         self._sketch_faces: dict[int, list] = {}        # history_idx → [Face]
         self._selected_sketch_entry: int | None = None  # history_idx
@@ -241,9 +246,26 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 if hud_visible and focused in (self._line_hud._len_field,
                                                self._line_hud._ang_field):
                     return False
+                # Typing (param names, expressions) and text-editing keys belong
+                # to the field; Return/Escape/Ctrl-combos still reach the viewport.
+                mods = e.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                        | Qt.KeyboardModifier.AltModifier
+                                        | Qt.KeyboardModifier.MetaModifier)
+                if not mods and (e.text().isprintable() and e.text()
+                                 or e.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete,
+                                                Qt.Key.Key_Left, Qt.Key.Key_Right,
+                                                Qt.Key.Key_Home, Qt.Key.Key_End)):
+                    return False
             self.keyPressEvent(e)
             return True
         return False
+
+    @staticmethod
+    def _arm_pick(btn, toggle):
+        """Start an op panel's pick mode as if its button was clicked, so a
+        freshly opened op takes the next click without pressing "Add" first."""
+        btn.setChecked(True)
+        toggle(True)
 
     @staticmethod
     def _focused_widget():

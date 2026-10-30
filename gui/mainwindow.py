@@ -244,7 +244,7 @@ class MainWindow(QMainWindow):
     def _toolbar_loft(self):
         if not self._viewport:
             return
-        self._viewport._show_loft_panel()
+        self._viewport._try_loft()
 
     def _toolbar_chamfer(self):
         if not self._viewport:
