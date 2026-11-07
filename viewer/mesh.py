@@ -246,7 +246,7 @@ def _mesh_data(shape, deviation, knobs):
         "verts":   verts,
         "tris":    np.array(tess['triangles'], dtype=np.uint32).reshape(-1, 3),
         "normals": np.array(tess['normals'],   dtype=np.float32).reshape(-1, 3),
-        "edges":   np.array(tess['edges'],     dtype=np.float32).reshape(-1, 3),
+        "edges":   _display_edges(shape, topo_edges, edge_pos),
         "topo_verts": topo_verts,
         "topo_edges": topo_edges,
         "edge_pos":   edge_pos,
@@ -338,6 +338,57 @@ def _extract_topo_verts(shape) -> np.ndarray:
     if not pts:
         return np.zeros((0, 3), dtype=np.float32)
     return np.array(pts, dtype=np.float32)
+
+
+def _seam_edges(shape):
+    """Map of the edges that only close a periodic face onto itself: a
+    sphere's or a full revolve's seam.  They bound nothing a user can see.
+
+    A seam occurs twice in one face and in no other.  A cut can leave part of
+    an old seam bounding the cut's own face; that part is a real edge, even
+    though it still sits on the closed surface's seam line."""
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    from OCP.TopExp import TopExp
+    from OCP.collections import (
+        IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher
+        as EdgeFaces,
+        Map_TopoDS_Shape_TopTools_ShapeMapHasher as ShapeMap)
+
+    edge_faces = EdgeFaces()
+    TopExp.MapShapesAndAncestors_s(shape.wrapped, TopAbs_EDGE, TopAbs_FACE,
+                                   edge_faces)
+    seams = ShapeMap()
+    for i in range(1, edge_faces.Extent() + 1):
+        faces = list(edge_faces.FindFromIndex(i))
+        if len(faces) == 2 and faces[0].IsSame(faces[1]):
+            seams.Add(edge_faces.FindKey(i))
+    return seams
+
+
+def _display_edges(shape, topo_edges, edge_pos) -> np.ndarray:
+    """GL_LINES vertices for the drawn wireframe: every topological edge except
+    seams, whose line would read as a split in a closed surface, and zero-length
+    edges.  Both stay in topo_edges so edge indices (and picking) don't shift."""
+    from OCP.BRep import BRep_Tool as BT
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+
+    seams = _seam_edges(shape)
+    hidden = set()
+    exp = TopExp_Explorer(shape.wrapped, TopAbs_EDGE)
+    pos = 0
+    while exp.More():
+        edge = TopoDS.Edge(exp.Current())
+        if seams.Contains(edge) or BT.Degenerated_s(edge):   # a sphere's poles
+            hidden.add(pos)
+        pos += 1
+        exp.Next()
+    chunks = [np.repeat(pts, 2, axis=0)[1:-1]
+              for pts, p in zip(topo_edges, edge_pos) if p not in hidden]
+    if not chunks:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.concatenate(chunks).astype(np.float32)
 
 
 def _extract_topo_edges(shape, angular_tol: float = 0.2,

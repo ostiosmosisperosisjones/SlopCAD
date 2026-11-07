@@ -268,7 +268,9 @@ class TrimTool(BaseTool):
         sketch.push_undo_snapshot()
         real_idx = entities.index(target)
         from cad.sketch import splice_entities
+        orient = orientation_of(sketch, real_idx)
         splice_entities(sketch, real_idx, real_idx + 1, survivors)
+        carry_orientation(sketch, orient, real_idx, len(survivors))
         _merge_left_behind(sketch, pieces[remove_idx])
         return True
 
@@ -384,4 +386,53 @@ def _gather_split_params(target, all_entities: list, target_idx: int,
             hits = _arc_arc_intersect(target, other)
             params.extend(t for t, _ in hits)
 
-    return [p for p in params if tol < p < 1.0 - tol]
+    # A crossing a hair from the target's own end (another line's end that
+    # meets it there, solved a few microns off) is not a split: it would
+    # leave a sliver at the corner that keeps the line's constraints.
+    if isinstance(target, LineEntity):
+        length = float(np.linalg.norm(np.asarray(target.p1) - np.asarray(target.p0)))
+    else:
+        length = float(target.radius) * abs(target.end_angle - target.start_angle)
+    edge = max(tol, _END_TOL / length) if length > 0 else tol
+    return [p for p in params if edge < p < 1.0 - edge]
+
+
+_END_TOL = 1e-3     # mm; same as cad.sketch._ATTACH_TOL
+
+
+def orientation_of(sketch, idx) -> list[str]:
+    """'horizontal' / 'vertical' constraints on line *idx*."""
+    return [c.type for c in getattr(sketch, 'constraints', [])
+            if c.type in ('horizontal', 'vertical') and tuple(c.indices) == (idx,)]
+
+
+def carry_orientation(sketch, orient, start, n) -> set[int]:
+    """After line *start* was split into the *n* line pieces at
+    start..start+n-1: every piece of a horizontal / vertical line is
+    horizontal / vertical.  splice_entities hands the constraint to one
+    piece; without copies the rest came out free (a trimmed square's top
+    went slanted while a sliver at the corner kept "horizontal").  A copy
+    the pieces' ties already imply (both ends snapped) would read as
+    over-constrained, so it is kept only where it adds something.
+    Returns the piece indices that carry one."""
+    from cad.sketch import SketchConstraint, LineEntity
+    held = set()
+    if not orient:
+        return held
+    ents = sketch.entities
+    for t in orient:
+        for j in range(start, start + n):
+            if not isinstance(ents[j], LineEntity):
+                continue
+            if any(c.type == t and tuple(c.indices) == (j,) for c in sketch.constraints):
+                held.add(j)
+                continue
+            status = getattr(sketch, 'compute_constraint_status', None)
+            before = status()[0] if status else None
+            con = SketchConstraint(t, (j,), 0.0)
+            sketch.constraints.append(con)
+            if status and before != 'over' and status()[0] == 'over':
+                sketch.constraints.remove(con)
+            else:
+                held.add(j)
+    return held

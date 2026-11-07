@@ -1329,11 +1329,13 @@ class SketchOverlay:
         glLineWidth(3.0)
 
         def outline(idx):
-            from cad.sketch import ArcEntity
+            from cad.sketch import ArcEntity, circle_of
             ent = sketch.entities[idx]
-            if isinstance(ent, ArcEntity):
-                a = np.linspace(ent.start_angle, ent.end_angle, 48)
-                return ent.center + ent.radius * np.stack([np.cos(a), np.sin(a)], 1)
+            circ = circle_of(ent)
+            if circ is not None:
+                a = np.linspace(ent.start_angle, ent.end_angle, 48) \
+                    if isinstance(ent, ArcEntity) else np.linspace(0, 2 * np.pi, 48)
+                return circ[0] + circ[1] * np.stack([np.cos(a), np.sin(a)], 1)
             ends = line_ends(ent)
             return None if ends is None else np.array([ends[0][:2], ends[1][:2]])
 
@@ -1385,7 +1387,8 @@ class SketchOverlay:
         glEnable(GL_BLEND)
         glLineWidth(1.2)
 
-        from cad.sketch import sharp_ends, pt_distance_ends, edge_gap_ends
+        from cad.sketch import (sharp_ends, pt_distance_ends, edge_gap_ends,
+                                line_ends)
         for ci, con in enumerate(constraints):
             if con.type not in ('distance', 'sharp_distance', 'pt_distance',
                                 'edge_gap'):
@@ -1489,13 +1492,12 @@ class SketchOverlay:
             if con.type != 'gap':
                 continue
             ref, mov = con.indices
-            if max(ref, mov) >= len(entities) or not all(
-                    isinstance(entities[k], LineEntity) for k in (ref, mov)):
+            if max(ref, mov) >= len(entities):
                 continue
-            a0 = np.array([float(entities[ref].p0[0]), float(entities[ref].p0[1])])
-            a1 = np.array([float(entities[ref].p1[0]), float(entities[ref].p1[1])])
-            b0 = np.array([float(entities[mov].p0[0]), float(entities[mov].p0[1])])
-            b1 = np.array([float(entities[mov].p1[0]), float(entities[mov].p1[1])])
+            ends = [line_ends(entities[k]) for k in (ref, mov)]
+            if None in ends:
+                continue
+            (a0, a1), (b0, b1) = ([np.asarray(p, float)[:2] for p in e] for e in ends)
             seg_len = float(np.linalg.norm(a1 - a0))
             if seg_len < 1e-6:
                 continue

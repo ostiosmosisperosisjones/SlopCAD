@@ -1563,8 +1563,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
     def _activate_include(self):
         """Include the current selection into the active sketch.  With nothing
         usable selected, arm click-to-include mode instead: each subsequent
-        click on a body edge, sketch line, or vertex includes it immediately.
-        Esc disarms."""
+        click on a body face or edge, sketch line, or vertex includes it
+        immediately.  Esc disarms."""
         from cad.sketch import SketchTool
         if self._sketch is None:
             return
@@ -1573,6 +1573,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
         only_active_sketch_lines = (
             bool(self.selection.sketch_edges)
             and not self.selection.edges and not self.selection.vertices
+            and not self.selection.faces
             and all(se.history_idx == -1 for se in self.selection.sketch_edges))
         if only_active_sketch_lines:
             print("[Sketch] Selected line is already part of this sketch — "
@@ -1583,8 +1584,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             self._sketch.cancel_tool()
             self.sketch_mode_changed.emit(True)
         self._include_armed = True
-        print("[Sketch] Include armed — click body edges, sketch lines, or "
-              "vertices to include them (Esc to finish).")
+        print("[Sketch] Include armed — click body faces, edges, sketch lines, "
+              "or vertices to include them (Esc to finish).")
         self.update()
 
     def _apply_include_selection(self) -> bool:
@@ -2096,6 +2097,13 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                        else "Angle:" if is_angle
                        else "Distance:" if is_pt else "Length:")
 
+        def _movers(ents, con):
+            # The label's entity, unless that's a fixed include: a point's
+            # distance to an included line moves the point.
+            from cad.sketch import is_datum
+            return {ei} if not is_datum(ents[ei]) else \
+                {i for i in con.indices if not is_datum(ents[i])}
+
         def _matches(con):
             # A gap's / point distance's / angle's label carries its mover
             # (indices[1]).
@@ -2130,7 +2138,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     self._sketch.constraints[ci] = new_con
                     from cad.sketch import SketchEntry, LineEntity, ArcEntity
                     tmp = SketchEntry.from_sketch_mode(self._sketch)
-                    if tmp.apply_constraints_local({ei}):
+                    if tmp.apply_constraints_local(_movers(tmp.entities, new_con)):
                         for i, ent in enumerate(tmp.entities):
                             if isinstance(ent, LineEntity):
                                 self._sketch.entities[i].p0 = ent.p0.copy()
@@ -2160,7 +2168,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             ok, new_con = _ask(con)
             if ok:
                 se.constraints[ci] = new_con
-                if not se.apply_constraints_local({ei}):
+                if not se.apply_constraints_local(_movers(se.entities, new_con)):
                     se.constraints[ci] = con   # refused: keep old value
                 self._rebuild_sketch_faces()
                 self.history_changed.emit()
@@ -2404,7 +2412,11 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             else:
                 origin, direction = self.get_ray(e.position().x(),
                                                  e.position().y())
-                if origin is not None and self._sketch_faces:
+                # Armed include wants the body's face, not a sketch region
+                # that happens to lie over it.
+                include_face = getattr(self, '_include_armed', False) and \
+                    self._pick_at(e.position())[1] is not None
+                if origin is not None and self._sketch_faces and not include_face:
                     hidx, fidx = self._pick_sketch_face(origin, direction)
                     if hidx is not None:
                         if self.route_sketch_face_pick_for_extrude(hidx, fidx):
@@ -2428,9 +2440,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         self.body_selected.emit(None)
                         self.selection_changed.emit()
                         self.update()
-                        face_count = len(self._sketch_faces.get(hidx, []))
+                        faces = self._sketch_faces.get(hidx, [])
                         print(f"[Sketch] Selected sketch face {fidx} "
-                              f"(entry {hidx}, {face_count} face(s)) — press E to extrude")
+                              f"(entry {hidx}, {len(faces)} face(s)) | "
+                              f"area={faces[fidx][0].area:.3f} mm² — press E to extrude")
                         return
 
                 body_id, idx = self._pick_at(e.position())
@@ -2479,16 +2492,18 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     self.workspace.set_active_body(body_id)
                     self.body_selected.emit(body_id)
                     mesh = self._meshes[body_id]
+                    face = mesh.occt_faces[idx]
                     try:
                         from build123d import Plane
-                        plane = Plane(mesh.occt_faces[idx])
+                        plane = Plane(face)
                         print(f"Picked face {idx} | "
                               f"{self.workspace.bodies[body_id].name} | "
-                              f"planar | normal={plane.z_dir}")
+                              f"planar | normal={plane.z_dir} | "
+                              f"area={face.area:.3f} mm²")
                     except Exception:
                         print(f"Picked face {idx} | "
                               f"{self.workspace.bodies[body_id].name} | "
-                              f"non-planar")
+                              f"non-planar | area={face.area:.3f} mm²")
                 else:
                     # Try offset-plane pick before clearing selection
                     from viewer.plane_overlay import pick_offset_plane

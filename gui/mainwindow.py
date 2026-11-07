@@ -534,6 +534,15 @@ class MainWindow(QMainWindow):
         self._edit_params_action = QAction("Edit parameters", self)
         self._edit_params_action.triggered.connect(self._edit_parameters)
         params_menu.addAction(self._edit_params_action)
+        params_menu.addSeparator()
+        self._restore_good_action = QAction("Restore last working values", self)
+        self._restore_good_action.setToolTip(
+            "Back to the last parameter values the whole document built with")
+        self._restore_good_action.triggered.connect(
+            lambda: self._viewport and self._viewport.param_restore_good())
+        params_menu.addAction(self._restore_good_action)
+        params_menu.aboutToShow.connect(lambda: self._restore_good_action.setEnabled(
+            bool(self._viewport) and self._viewport.history.last_good() is not None))
         self._apply_menu_shortcuts()
 
         ops_menu = menubar.addMenu("Operations")

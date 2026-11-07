@@ -41,12 +41,20 @@ class FaceOrigin:
     # h is then re-read from that extrude's current depth, so the cap is
     # followed through depth edits too.
     cap_of:    str | None = None
+    # Slanted wall: entry_id of the extrude/cut that swept the line along a
+    # direction other than the sketch normal.  The frame's third axis is then
+    # that op's CURRENT direction (h is mm along it) and its second the
+    # wall's normal, so the wall turns when the direction does (a direction
+    # picked from an edge follows the edge).
+    swept_by:  str | None = None
 
     def to_dict(self) -> dict:
         d = {"sketch_id": self.sketch_id, "uid": self.uid,
              "probe": list(self.probe), "normal": list(self.normal)}
         if self.cap_of:
             d["cap_of"] = self.cap_of
+        if self.swept_by:
+            d["swept_by"] = self.swept_by
         return d
 
     @classmethod
@@ -54,7 +62,7 @@ class FaceOrigin:
         if not d:
             return None
         return cls(d["sketch_id"], d["uid"], tuple(d["probe"]), tuple(d["normal"]),
-                   d.get("cap_of"))
+                   d.get("cap_of"), d.get("swept_by"))
 
     def frame(self, history):
         """The line's current frame (A, L, t, w, n, dh) — dh lifts a cap's
@@ -68,6 +76,10 @@ class FaceOrigin:
         frame = _line_frame(se, line) if line is not None else None
         if frame is None:
             return None
+        if self.swept_by:
+            ci = history.id_to_index(self.swept_by)
+            op = history._entries[ci].op if ci is not None else None
+            return _swept_frame(frame, _extrude_dir(op, se)) if op is not None else None
         dh = 0.0
         if self.cap_of:
             ci = history.id_to_index(self.cap_of)
@@ -79,13 +91,16 @@ class FaceOrigin:
 
     @staticmethod
     def local(frame, p=None, v=None):
-        """World point/vector → line-frame (s, w, h) / (t, w, n) components."""
+        """World point/vector → line-frame (s, w, h) / (t, w, n) components.
+        A swept frame's axes aren't orthogonal (n runs along the sweep), so
+        this solves for the components rather than projecting."""
         A, L, t, w, n, dh = frame
+        M = np.column_stack([t, w, n])
         if p is not None:
-            r = np.asarray(p, dtype=float) - A
-            return (float(r @ t) / L, float(r @ w), float(r @ n) - dh)
-        v = np.asarray(v, dtype=float)
-        return (float(v @ t), float(v @ w), float(v @ n))
+            c = np.linalg.solve(M, np.asarray(p, dtype=float) - A)
+            return (float(c[0]) / L, float(c[1]), float(c[2]) - dh)
+        c = np.linalg.solve(M, np.asarray(v, dtype=float))
+        return (float(c[0]), float(c[1]), float(c[2]))
 
     @staticmethod
     def world(frame, p=None, v=None):
@@ -105,7 +120,8 @@ class FaceOrigin:
         N = self.world(frame, v=self.normal)
         N /= np.linalg.norm(N)
         reach = max(1.0, 0.5 * frame[1])
-        best = (None, None, reach)
+        n = frame[4]
+        best = (None, None, np.inf)
         for fi, face in enumerate(shape.faces()):
             fn = _occ_face_normal(face.wrapped)
             if fn is None or float(np.dot(fn, N)) < _NORMAL_DOT:
@@ -114,9 +130,34 @@ class FaceOrigin:
             if abs(float(np.dot(P - c, fn))) > 1e-3:
                 continue                       # not the wall's plane
             d = _dist_to_face(P, face.wrapped)
-            if d is not None and d < best[2]:
-                best = (fi, face, d)
+            if d is None or d >= best[2]:
+                continue
+            # Only the fraction along the line scales with the part: heights
+            # and offsets are the mm it was built at, so a part that shrank
+            # leaves the probe off its face.  A wall must still lie over the
+            # line, at any height.  A cap or base is pinned by its plane.
+            if abs(float(np.dot(fn, n))) < _NORMAL_DOT:
+                u = n - float(np.dot(n, fn)) * fn
+                level = P + float(np.dot(c - P, u)) / float(np.dot(u, u)) * u
+                over = _dist_to_face(level, face.wrapped)
+                if over is None or over >= reach:
+                    continue
+            best = (fi, face, d)
         return best[0], best[1]
+
+
+def _swept_frame(frame, d):
+    """A line frame (A, L, t, w, n) re-based on sweep direction d: (A, L, t,
+    wall normal, d, 0), or None when d runs along the line."""
+    if frame is None or d is None:
+        return None
+    A, L, t, _w, _n = frame[:5]
+    d = np.asarray(d, dtype=float)
+    d = d / np.linalg.norm(d)
+    w = np.cross(t, d)
+    if float(np.linalg.norm(w)) < 1e-6:
+        return None
+    return (A, L, t, w / np.linalg.norm(w), d, 0.0)
 
 
 def origin_for_face(history, body_id: str, occ_face,
@@ -162,17 +203,23 @@ def origin_for_face(history, body_id: str, occ_face,
                 if not (end_cap and abs(float(np.dot(A + _cap_height(op) * n - P, N))) <= _ON_PLANE):
                     continue                   # line isn't on this wall's plane
                 cap = e.entry_id               # the extrude's far face
-            r = P - A
-            s = float(np.dot(r, t)) / L
+            # A wall swept at a slant: measure it in the sweep's own frame,
+            # where the face lies over the line (s in 0..1) and turns with it.
+            swept = (cap is None and abs(float(np.dot(N, d))) < 1e-6
+                     and abs(float(np.dot(d, n))) < 1 - 1e-9)
+            fr = _swept_frame(frame, d) if swept else (*frame, 0.0)
+            if fr is None:
+                continue
+            s, pw, ph = FaceOrigin.local(fr, p=P)
             if not (-1e-6 <= s <= 1 + 1e-6):
                 continue                       # the face isn't over this line
             return FaceOrigin(
                 sketch_id = sk_rec.entry_id,
                 uid       = ent.uid,
-                probe     = (round(s, 9), round(float(np.dot(r, w)), 9),
-                             round(float(np.dot(r, n)), 9)),
-                normal    = tuple(round(float(np.dot(N, v)), 9) for v in (t, w, n)),
+                probe     = (round(s, 9), round(pw, 9), round(ph, 9)),
+                normal    = tuple(round(x, 9) for x in FaceOrigin.local(fr, v=N)),
                 cap_of    = cap,
+                swept_by  = e.entry_id if swept else None,
             )
     return None
 
@@ -503,7 +550,7 @@ class EdgeOrigin:
     def from_dict(cls, d: dict | None) -> "EdgeOrigin | None":
         if not d:
             return None
-        return cls([FaceOrigin.from_dict(f) for f in d["faces"]],
+        return cls([face_origin_from_dict(f) for f in d["faces"]],
                    tuple(d["mid"]), tuple(d["tan"]), FaceOrigin.from_dict(d.get("anchor")))
 
     def faces_apart(self, history, shape) -> bool:
@@ -560,14 +607,28 @@ class EdgeOrigin:
 
 
 def edge_origin(history, body_id: str, shape_occ, occ_edge,
-                before_index: int) -> "EdgeOrigin | RevolveEdgeOrigin | None":
-    """Provenance for an edge of body_id, or None if neither face has any."""
+                before_index: int):
+    """Provenance for an edge of body_id, or None if neither it nor its
+    faces have any."""
     from build123d import Edge
+    rim = rim_origin(history, body_id, occ_edge, before_index)
+    if rim is not None:
+        return rim
     faces = _adjacent_faces(shape_occ, occ_edge)
     origins = [o for o in (origin_for_face(history, body_id, f, before_index)
                            for f in faces) if o is not None]
     if not origins:
         return revolve_edge_origin(history, body_id, shape_occ, occ_edge, before_index)
+    if len(origins) == 1 and len(faces) == 2:
+        # The other face is a chamfer's: name it too, so the edge is the two
+        # faces' shared edge.  One face alone predicts the edge where it was,
+        # running the way it ran, and a chamfer angle edit moves and turns it.
+        other = next((f for f in faces
+                      if origin_for_face(history, body_id, f, before_index) is None), None)
+        cf = (chamfer_origin_for_face(history, body_id, other, before_index)
+              if other is not None else None)
+        if cf is not None:
+            origins.append(cf)
     e = Edge(occ_edge)
     mid, tan = np.array(tuple(e.position_at(0.5))), np.array(tuple(e.tangent_at(0.5)))
     anchor = _edge_anchor(history, origins[0], mid, tan)
@@ -580,6 +641,271 @@ def edge_origin(history, body_id: str, shape_occ, occ_edge,
         tan    = tuple(round(x, 9) for x in FaceOrigin.local(frame, v=tan)),
         anchor = anchor,
     )
+
+
+# ---------------------------------------------------------------------------
+# rims: a circular edge, named by the circle that made it
+# ---------------------------------------------------------------------------
+#
+# A rim has no straight line to hang a FaceOrigin on, and "the edge near where
+# it used to be" fails as soon as the hole changes size: the rim moves further
+# than the matcher allows, or a neighbouring rim is now nearer.  But a rim's
+# whole geometry can be worked out: from the sketch circle and the extrude
+# that made it, or from the rim a chamfer / fillet was cut into.  Finding it
+# is then an exact lookup, so it doesn't matter how far it moved, and a rim
+# that isn't there is reported as missing rather than swapped for another
+# (`authoritative`).
+
+_RIM_TOL = 1e-3      # mm — a rim sits exactly where its circle says
+
+
+def _edge_circle(occ_edge):
+    """(centre, canonical unit axis, radius) of a circular edge, else None."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GeomAbs import GeomAbs_Circle
+    try:
+        a = BRepAdaptor_Curve(occ_edge)
+        if a.GetType() != GeomAbs_Circle:
+            return None
+        c = a.Circle()
+    except Exception:
+        return None
+    p, d = c.Location(), c.Axis().Direction()
+    return (np.array([p.X(), p.Y(), p.Z()]),
+            _canonical_axis(np.array([d.X(), d.Y(), d.Z()])), float(c.Radius()))
+
+
+def _canonical_axis(n):
+    n = np.asarray(n, dtype=float)
+    for c in n:
+        if abs(c) > 1e-6:
+            return -n if c < 0 else n
+    return n
+
+
+def _rim_angle(C, n, p) -> float:
+    """Angle of point p around the axis (C, n), in a frame fixed by n: the
+    part of the circle an arc rim covers, when a rim has been split."""
+    u, v = _axis_frame(n)
+    r = np.asarray(p, dtype=float) - C
+    return float(np.arctan2(r @ v, r @ u))
+
+
+def _axis_frame(n):
+    k = np.eye(3)[int(np.argmin(np.abs(n)))]
+    u = np.cross(n, k)
+    u /= np.linalg.norm(u)
+    return u, np.cross(n, u)
+
+
+def _is_full_circle_edge(occ_edge) -> bool:
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    a = BRepAdaptor_Curve(occ_edge)
+    return abs(a.LastParameter() - a.FirstParameter() - 2.0 * np.pi) < 1e-6
+
+
+def _find_rim(shape, C, n, R, ang, full):
+    """The circular edge of shape on circle (C, n, R), or None.  An arc rim
+    that has been split: the piece nearest angle ang.  A full rim has no
+    such piece — something now cuts through it, so it's gone."""
+    hits = []
+    for e in shape.edges():
+        c = _edge_circle(e.wrapped)
+        if c is not None and abs(float(c[1] @ n)) > _NORMAL_DOT and \
+                abs(c[2] - R) < _RIM_TOL and np.linalg.norm(c[0] - C) < _RIM_TOL:
+            hits.append(e)
+    if full:
+        hits = [e for e in hits if _is_full_circle_edge(e.wrapped)]
+    if len(hits) <= 1:
+        return hits[0].wrapped if hits else None
+    u, v = _axis_frame(n)
+    mid = C + R * (np.cos(ang) * u + np.sin(ang) * v)
+    return min(hits, key=lambda e: _edge_mid_dist(e, mid)).wrapped
+
+
+class _Rim:
+    """A rim origin: circle(history) → (C, n, R) now.  Replay trusts the
+    answer, so EdgeRef has no reason to go hunting when it finds no edge."""
+    authoritative = True
+
+    def faces_apart(self, history, shape) -> bool:
+        return False
+
+    def find_in(self, history, shape):
+        circ = self.circle(history)
+        if circ is None:
+            return None
+        return _find_rim(shape, *circ, self.ang, self.full)
+
+
+@dataclass
+class RimOrigin(_Rim):
+    """An end of the wall a sketch arc / circle was extruded into."""
+    sketch_id:  str
+    uid:        str      # the ArcEntity
+    extrude_of: str      # entry_id of the extrude / cut
+    end:        int      # 0 = the sketch-plane end, 1 = the far end
+    ang:        float
+    full:       bool
+
+    def to_dict(self) -> dict:
+        return {"rim_of": self.sketch_id, "uid": self.uid, "extrude_of": self.extrude_of,
+                "end": self.end, "ang": self.ang, "full": self.full}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RimOrigin":
+        return cls(d["rim_of"], d["uid"], d["extrude_of"], int(d["end"]),
+                   float(d["ang"]), bool(d["full"]))
+
+    def circle(self, history):
+        si, ei = (history.id_to_index(i) for i in (self.sketch_id, self.extrude_of))
+        if si is None or ei is None:
+            return None
+        se = history._entries[si].params.get("sketch_entry")
+        op = history._entries[ei].op
+        ent = next((e for e in (se.entities if se else ())
+                    if getattr(e, "uid", None) == self.uid), None)
+        if ent is None or not hasattr(ent, "radius"):
+            return None
+        return _rim_circle(se, ent, op, self.end)
+
+
+def _rim_circle(se, arc, op, end):
+    """(C, n, R) of one end of the wall op extruded arc into, or None when
+    the extrude runs at a slant (the rim isn't that circle)."""
+    n = np.asarray(se.plane_normal, dtype=float)
+    d = _extrude_dir(op, se)
+    if abs(float(d @ n)) < 1.0 - 1e-9:
+        return None
+    u, v = np.asarray(arc.center, dtype=float)[:2]
+    c = (np.asarray(se.plane_origin, dtype=float) + u * np.asarray(se.plane_x_axis, dtype=float)
+         + v * np.asarray(se.plane_y_axis, dtype=float))
+    return c + (op.start_offset + end * abs(op.distance)) * d, _canonical_axis(n), float(arc.radius)
+
+
+@dataclass
+class BlendRimOrigin(_Rim):
+    """A boundary circle of a chamfer / fillet on a rim: that rim offset by
+    (dr, dh) in units of the blend's size, so it follows both the rim and
+    the size."""
+    blend_of: str        # entry_id of the ChamferOp / FaceFilletOp
+    edge:     int        # index into that op's edge_refs
+    dr:       float
+    dh:       float
+    ang:      float
+    full:     bool
+
+    def to_dict(self) -> dict:
+        return {"blend_of": self.blend_of, "edge": self.edge, "dr": self.dr,
+                "dh": self.dh, "ang": self.ang, "full": self.full}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BlendRimOrigin":
+        return cls(d["blend_of"], int(d["edge"]), float(d["dr"]), float(d["dh"]),
+                   float(d["ang"]), bool(d["full"]))
+
+    def circle(self, history):
+        ci = history.id_to_index(self.blend_of)
+        op = history._entries[ci].op if ci is not None else None
+        refs = getattr(op, "edge_refs", None) or []
+        size = _blend_size(op) if self.edge < len(refs) else None
+        src = history._shape_for_body_at(op.source_body_id, ci) if size else None
+        occ = refs[self.edge].resolve(history, src) if src is not None else None
+        base = _edge_circle(occ) if occ is not None else None
+        if base is None:
+            return None
+        C, n, R = base
+        return C + self.dh * size * n, n, R + self.dr * size
+
+
+def _blend_size(op) -> float | None:
+    """A chamfer's distance or an (even) fillet's radius."""
+    if type(op).__name__ == "ChamferOp":
+        return float(op.distance)
+    if type(op).__name__ == "FaceFilletOp" and not op.edge_radii:
+        return float(op.radius)
+    return None
+
+
+def rim_origin(history, body_id: str, occ_edge, before_index: int):
+    """Which circle made this circular edge of body_id, or None.  The most
+    recent op that could have wins, as in origin_for_face."""
+    from build123d import Edge
+    circ = _edge_circle(occ_edge)
+    if circ is None:
+        return None
+    C, n, R = circ
+    ang = _rim_angle(C, n, tuple(Edge(occ_edge).position_at(0.5)))
+    full = _is_full_circle_edge(occ_edge)
+    for e in reversed(history._entries[:max(0, before_index)]):
+        if e.error:
+            continue
+        found = (_blend_rim(history, e, body_id, circ, ang, full)
+                 or _extruded_rim(history, e, body_id, circ, ang, full))
+        if found is not None:
+            return found
+    return None
+
+
+def _blend_rim(history, e, body_id, circ, ang, full):
+    op = e.op
+    size = _blend_size(op)
+    if not size or size <= 0 or op.source_body_id != body_id:
+        return None
+    C, n, R = circ
+    ci = history.id_to_index(e.entry_id)
+    src = history._shape_for_body_at(body_id, ci)
+    if src is None:
+        return None
+    for k, ref in enumerate(op.edge_refs or []):
+        occ = ref.resolve(history, src)
+        base = _edge_circle(occ) if occ is not None else None
+        if base is None or abs(float(base[1] @ n)) < _NORMAL_DOT:
+            continue
+        delta = C - base[0]
+        dh = float(delta @ n)
+        dr = R - base[2]
+        reach = max(abs(dr), abs(dh))
+        # Coaxial, displaced, and within reach of this blend.
+        if np.linalg.norm(delta - dh * n) < _RIM_TOL and _RIM_TOL < reach <= 3.0 * size:
+            return BlendRimOrigin(e.entry_id, k, round(dr / size, 9),
+                                  round(dh / size, 9), ang, full)
+    return None
+
+
+def _extruded_rim(history, e, body_id, circ, ang, full):
+    op = e.op
+    sketch_id = _sketch_id_of(op)
+    if sketch_id is None or body_id not in (
+            e.body_id, getattr(op, "merge_body_id", None), getattr(op, "cut_body_id", None)):
+        return None
+    si = history.id_to_index(sketch_id)
+    se = history._entries[si].params.get("sketch_entry") if si is not None else None
+    C, n, R = circ
+    for ent in (se.entities if se else ()):
+        if not hasattr(ent, "radius") or not getattr(ent, "uid", None) or \
+                abs(float(ent.radius) - R) > _RIM_TOL:
+            continue
+        for end in (1, 0):
+            rim = _rim_circle(se, ent, op, end)
+            if rim is not None and np.linalg.norm(rim[0] - C) < _RIM_TOL and \
+                    abs(float(rim[1] @ n)) > _NORMAL_DOT:
+                return RimOrigin(sketch_id, ent.uid, e.entry_id, end, ang, full)
+    return None
+
+
+def upgrade_to_rim(history, body_id, occ_edge, ref, origin, before_index):
+    """origin, or the rim origin of occ_edge if it's a rim saved before they
+    existed.  Only while the edge is still where ref says, which means this
+    is the edge that was picked and not a neighbour a fuzzy match landed on."""
+    if isinstance(origin, _Rim) or occ_edge is None or _edge_circle(occ_edge) is None:
+        return origin
+    from cad.edge_ref import EdgeRef
+    now = EdgeRef.from_occ_edge(occ_edge)
+    if now is None or abs(now.length - ref.length) > 0.5 or \
+            np.linalg.norm(np.subtract(now.midpoint, ref.midpoint)) > 0.1:
+        return origin
+    return rim_origin(history, body_id, occ_edge, before_index) or origin
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +1053,10 @@ def edge_origin_from_dict(d: dict | None):
         return None
     if "revolve_of" in d:
         return RevolveEdgeOrigin.from_dict(d)
+    if "rim_of" in d:
+        return RimOrigin.from_dict(d)
+    if "blend_of" in d:
+        return BlendRimOrigin.from_dict(d)
     return EdgeOrigin.from_dict(d)
 
 

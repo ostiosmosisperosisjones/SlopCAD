@@ -235,7 +235,10 @@ class ReferenceEntity:
                   Original OCCT edges preserved for exact face construction.
     source      : EdgeSource | None
                   Stable parametric reference used to re-derive points and
-                  occ_edges during replay.  None for vertices and legacy data.
+                  occ_edges during replay.  None for legacy data.
+    circle      : (center_uv, radius) | None
+                  Baked with the points (needs the sketch plane, see
+                  refresh_ref_circles); what circle_of() reads.
     """
     def __init__(self, points: list[np.ndarray], source_type: str = 'edge',
                  occ_edges=None, source=None):
@@ -244,6 +247,7 @@ class ReferenceEntity:
         self.source_type = source_type
         self.occ_edges   = occ_edges
         self.source      = source          # EdgeSource | None
+        self.circle      = None
 
     def __deepcopy__(self, memo):
         # TopoDS_Edge is not picklable — share by reference (OCCT shapes are
@@ -257,6 +261,7 @@ class ReferenceEntity:
         result.source_type = self.source_type
         result.occ_edges   = self.occ_edges   # shared reference, not copied
         result.source      = copy.deepcopy(self.source, memo)
+        result.circle      = copy.deepcopy(self.circle, memo)
         return result
 
 
@@ -574,15 +579,20 @@ class SketchConstraint:
 #
 # Includes (ReferenceEntity) enter the solver as FIXED geometry (solver
 # group 1, never solved for): user constraints may reference them
-# (parallel / perpendicular / equal / symmetric axis on a straight include),
-# and drawn points touching them are held there by hard coincidences.
+# (every dimension and geometric constraint: an include is a datum, the drawn
+# side moves), and drawn points touching them are held there by hard
+# coincidences.  Replay re-projects them from their source and re-solves.
 #
-# Touching is inferred, not stored: include_attachments() reads where each
-# drawn point sits on an include.  While editing, that's the current
-# coordinates.  On replay the includes move first, so replay infers before
-# re-projecting and hands the result to the solve (attachment_targets gives
-# the new spots, used as solver start points).  Needs no new metadata, so
-# files saved before this existed get the same behaviour.
+# include_attachments() reads where each drawn point sits on an include.
+# While editing, that's the current coordinates.  On replay the includes move
+# first, so replay reads before re-projecting and hands the result to the
+# solve (attachment_targets gives the new spots, used as solver start points).
+#
+# Coordinates alone can't be the record: two includes can land on each other
+# for one parameter value, and a line between them would then read as having
+# both ends on the same include, for good.  So what was read is kept in
+# se.links, by uid, and replay trusts it.  Files saved before links existed
+# get theirs from the first replay.
 
 _ATTACH_TOL = 1e-3
 
@@ -641,36 +651,173 @@ def _ref_circle(se, ref):
     return _fit_circle(np.asarray(ref.points, dtype=np.float64))
 
 
-def include_attachments(se) -> list:
+def refresh_ref_circles(se) -> None:
+    """Re-bake each include's circle.  Call after its points or the plane
+    change.  se needs plane_origin / _x_axis / _y_axis / _normal."""
+    for ent in se.entities:
+        if isinstance(ent, ReferenceEntity):
+            ent.circle = _ref_circle(se, ent) if len(ent.points) >= 2 else None
+
+
+def circle_of(ent):
+    """(center, radius) of an arc, a circle or a circular include, else
+    None: the shape dimensions and tangents see."""
+    if isinstance(ent, ArcEntity):
+        return np.asarray(ent.center, float)[:2], float(ent.radius)
+    return ent.circle if isinstance(ent, ReferenceEntity) else None
+
+
+def is_datum(ent) -> bool:
+    """Fixed for the solver: only its source moves it."""
+    return isinstance(ent, ReferenceEntity)
+
+
+def include_attachments(se, trust_links: bool = False) -> list:
     """Drawn points lying on include geometry, as
     [(key, ref_idx, kind, data, n_points)] with kind:
       'v' vertex k of the include polyline          data = k
       's' on segment k..k+1 at fraction t           data = (k, t)
       'c' centre of a circular include              data = None
       'a' on a circular include                     data = UV angle
+
+    A point stays on the include se.links names while it still sits there,
+    even when another include is in the same spot.  trust_links (replay):
+    it stays even if it doesn't — an earlier failed replay may have left it
+    anywhere.  Otherwise a point that left its include is free to attach to
+    whatever it sits on now (the user dragged it).
     """
     refs = [(ri, r) for ri, r in enumerate(se.entities)
             if isinstance(r, ReferenceEntity) and len(r.points) >= 1]
     if not refs:
         return []
     circles = {}
+
+    def _hit(ri, ref, pt):
+        pts = np.asarray(ref.points, dtype=np.float64)
+        # Circular includes attach by centre / angle only: their
+        # tessellation seam moves when OCC rebuilds the edge, so a
+        # vertex index would land somewhere else after replay.
+        if ri not in circles:
+            circles[ri] = _ref_circle(se, ref) if len(pts) >= 2 else None
+        if circles[ri] is not None:
+            return _attach_on_circle(pt, circles[ri])
+        return _attach_on_polyline(pt, pts)
+
+    links = getattr(se, 'links', None) or {}
+    by_uid = {r.uid: (ri, r) for ri, r in refs}
     out = []
     for key, pt in _drawn_points(se.entities):
-        for ri, ref in refs:
-            pts = np.asarray(ref.points, dtype=np.float64)
-            # Circular includes attach by centre / angle only: their
-            # tessellation seam moves when OCC rebuilds the edge, so a
-            # vertex index would land somewhere else after replay.
-            if ri not in circles:
-                circles[ri] = _ref_circle(se, ref) if len(pts) >= 2 else None
-            if circles[ri] is not None:
-                hit = _attach_on_circle(pt, circles[ri])
-            else:
-                hit = _attach_on_polyline(pt, pts)
+        link = links.get((se.entities[key[0]].uid, key[1]))
+        if link is not None and link[0] in by_uid:
+            ri, ref = by_uid[link[0]]
+            kind, data, n_pts = link[1:]
+            n_now = len(ref.points)
+            if kind == 'v' and data < n_now and \
+                    np.linalg.norm(np.asarray(ref.points[data]) - pt) < _ATTACH_TOL:
+                hit = ('v', data)        # a collapsed include has every
+            else:                        # vertex here; keep this one
+                hit = _hit(ri, ref, pt)
             if hit is not None:
-                out.append((key, ri, *hit, len(pts)))
+                out.append((key, ri, *hit, n_now))
+                continue
+            if trust_links:
+                out.append((key, ri, kind, data, n_pts))
+                continue
+        for ri, ref in refs:
+            hit = _hit(ri, ref, pt)
+            if hit is not None:
+                out.append((key, ri, *hit, len(ref.points)))
                 break
+    return _midpoints_exact(se, out)
+
+
+def _midpoints_exact(se, atts) -> list:
+    """A point drawn with a midpoint snap on a straight include sits at
+    t = 0.5 exactly.  Measured, its fraction comes out a hair off (solver
+    residue, a re-projected include) and that error grows with the line, so
+    the point would slowly leave the middle.  Only one of the ends meeting
+    there carries the snap; every end at that spot moves with it, or the
+    corner opens."""
+    from cad.sketch_tools.snap import SnapType
+    mids = set()                        # (ri, where) of midpoint snaps
+    for key, ri, kind, data, n in atts:
+        if kind != 's' or n != 2 or abs(data[1] - 0.5) > 0.01:
+            continue
+        snap = getattr(se.entities[key[0]], f'{key[1]}_snap', None)
+        if snap is not None and snap[0] == ri and snap[1] == SnapType.MIDPOINT:
+            mids.add((ri, tuple(getattr(se.entities[key[0]], key[1]))))
+    if not mids:
+        return atts
+    out = []
+    for key, ri, kind, data, n in atts:
+        pt = getattr(se.entities[key[0]], key[1])
+        if kind == 's' and n == 2 and any(
+                r == ri and np.linalg.norm(pt - np.asarray(m)) < _ATTACH_TOL
+                for r, m in mids):
+            data = (0, 0.5)
+        out.append((key, ri, kind, data, n))
     return out
+
+
+def links_to_list(links) -> list | None:
+    if links is None:
+        return None
+    return [[uid, end, *link] for (uid, end), link in links.items()]
+
+
+def links_from_list(rows) -> dict | None:
+    if rows is None:
+        return None
+    return {(uid, end): (ref, kind, tuple(data) if kind == 's' else data, n)
+            for uid, end, ref, kind, data, n in rows}
+
+
+def sketch_geometry(se) -> dict:
+    """The solved state of a sketch, as JSON, for restore_sketch_geometry."""
+    ents = {}
+    for e in se.entities:
+        if isinstance(e, LineEntity):
+            ents[e.uid] = [e.p0.tolist(), e.p1.tolist()]
+        elif isinstance(e, ArcEntity):
+            ents[e.uid] = [e.center.tolist(), float(e.radius),
+                           float(e.start_angle), float(e.end_angle)]
+        elif isinstance(e, ReferenceEntity):
+            ents[e.uid] = [np.asarray(p, dtype=float).tolist() for p in e.points]
+    return {"entities": ents, "values": [float(c.value) for c in se.constraints],
+            "links": links_to_list(se.links),
+            "plane": [np.asarray(v, dtype=float).tolist() for v in
+                      (se.plane_origin, se.plane_x_axis, se.plane_y_axis, se.plane_normal)]}
+
+
+def restore_sketch_geometry(se, state: dict) -> None:
+    """Put a sketch back to a sketch_geometry() state.  Includes keep their
+    sources: only where they were is restored."""
+    for e in se.entities:
+        g = state["entities"].get(e.uid)
+        if g is None:
+            continue
+        if isinstance(e, LineEntity):
+            e.p0, e.p1 = (np.array(p, dtype=np.float64) for p in g)
+        elif isinstance(e, ArcEntity):
+            e.center = np.array(g[0], dtype=np.float64)
+            e.radius, e.start_angle, e.end_angle = g[1:]
+        elif isinstance(e, ReferenceEntity):
+            e.points = [np.array(p, dtype=np.float64) for p in g]
+    for c, v in zip(se.constraints, state["values"]):
+        c.value = v
+    se.links = links_from_list(state["links"])
+    se.plane_origin, se.plane_x_axis, se.plane_y_axis, se.plane_normal = (
+        np.array(v, dtype=np.float64) for v in state["plane"])
+    refresh_ref_circles(se)
+
+
+def remember_links(se, attachments=None) -> None:
+    """Record attachments (default: as they read now) in se.links."""
+    if attachments is None:
+        attachments = include_attachments(se)
+    se.links = {(se.entities[key[0]].uid, key[1]):
+                (se.entities[ri].uid, kind, data, n_pts)
+                for key, ri, kind, data, n_pts in attachments}
 
 
 def _attach_on_circle(pt, circ):
@@ -813,6 +960,15 @@ def ref_point(entities, i: int, which):
     if not 0 <= i < len(entities):
         return None
     e = entities[i]
+    if isinstance(e, ReferenceEntity):
+        if which == 'center':
+            return e.circle[0] if e.circle else None
+        if which == 'mid':
+            ends = ref_line(e)
+            return None if ends is None else (ends[0] + ends[1]) / 2
+        if which in ('p0', 'p1') and e.points:
+            return np.asarray(e.points[0 if which == 'p0' else -1], float)[:2]
+        return None
     if which == 'center':
         return np.asarray(e.center, float)[:2] if isinstance(e, ArcEntity) else None
     if which == 'mid':
@@ -831,9 +987,10 @@ def pt_distance_ends(entities, con):
     if A is None:
         return None
     if wb is None:
-        if not (0 <= b < len(entities)) or not isinstance(entities[b], LineEntity):
+        ends = line_ends(entities[b]) if 0 <= b < len(entities) else None
+        if ends is None:
             return None
-        p0, p1 = np.asarray(entities[b].p0, float)[:2], np.asarray(entities[b].p1, float)[:2]
+        p0, p1 = (np.asarray(p, float)[:2] for p in ends)
         d = p1 - p0
         t = float(np.dot(A - p0, d) / max(float(np.dot(d, d)), 1e-24))
         return A, p0 + t * d
@@ -845,20 +1002,20 @@ def edge_gap_ends(entities, con):
     """(foot on the line, nearest point of the circle) an 'edge_gap'
     measures between, or None."""
     li, ai = con.indices
-    if not (0 <= li < len(entities) and 0 <= ai < len(entities)) or not \
-            isinstance(entities[li], LineEntity) or \
-            not isinstance(entities[ai], ArcEntity):
+    if not (0 <= li < len(entities) and 0 <= ai < len(entities)):
         return None
-    L, A = entities[li], entities[ai]
-    p0, p1 = np.asarray(L.p0, float)[:2], np.asarray(L.p1, float)[:2]
-    c = np.asarray(A.center, float)[:2]
+    ends, circ = line_ends(entities[li]), circle_of(entities[ai])
+    if ends is None or circ is None:
+        return None
+    p0, p1 = (np.asarray(p, float)[:2] for p in ends)
+    c, r = circ
     d = p1 - p0
     foot = p0 + d * float(np.dot(c - p0, d) / max(float(np.dot(d, d)), 1e-24))
     v = foot - c
     n = float(np.linalg.norm(v))
     if n < 1e-12:
         return None
-    return foot, c + v / n * A.radius
+    return foot, c + v / n * r
 
 
 def angle_ray_ends(entities, indices):
@@ -1285,7 +1442,7 @@ class SketchEntry:
 
     def __init__(self, plane_origin, plane_x_axis, plane_y_axis, plane_normal,
                  entities, body_id, face_idx, visible=True, plane_source=None,
-                 constraints=None, undo_snapshots=None):
+                 constraints=None, undo_snapshots=None, links=None, rev=None):
         self.plane_origin    = np.array(plane_origin, dtype=np.float64)
         self.plane_x_axis    = np.array(plane_x_axis, dtype=np.float64)
         self.plane_y_axis    = np.array(plane_y_axis, dtype=np.float64)
@@ -1300,6 +1457,13 @@ class SketchEntry:
         # Populated from SketchMode on commit; restored on re-entry so the user
         # can undo individual sketch operations after re-opening the sketch.
         self.undo_snapshots  = undo_snapshots or []
+        # Which include each drawn point belongs to (see include_attachments).
+        # None: not read yet — a file from before links, or a new sketch.
+        self.links           = links
+        # This version of the sketch: a commit makes a new SketchEntry, and
+        # undo brings the old one back, rev and all.  Known-good states are
+        # only valid for the revisions they were taken from.
+        self.rev             = rev or _new_uid()
 
     @classmethod
     def from_sketch_mode(cls, sketch: SketchMode) -> SketchEntry:
@@ -1314,6 +1478,7 @@ class SketchEntry:
             plane_source    = sketch.plane_source,
             constraints     = copy.deepcopy(getattr(sketch, 'constraints', [])),
             undo_snapshots  = copy.deepcopy(sketch._entity_snapshots),
+            links           = getattr(sketch, 'links', None),
         )
 
     # ------------------------------------------------------------------
@@ -1375,6 +1540,15 @@ class SketchEntry:
         cells: dict[tuple, list] = {}
         n_canon = [0]
 
+        # Two points linked to different include spots are different points
+        # even while they sit together: those spots only touch for now, and
+        # merged they could never part again (see include_attachments).
+        linked = {}
+        if getattr(self, 'links', None):
+            uids = {e.uid: i for i, e in enumerate(self.entities)}
+            linked = {(uids[uid], end): link[:3]
+                      for (uid, end), link in self.links.items() if uid in uids}
+
         def _register_pt(key, pt):
             cx, cy = int(np.floor(pt[0] / tol)), int(np.floor(pt[1] / tol))
             best = None
@@ -1382,7 +1556,9 @@ class SketchEntry:
                 for dy in (-1, 0, 1):
                     for order, ck, op in cells.get((cx + dx, cy + dy), ()):
                         if (best is None or order < best[0]) and \
-                                np.hypot(pt[0] - op[0], pt[1] - op[1]) < tol:
+                                np.hypot(pt[0] - op[0], pt[1] - op[1]) < tol and \
+                                linked.get(key, linked.get(ck)) == \
+                                linked.get(ck, linked.get(key)):
                             best = (order, ck)
             if best is not None:
                 canon_map[key] = best[1]
@@ -1466,7 +1642,8 @@ class SketchEntry:
         # Includes: fixed geometry in group 1 — the solver only solves the
         # current group (0), so their params are constants.  A straight
         # include (ref_line) also gets a first→last line in slvs_lines so
-        # parallel / perpendicular / equal / symmetric constraints can name it.
+        # constraints can name it; _apply_constraints_to_solver reads the rest
+        # (points, circle) from ref_geo.
         ref_geo: dict[int, dict] = {}
         slvs.set_group(1)
         for i, ent in enumerate(self.entities):
@@ -1475,7 +1652,8 @@ class SketchEntry:
             g = {'verts': [slvs.add_point_2d(float(p[0]), float(p[1]), wp)
                            for p in ent.points],
                  'segs': [], 'center': None, 'circle': None}
-            circ = _ref_circle(self, ent) if len(ent.points) >= 2 else None
+            circ = ent.circle = \
+                _ref_circle(self, ent) if len(ent.points) >= 2 else None
             if circ is not None:
                 c, r = circ
                 g['center'] = slvs.add_point_2d(float(c[0]), float(c[1]), wp)
@@ -1497,10 +1675,19 @@ class SketchEntry:
 
     def _apply_constraints_to_solver(self, slvs, wp, canon_map,
                                      slvs_pts, slvs_lines, slvs_arcs,
-                                     arc_dist_ents, constraints):
+                                     arc_dist_ents, constraints, ref_geo):
         """Emit all constraint calls onto an already-built solver system."""
         def _pt(ei, which):
+            g = ref_geo.get(ei)
+            if g is not None:
+                return g['center'] if which == 'center' else \
+                    g['verts'][0 if which == 'p0' else -1]
             return slvs_pts[canon_map[(ei, which)]]
+
+        # Arcs a constraint may name; `diameter` sets size, so drawn only.
+        circles = {i: g['circle'] for i, g in ref_geo.items()
+                   if g['circle'] is not None}
+        any_arc = {**slvs_arcs, **circles}
 
         implied = {id(self.constraints[k]) for k in self._implied_direction_cons()}
         # A pinch (see pinch_pairs) is a tangent nobody added: emit it
@@ -1523,7 +1710,7 @@ class SketchEntry:
                 ref, mov = con.indices
                 if ref in slvs_lines and mov in slvs_lines:
                     slvs.distance(_pt(mov, 'p0'), slvs_lines[ref],
-                                  self._gap_sign(ref, mov) * con.value, wp)
+                                  self._side_of(con) * con.value, wp)
             elif con.type == 'diameter':
                 if i is not None and i < len(self.entities) and \
                         isinstance(self.entities[i], ArcEntity):
@@ -1556,17 +1743,17 @@ class SketchEntry:
                 a, b = con.indices
                 if a in slvs_lines and b in slvs_lines:
                     slvs.equal(slvs_lines[a], slvs_lines[b], wp)
-                elif a in slvs_arcs and b in slvs_arcs:
+                elif a in any_arc and b in any_arc:
                     from python_solvespace import Constraint as K, Entity as E
                     slvs.add_constraint(K.EQUAL_RADIUS, wp, 0.0, E.NONE,
-                                        E.NONE, slvs_arcs[a], slvs_arcs[b])
+                                        E.NONE, any_arc[a], any_arc[b])
             elif con.type == 'concentric':
                 a, b = con.indices
-                if a in slvs_arcs and b in slvs_arcs and \
-                        canon_map[(a, 'center')] != canon_map[(b, 'center')]:
+                if a in any_arc and b in any_arc and \
+                        _pt(a, 'center') is not _pt(b, 'center'):
                     slvs.coincident(_pt(a, 'center'), _pt(b, 'center'), wp)
             elif con.type == 'edge_gap':
-                self._emit_edge_gap(slvs, wp, con, _pt, slvs_lines, slvs_arcs)
+                self._emit_edge_gap(slvs, wp, con, _pt, slvs_lines, any_arc)
             elif con.type == 'symmetric':
                 # (src_idx, copy_idx, axis_line_idx): reflect each corresponding
                 # point of src/copy across the axis line.
@@ -1595,8 +1782,8 @@ class SketchEntry:
             elif con.type == 'pt_distance':
                 self._emit_pt_distance(slvs, wp, con, _pt, slvs_lines)
             elif con.type == 'tangent':
-                self._emit_tangent(slvs, wp, con, canon_map, slvs_pts,
-                                   slvs_lines, slvs_arcs)
+                self._emit_tangent(slvs, wp, con, canon_map, _pt,
+                                   slvs_lines, any_arc)
             elif con.type == 'sharp_distance':
                 # Length to the virtual sharp corner(s) a fillet cut away:
                 # a hidden point where the line meets its old neighbour.
@@ -1623,17 +1810,27 @@ class SketchEntry:
         ends = edge_gap_ends(self.entities, con)
         if ends is None or li not in slvs_lines or ai not in slvs_arcs:
             return
-        L, c = self.entities[li], self.entities[ai].center
-        t = ends[1]
+        side = self._side_of(con)
+        # Start on the rim nearest the line on the side being held, which
+        # after replay moved an include isn't the side it's on now.
+        p0, p1 = (np.asarray(p, float)[:2] for p in line_ends(self.entities[li]))
+        c, r = circle_of(self.entities[ai])
+        d = (p1 - p0) / max(float(np.linalg.norm(p1 - p0)), 1e-12)
+        n = np.array([-d[1], d[0]])
+        if not is_datum(self.entities[ai]) and \
+                id(con) in (getattr(self, '_held_sides', None) or {}):
+            # An include moved past this circle.  Newton from the old spot
+            # can drag T through the centre, where radius ⊥ line is singular,
+            # so start the centre where the gap holds at this radius.
+            c = c + (-side * (con.value + r) - float((c - p0) @ n)) * n
+            slvs.set_params(_pt(ai, 'center').params, [float(c[0]), float(c[1])])
+        t = c + side * n * r
         T = slvs.add_point_2d(float(t[0]), float(t[1]), wp)
         slvs.add_constraint(K.PT_ON_CIRCLE, wp, 0.0, T, E.NONE,
                             slvs_arcs[ai], E.NONE)
         slvs.perpendicular(slvs.add_line_2d(_pt(ai, 'center'), T, wp),
                            slvs_lines[li], wp)
-        cross = (L.p1[0] - L.p0[0]) * (c[1] - L.p0[1]) - \
-            (L.p1[1] - L.p0[1]) * (c[0] - L.p0[0])
-        slvs.distance(T, slvs_lines[li],
-                      (-1.0 if cross > 0 else 1.0) * con.value, wp)
+        slvs.distance(T, slvs_lines[li], side * con.value, wp)
 
     def _emit_pt_distance(self, slvs, wp, con, _pt, slvs_lines) -> None:
         """('pt_distance', (a, b), points=(wa, wb)): point to point, or
@@ -1658,18 +1855,13 @@ class SketchEntry:
         if wb is None:
             if b not in slvs_lines:
                 return
-            L = self.entities[b]
-            p = ref_point(self.entities, a, wa)
-            cross = (L.p1[0] - L.p0[0]) * (p[1] - L.p0[1]) - \
-                (L.p1[1] - L.p0[1]) * (p[0] - L.p0[0])
-            slvs.distance(A, slvs_lines[b],
-                          (-1.0 if cross > 0 else 1.0) * con.value, wp)
+            slvs.distance(A, slvs_lines[b], self._side_of(con) * con.value, wp)
             return
         B = point(b, wb)
         if B is not None:
             slvs.distance(A, B, con.value, wp)
 
-    def _emit_tangent(self, slvs, wp, con, canon_map, slvs_pts,
+    def _emit_tangent(self, slvs, wp, con, canon_map, _pt,
                       slvs_lines, slvs_arcs) -> None:
         """('tangent', (arc, other)) — other a line or arc/circle.
 
@@ -1690,10 +1882,14 @@ class SketchEntry:
             return
         A, B = ents[a], ents[b]
         ck = lambda i, w: canon_map.get((i, w))
-        # A pinched arc is a circle to the solver (_build_solver_system).
-        a_full = _is_full_circle(A) or ck(a, 'p0') == ck(a, 'p1')
-        b_arc = isinstance(B, ArcEntity)
-        b_full = b_arc and (_is_full_circle(B) or ck(b, 'p0') == ck(b, 'p1'))
+        A_c, A_r = circle_of(A)
+        # A pinched arc is a circle to the solver (_build_solver_system); so
+        # is a circular include (ref_geo holds its whole circle).
+        full = lambda E_, i: isinstance(E_, ReferenceEntity) or \
+            _is_full_circle(E_) or ck(i, 'p0') == ck(i, 'p1')
+        a_full = full(A, a)
+        b_arc = circle_of(B) is not None
+        b_full = b_arc and full(B, b)
 
         def tied(i, which, target):
             snap = getattr(ents[i], f'{which}_snap', None) \
@@ -1705,30 +1901,30 @@ class SketchEntry:
             slvs.add_constraint(K.PT_ON_CIRCLE, wp, 0.0, pt_ent, E.NONE,
                                 slvs_arcs[arc_i], E.NONE)
 
-        center_a = slvs_pts[ck(a, 'center')]
+        center_a = _pt(a, 'center')
         if not b_arc:
             line_cks = (ck(b, 'p0'), ck(b, 'p1'))
             if not a_full:
                 for k, w in enumerate(('p0', 'p1')):
-                    if ck(a, w) in line_cks:
+                    if ck(a, w) is not None and ck(a, w) in line_cks:
                         slvs.add_constraint(K.ARC_LINE_TANGENT, wp, 0.0,
                                             E.NONE, E.NONE, slvs_arcs[a],
                                             slvs_lines[b], other=bool(k))
                         return
             for w in ('p0', 'p1'):
                 if tied(b, w, a):
-                    radius = slvs.add_line_2d(center_a, slvs_pts[ck(b, w)], wp)
+                    radius = slvs.add_line_2d(center_a, _pt(b, w), wp)
                     slvs.perpendicular(radius, slvs_lines[b], wp)
                     return
             # Touch point: the foot of the centre on the line, out on the circle.
-            p, q = B.p0, B.p1
+            p, q = (np.asarray(v, float)[:2] for v in line_ends(B))
             d = q - p
-            t = float(np.dot(A.center - p, d) / max(float(np.dot(d, d)), 1e-24))
+            t = float(np.dot(A_c - p, d) / max(float(np.dot(d, d)), 1e-24))
             foot = p + t * d
-            n = foot - A.center
+            n = foot - A_c
             nn = float(np.linalg.norm(n))
             n = n / nn if nn > 1e-12 else np.array([-d[1], d[0]]) / np.linalg.norm(d)
-            t0 = A.center + n * A.radius
+            t0 = A_c + n * A_r
             T = slvs.add_point_2d(float(t0[0]), float(t0[1]), wp)
             slvs.coincident(T, slvs_lines[b], wp)
             on_circle(T, a)
@@ -1736,7 +1932,7 @@ class SketchEntry:
             slvs.perpendicular(radius, slvs_lines[b], wp)
             return
 
-        center_b = slvs_pts[ck(b, 'center')]
+        center_b = _pt(b, 'center')
         if not a_full and not b_full:
             for ka, wa in enumerate(('p0', 'p1')):
                 for kb, wb in enumerate(('p0', 'p1')):
@@ -1748,18 +1944,40 @@ class SketchEntry:
                         return
         # Two circles: touch point on both, centres in line with it.  A
         # pinched pair's shared end is that point, already on both.
-        if b_arc and ck(a, 'p0') == ck(a, 'p1') == ck(b, 'p0'):
-            T = slvs_pts[ck(a, 'p0')]
+        if b_arc and ck(a, 'p0') is not None and \
+                ck(a, 'p0') == ck(a, 'p1') == ck(b, 'p0'):
+            T = _pt(a, 'p0')
         else:
-            n = B.center - A.center
+            n = circle_of(B)[0] - A_c
             nn = float(np.linalg.norm(n))
             n = n / nn if nn > 1e-12 else np.array([1.0, 0.0])
-            t0 = A.center + n * A.radius
+            t0 = A_c + n * A_r
             T = slvs.add_point_2d(float(t0[0]), float(t0[1]), wp)
             on_circle(T, a)
             on_circle(T, b)
         slvs.parallel(slvs.add_line_2d(center_a, T, wp),
                       slvs.add_line_2d(center_b, T, wp), wp)
+
+    def _idle_rim_dof(self) -> int:
+        """Solver DOF that aren't the user's to pin: a full circle's p0/p1 is
+        a free point nothing ties to its rim.  Unless something else uses it,
+        it would keep every circle 'under' constrained for ever."""
+        built = self._build_solver_system()
+        if built is None:
+            return 0
+        canon_map = built[3]
+        attached = {k for k, *_ in include_attachments(self)}
+        owners: dict = {}
+        for key, ck in canon_map.items():
+            owners.setdefault(ck, []).append(key)
+        idle = 0
+        for i, ent in enumerate(self.entities):
+            if isinstance(ent, ArcEntity) and _is_full_circle(ent) and \
+                    (i, 'p0') in canon_map:
+                keys = owners[canon_map[(i, 'p0')]]
+                if {k[0] for k in keys} == {i} and not attached & set(keys):
+                    idle += 2
+        return idle
 
     def compute_constraint_status(self) -> tuple[str, int]:
         """
@@ -1798,7 +2016,7 @@ class SketchEntry:
             cons = [c for c in self.constraints if c is not drop]
             self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
                                               slvs_lines, slvs_arcs,
-                                              arc_dist_ents, cons)
+                                              arc_dist_ents, cons, ref_geo)
             r = slvs.solve()
             if r == 0 and drop is not None and not self._constraint_holds(
                     drop, slvs, canon_map, slvs_pts, ref_geo, arc_dist_ents):
@@ -1823,7 +2041,7 @@ class SketchEntry:
         if result != 0:
             return ('over', -1)
 
-        user_dof = slvs.dof() - _solver_overhead_dof()
+        user_dof = slvs.dof() - _solver_overhead_dof() - self._idle_rim_dof()
         if user_dof <= 0:
             return ('fully', 0)
         return ('under', user_dof)
@@ -2170,7 +2388,11 @@ class SketchEntry:
         # result is no "local" edit, so the next tier tries; if even the
         # global solve runs off, the constraint is refused.
         before = self._drawn_xy()
-        reach = 3.0 * max(_xy_extent(before), *(
+        # Drawn geometry dimensioned to a far include has to get there.
+        datums = [np.asarray(p, float)[:2] for e in self.entities
+                  if isinstance(e, ReferenceEntity) for p in e.points]
+        spread = _xy_extent(np.vstack([before, *datums]) if datums else before)
+        reach = 3.0 * max(spread, *(
             abs(c.value) for c in self.constraints if c.type != 'angle'), 1.0)
         saved = [copy.deepcopy(e.__dict__) for e in self.entities]
 
@@ -2407,13 +2629,45 @@ class SketchEntry:
                 locks.append((i, group))
         return locks
 
-    def _gap_sign(self, ref: int, mov: int) -> float:
+    def _measured_side(self, con) -> float | None:
         """libslvs' point-line distance is signed in a workplane (+ = right
-        of ref's direction); keep mov on the side it is on now."""
-        a, b = self.entities[ref].p0, self.entities[ref].p1
-        p = self.entities[mov].p0
+        of the line's direction): the sign that keeps a 'gap', 'edge_gap' or
+        point-to-line 'pt_distance' on the side it is on now."""
+        ents = self.entities
+        if con.type == 'gap':
+            li, ends = con.indices[0], line_ends(ents[con.indices[1]])
+            p = None if ends is None else ends[0]
+        elif con.type == 'edge_gap':
+            li, circ = con.indices[0], circle_of(ents[con.indices[1]])
+            p = None if circ is None else circ[0]
+        elif con.type == 'pt_distance' and con.points and con.points[1] is None:
+            li, p = con.indices[1], ref_point(ents, con.indices[0], con.points[0])
+        else:
+            return None
+        ends = line_ends(ents[li])
+        if ends is None or p is None:
+            return None
+        a, b = ends
         cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
         return -1.0 if cross > 0 else 1.0
+
+    def dimension_sides(self) -> dict:
+        """{id(constraint): side} for every side-keeping dimension.  Replay
+        takes this before moving the includes (set as _held_sides for the
+        solve): measured afterwards, an include that moved past the point
+        would flip the dimension to its other side."""
+        out = {}
+        for c in self.constraints:
+            if not all(0 <= i < len(self.entities) for i in c.indices):
+                continue
+            side = self._measured_side(c)
+            if side is not None:
+                out[id(c)] = side
+        return out
+
+    def _side_of(self, con) -> float:
+        held = getattr(self, '_held_sides', None) or {}
+        return held.get(id(con)) or self._measured_side(con) or 1.0
 
     def _free_cks_for_constraint(self, con, canon_map) -> set:
         """Return canonical keys that must be FREE when applying constraint `con`."""
@@ -2435,7 +2689,8 @@ class SketchEntry:
             if i < len(self.entities) and isinstance(self.entities[i], LineEntity):
                 free.add(canon_map[(i, 'p1')])
         elif con.type in ('pt_distance', 'edge_gap', 'concentric'):
-            mov = con.indices[1]
+            mov = next((i for i in reversed(con.indices)
+                        if not is_datum(self.entities[i])), None)
             for w in ('p0', 'p1', 'center'):
                 if (mov, w) in canon_map:
                     free.add(canon_map[(mov, w)])
@@ -2549,6 +2804,13 @@ class SketchEntry:
                     continue
                 dragged.add(ck)
                 slvs.dragged(pt, wp)
+            elif kind == 's' and n_pts == 2 and data[1] == 0.5:
+                # A midpoint snap (see _midpoints_exact): held at the middle,
+                # not just on the line, or any solve slides it along.
+                slvs.midpoint(pt, target, wp)
+                a, b = g['verts'][0], g['verts'][1]
+                check = (lambda s, p=pt, a=a, b=b:
+                         np.linalg.norm(_uv(p) - (_uv(a) + _uv(b)) / 2) < 1e-6)
             else:
                 slvs.coincident(pt, target, wp)
             checks[n] = check
@@ -2561,22 +2823,25 @@ class SketchEntry:
                 con.indices[0] in arc_dist_ents:
             r = float(slvs.params(arc_dist_ents[con.indices[0]].params)[0])
             return abs(2.0 * r - con.value) < 1e-6 * max(1.0, con.value)
+        def at(i, w):
+            g = ref_geo.get(i)
+            sp = slvs_pts[canon_map[(i, w)]] if g is None else \
+                g['center'] if w == 'center' else g['verts'][0 if w == 'p0' else -1]
+            return np.array(slvs.params(sp.params)[:2])
+
         if con.type == 'pt_distance' and None not in (con.points or (None,)) \
                 and 'mid' not in con.points:
-            a, b = (np.array(slvs.params(slvs_pts[canon_map[(i, w)]].params)[:2])
-                    for i, w in zip(con.indices, con.points))
+            a, b = (at(i, w) for i, w in zip(con.indices, con.points))
             return abs(float(np.linalg.norm(a - b)) - con.value) < \
                 1e-6 * max(1.0, con.value)
         if con.type in ('equal', 'concentric') and all(
                 0 <= i < len(self.entities) and
-                isinstance(self.entities[i], ArcEntity) for i in con.indices):
-            def at(i, w):
-                return np.array(slvs.params(
-                    slvs_pts[canon_map[(i, w)]].params)[:2])
-
+                circle_of(self.entities[i]) is not None for i in con.indices):
             def radius(i):
                 if arc_dist_ents and i in arc_dist_ents:
                     return float(slvs.params(arc_dist_ents[i].params)[0])
+                if isinstance(self.entities[i], ReferenceEntity):
+                    return self.entities[i].circle[1]
                 return float(np.linalg.norm(at(i, 'p0') - at(i, 'center')))
             a, b = con.indices
             if con.type == 'concentric':
@@ -2771,8 +3036,8 @@ class SketchEntry:
                              for c in self.constraints if c.type == 'edge_gap'}
                 # Concentric circles: pin one centre per group.
                 for c in self.constraints:
-                    if c.type == 'concentric' and all(
-                            (i, 'center') in canon_map for i in c.indices):
+                    if c.type == 'concentric' and \
+                            (c.indices[1], 'center') in canon_map:
                         measured.add(canon_map[(c.indices[1], 'center')])
                 for i, ent in enumerate(self.entities):
                     if not isinstance(ent, ArcEntity):
@@ -2802,7 +3067,7 @@ class SketchEntry:
                                  for i in c.indices)))]
             self._apply_constraints_to_solver(slvs, wp, canon_map, slvs_pts,
                                               slvs_lines, slvs_arcs,
-                                              arc_dist_ents, cons)
+                                              arc_dist_ents, cons, ref_geo)
             result = slvs.solve()
             state = (slvs, wp, canon_map, slvs_pts, slvs_lines, slvs_arcs,
                      arc_dist_ents, ref_geo, att_checks)

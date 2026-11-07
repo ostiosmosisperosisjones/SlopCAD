@@ -50,7 +50,7 @@ class FaceFilletOp(Op):
                 result.append(mesh.topo_edges_occ[ei])
         return result
 
-    def _resolve_edge_refs(self, shape, history=None) -> list:
+    def _resolve_edge_refs(self, shape, history=None, entry_index=None) -> list:
         """Re-find edges via EdgeRef provenance/fingerprints (replay-safe)."""
         if not self.edge_refs:
             return []
@@ -67,6 +67,10 @@ class FaceFilletOp(Op):
                 raise RuntimeError(
                     f"FaceFilletOp: could not relocate edge "
                     f"(midpoint={ref.midpoint}, length={ref.length:.3f})")
+            if entry_index is not None:
+                from cad.face_origin import upgrade_to_rim
+                ref.origin = upgrade_to_rim(history, self.source_body_id, occ, ref,
+                                            ref.origin, entry_index)
             out.append(occ)
         return out
 
@@ -81,7 +85,7 @@ class FaceFilletOp(Op):
         # edge_indices are commit-time mesh handles; replay uses edge_refs
         # (geometry fingerprints) to relocate the same edges after upstream
         # edits perturb the topology.
-        edge_occs = self._resolve_edge_refs(shape, history)
+        edge_occs = self._resolve_edge_refs(shape, history, entry_index)
         # Run in a killable child process: an OCCT fillet hang here would
         # otherwise freeze replay (e.g. on file open). FilletTimeout surfaces as
         # a normal per-entry error the replay loop already handles. edge_radii

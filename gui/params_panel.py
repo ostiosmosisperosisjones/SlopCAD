@@ -102,6 +102,18 @@ class ParamsPanel(QWidget):
         self._table = t
         root.addWidget(t, 1)
 
+        # Shown while the document is failing and a good build is on record.
+        self._restore = QPushButton("Restore last working values")
+        self._restore.setStyleSheet(prefs.scale_stylesheet("""
+            QPushButton { background: #3a2a1a; color: #e0b070; border: none;
+                          padding: 4px 8px; font-size: 11px; }
+            QPushButton:hover { background: #4a3620; }
+        """))
+        self._restore.clicked.connect(
+            lambda: self.controller and self.controller.param_restore_good())
+        self._restore.setVisible(False)
+        root.addWidget(self._restore)
+
         self._hint = QLabel(
             f"{prefs.key('new_parameter') or '+'} adds a parameter. Use its"
             " name in any value or dimension: w/2")
@@ -131,6 +143,12 @@ class ParamsPanel(QWidget):
             t.setRowCount(len(table.params))
             t.setVisible(bool(table.params))
             self._hint.setVisible(not table.params)
+            good = self._history.last_good()
+            failing = any(e.error for e in self._history.entries)
+            self._restore.setVisible(failing and good is not None)
+            if good is not None:
+                self._restore.setToolTip("Back to: " + ", ".join(
+                    f"{i['name']} = {i['expr']}" for i in good["items"]))
             for row, p in enumerate(table.params.values()):
                 users = len(self._history.param_users({p.name}))
                 name = QTableWidgetItem(p.name)

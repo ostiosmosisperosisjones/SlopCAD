@@ -161,6 +161,8 @@ class ExtrudePanel(QWidget):
         self._picking_face   : bool = False
 
         self._target_vertex  : np.ndarray | None = None
+        self._target_source  : dict | None = None   # how replay re-finds it
+        self._direction_source: dict | None = None  # edge the direction came from
         self._face_origin    : np.ndarray | None = None
         self._face_normal    : np.ndarray | None = None
         self._vertex_dist_mm : float | None = None
@@ -481,8 +483,10 @@ class ExtrudePanel(QWidget):
         self._recompute_vertex_dist()
         self._emit_preview()
 
-    def set_direction(self, vec: np.ndarray):
+    def set_direction(self, vec: np.ndarray, source: dict | None = None):
+        """*source*: the picked edge, serialized, so replay can follow it."""
         self._direction = vec / np.linalg.norm(vec)
+        self._direction_source = source
         x, y, z = self._direction
         self._dir_label.setText(f"{x:+.2f}, {y:+.2f}, {z:+.2f}")
         self._dir_label.setStyleSheet(prefs.scale_stylesheet(
@@ -491,8 +495,9 @@ class ExtrudePanel(QWidget):
         self._recompute_vertex_dist()
         self._emit_preview()
 
-    def set_vertex_target(self, vertex: np.ndarray):
+    def set_vertex_target(self, vertex: np.ndarray, source: dict | None = None):
         self._target_vertex = vertex.copy()
+        self._target_source = source
         x, y, z = vertex
         self._vtx_label.setText(f"{x:.2f}, {y:.2f}, {z:.2f}")
         self._vtx_label.setStyleSheet(prefs.scale_stylesheet(
@@ -795,6 +800,7 @@ class ExtrudePanel(QWidget):
 
     def _reset_vertex(self):
         self._target_vertex  = None
+        self._target_source  = None
         self._vertex_dist_mm = None
         self._vtx_label.setText("No vertex selected")
         self._vtx_label.setStyleSheet(prefs.scale_stylesheet(
@@ -805,6 +811,7 @@ class ExtrudePanel(QWidget):
 
     def _reset_direction(self):
         self._direction = None
+        self._direction_source = None
         self._dir_label.setText("Normal")
         self._dir_label.setStyleSheet(prefs.scale_stylesheet(
             "color: #888; font-size: 11px; font-family: monospace;"))

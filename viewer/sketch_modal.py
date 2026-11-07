@@ -80,6 +80,7 @@ class SketchModalMixin:
         mode._entity_snapshots = copy.deepcopy(se.undo_snapshots)
         mode.entities    = existing
         mode.constraints = copy.deepcopy(se.constraints)
+        mode.links       = se.links
         self._sketch = mode
         self._editing_sketch_history_idx = history_idx
         self._selected_sketch_entry = None
@@ -122,7 +123,7 @@ class SketchModalMixin:
         and *entity_idx*; the latter is the one that moves.  A point
         distance (entity_type 'pt') gets ref_idx = (indices, points)."""
         from gui.value_dialog import ask_value
-        from cad.sketch import SketchConstraint
+        from cad.sketch import SketchConstraint, line_ends
 
         is_arc = (entity_type == 'arc')
         is_gap = (entity_type == 'gap')
@@ -145,6 +146,8 @@ class SketchModalMixin:
                     else 'pt_distance' if is_pt else 'distance')
         indices  = ((ref_idx, entity_idx) if is_gap or is_angle
                     else ref_idx[0] if is_pt else (entity_idx,))
+        if is_edge and line_ends(self._sketch.entities[indices[0]]) is None:
+            indices = indices[::-1]           # (line, arc), whichever moves
         if con_type == 'distance':
             # A filleted line's length already measures to its sharp
             # corner(s): edit that one rather than add a second length.
@@ -234,7 +237,8 @@ class SketchModalMixin:
             return
         self._include_armed = False
         sketch = self._sketch
-        from cad.sketch import LineEntity, ArcEntity, ReferenceEntity, SketchEntry
+        from cad.sketch import (LineEntity, ArcEntity, ReferenceEntity, SketchEntry,
+                                remember_links)
         lines = [e for e in sketch.entities if isinstance(e, LineEntity)]
         arcs  = [e for e in sketch.entities if isinstance(e, ArcEntity)]
         refs  = [e for e in sketch.entities if isinstance(e, ReferenceEntity)]
@@ -245,6 +249,7 @@ class SketchModalMixin:
             return
         entity_count = len(lines) + len(arcs) + len(refs)
         new_se = SketchEntry.from_sketch_mode(sketch)
+        remember_links(new_se)
 
         if editing_idx is not None:
             entries = self.history.entries

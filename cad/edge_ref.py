@@ -6,12 +6,15 @@ Stable edge references and abstract edge sources for parametric include replay.
 EdgeRef          — geometry fingerprint that re-finds an edge after topology changes
 EdgeSource       — abstract base: resolve → (world_pts, occ_edges)
 BodyEdgeSource   — edge on a specific body (most common include case)
+BodyVertexSource — vertex on a body, found as where its edges meet
 SketchEdgeSource — line entity from a previously committed sketch
 """
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from itertools import combinations
+
 import numpy as np
 
 
@@ -81,6 +84,8 @@ class EdgeRef:
             occ = self.origin.find_in(history, shape)
             if occ is not None:
                 return occ
+            if _origin_is_final(self.origin, history):
+                return None
         return self.find_in(shape, use_face_sigs=self.origin is None)[1]
 
     # ------------------------------------------------------------------
@@ -372,6 +377,12 @@ class EdgeSource(ABC):
 # BodyEdgeSource
 # ---------------------------------------------------------------------------
 
+def _origin_is_final(origin, history) -> bool:
+    """origin found no edge and knows exactly what it was looking for: the
+    edge is gone, and a fuzzy match could only return some other edge."""
+    return getattr(origin, "authoritative", False) and origin.circle(history) is not None
+
+
 class BodyEdgeSource(EdgeSource):
     """An edge on a specific body, re-found each replay — through the faces
     it bounds when they have provenance (origin; follows rotation), else via
@@ -388,18 +399,103 @@ class BodyEdgeSource(EdgeSource):
             raise RuntimeError(
                 f"BodyEdgeSource: no shape for body '{self.body_id}' "
                 f"before history index {before_index}")
+        from cad.face_origin import upgrade_to_rim
         if self.origin is not None:
             occ = self.origin.find_in(history, shape)
             if occ is not None:
+                self.origin = upgrade_to_rim(history, self.body_id, occ, self.edge_ref,
+                                             self.origin, before_index)
                 return sample_occ_edge(occ), [occ]
-        _, occ_edge, world_pts = self.edge_ref.find_in(shape)
+        occ_edge = None
+        if not _origin_is_final(self.origin, history):
+            _, occ_edge, world_pts = self.edge_ref.find_in(shape)
         if occ_edge is None:
             raise RuntimeError(
                 f"BodyEdgeSource: could not relocate edge in body '{self.body_id}'")
+        self.origin = upgrade_to_rim(history, self.body_id, occ_edge, self.edge_ref,
+                                     self.origin, before_index)
         return world_pts, [occ_edge]
 
     def to_dict(self) -> dict:
         return {"type": "body_edge", "body_id": self.body_id}
+
+
+# ---------------------------------------------------------------------------
+# BodyVertexSource
+# ---------------------------------------------------------------------------
+
+class BodyVertexSource(EdgeSource):
+    """A body vertex, re-found each replay as the end its edges (BodyEdgeSource)
+    share.  A re-found edge can run the other way, so it takes two to name an
+    end; a third lets the vertex survive losing one of them.  Two edges can
+    meet twice (a split circle): the meeting nearest the last known position
+    wins, and a lone edge (a circle's seam vertex) picks its end the same way."""
+
+    _MEET_TOL = 1e-3
+
+    def __init__(self, edges: list, point):
+        self.edges = edges
+        self.point = [float(c) for c in point]
+
+    def resolve(self, history, before_index: int) -> tuple[list, list | None]:
+        ends, lost = [], None
+        for src in self.edges:
+            try:
+                pts, occ = src.resolve(history, before_index)
+            except Exception as ex:
+                lost = ex
+                continue
+            pts = np.asarray(pts, dtype=np.float64)
+            ends.append(((pts[0], pts[-1]), occ[0] if occ else None))
+        if not ends or (len(self.edges) >= 2 and len(ends) < 2):
+            raise lost or RuntimeError("BodyVertexSource: it has no edges")
+        if len(ends) >= 2:
+            # Two sources landing on one edge meet nowhere: a matcher guessed.
+            spots = [a for (e0, x), (e1, y) in combinations(ends, 2)
+                     if not (x is not None and y is not None and x.IsSame(y))
+                     for a in e0 for b in e1
+                     if float(np.linalg.norm(a - b)) <= self._MEET_TOL]
+            if not spots:
+                raise RuntimeError("BodyVertexSource: its edges no longer meet")
+        else:
+            spots = ends[0][0]
+        last = np.asarray(self.point)
+        v = min(spots, key=lambda p: float(np.linalg.norm(p - last)))
+        self.point = [float(c) for c in v]
+        return [self.point], None
+
+    def to_dict(self) -> dict:
+        return {"type": "body_vertex", "point": self.point}
+
+
+def vertex_source_at(history, body_id, shape, point, before_index: int,
+                     tol: float = 1e-3) -> "BodyVertexSource | None":
+    """The source for the vertex of *shape* at world *point*, or None when no
+    edge ends there.  Edges with provenance go first: they follow the part."""
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+    occ = getattr(shape, "wrapped", shape)
+    p = np.asarray(point, dtype=np.float64)
+    found, seen = [], []
+    exp = TopExp_Explorer(occ, TopAbs_EDGE)
+    while exp.More():
+        edge = TopoDS.Edge(exp.Current())
+        exp.Next()
+        if BRep_Tool.Degenerated_s(edge) or any(edge.IsSame(e) for e in seen):
+            continue
+        pts = np.asarray(sample_occ_edge(edge, 1), dtype=np.float64)
+        if min(np.linalg.norm(pts[0] - p), np.linalg.norm(pts[-1] - p)) >= tol:
+            continue
+        seen.append(edge)                 # a shared edge is walked once per face
+        ref = EdgeRef.for_edge(history, body_id, edge, occ, before_index)
+        if ref is not None:
+            found.append(BodyEdgeSource(body_id, ref, ref.origin))
+    if not found:
+        return None
+    found.sort(key=lambda s: s.origin is None)
+    return BodyVertexSource(found[:3], p)
 
 
 # ---------------------------------------------------------------------------
@@ -411,16 +507,21 @@ class SketchEdgeSource(EdgeSource):
     A LineEntity (or ArcEntity) from a previously committed sketch entry.
 
     Identified by the source sketch's stable entry_id UUID, so reorder/
-    delete/insert in the history list never breaks the reference.
+    delete/insert in the history list never breaks the reference, and the
+    entity by its uid, so reordering, trimming or deleting in the source
+    sketch can't silently retarget the include to a neighbouring line (older
+    saves have no uid: entity_idx finds it once, then the uid is kept).
 
     On resolve(), converts the UV-space entity back to world space using
     the source SketchEntry's (possibly already-updated) plane cache, so it
     automatically inherits upstream sketch plane changes.
     """
 
-    def __init__(self, source_entry_id: str, entity_idx: int):
+    def __init__(self, source_entry_id: str, entity_idx: int,
+                 entity_uid: str | None = None):
         self.source_entry_id = source_entry_id
         self.entity_idx      = entity_idx
+        self.entity_uid      = entity_uid
 
     def resolve(self, history, before_index: int) -> tuple[list, list | None]:
         from cad.sketch import LineEntity
@@ -434,10 +535,18 @@ class SketchEdgeSource(EdgeSource):
         if se is None:
             raise RuntimeError(
                 f"SketchEdgeSource: entry '{self.source_entry_id}' has no sketch_entry")
-        if self.entity_idx >= len(se.entities):
+        if self.entity_uid is not None:
+            at = next((i for i, e in enumerate(se.entities)
+                       if e.uid == self.entity_uid), None)
+            if at is None:
+                raise RuntimeError(
+                    f"SketchEdgeSource: entity {self.entity_uid} is gone")
+            self.entity_idx = at
+        elif self.entity_idx >= len(se.entities):
             raise RuntimeError(
                 f"SketchEdgeSource: entity_idx {self.entity_idx} out of range")
         ent = se.entities[self.entity_idx]
+        self.entity_uid = ent.uid
 
         def _uv_to_world(uv):
             return (se.plane_origin
@@ -481,8 +590,11 @@ class SketchEdgeSource(EdgeSource):
                 f"'{self.source_entry_id}' has unsupported type {type(ent).__name__}")
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "type":            "sketch_edge",
             "source_entry_id": self.source_entry_id,
             "entity_idx":      self.entity_idx,
         }
+        if self.entity_uid is not None:
+            d["entity_uid"] = self.entity_uid
+        return d

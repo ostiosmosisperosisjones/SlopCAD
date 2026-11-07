@@ -306,7 +306,7 @@ class HistoryMixin:
         self._cmd_stack._do_push_no_apply(ParamCommand(
             before_items, h.params.to_list(), rename,
             f"{verb} parameter '{param.name}'"))
-        self._replay_params(before_vals)
+        self._replay_params(before_vals, before_items)
         return None
 
     def param_remove(self, name: str) -> str | None:
@@ -324,9 +324,30 @@ class HistoryMixin:
         self.history_changed.emit()
         return None
 
-    def _replay_params(self, before_vals: dict):
-        ok, err, mutated = self.history._replay_for_params(before_vals)
+    def _replay_params(self, before_vals: dict, before_items: list | None = None):
+        h = self.history
+        ok, err, mutated = h._replay_for_params(before_vals, before_items)
         if not ok:
             print(f"[Params] Replay error: {err}")
+            if h.last_good() is not None:
+                print("[Params] Parameters > Restore last working values "
+                      "gets back to the last good build")
         self._rebuild_bodies(mutated)
         self.history_changed.emit()
+
+    def param_restore_good(self) -> str | None:
+        """Undoable: back to the last parameter values that built cleanly.
+        Returns an error message, or None on success."""
+        from viewer.history_commands import ParamCommand
+        h = self.history
+        if h.last_good() is None:
+            return "No working state remembered for this document"
+        before_items = h.params.to_list()
+        ok, err, _ = h.revert_to_good()
+        self._cmd_stack._do_push_no_apply(ParamCommand(
+            before_items, h.params.to_list(), None, "Restore last working values"))
+        if not ok:
+            print(f"[Params] Restore failed: {err}")
+        self._rebuild_all_meshes()
+        self.history_changed.emit()
+        return None if ok else err

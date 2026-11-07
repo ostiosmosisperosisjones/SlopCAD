@@ -46,9 +46,17 @@ def _occ_face_normal(occ_face):
     """
     try:
         surf = BRepAdaptor_Surface(occ_face)
-        if surf.GetType() != GeomAbs_Plane:
-            return None
-        d = surf.Plane().Axis().Direction()
+        if surf.GetType() == GeomAbs_Plane:
+            d = surf.Plane().Axis().Direction()
+        else:
+            # OCCT builds some flat faces as splines (a chamfer run off the
+            # part's end); they are planes all the same.
+            from OCP.BRep import BRep_Tool
+            from OCP.GeomLib import GeomLib_IsPlanarSurface
+            chk = GeomLib_IsPlanarSurface(BRep_Tool.Surface_s(occ_face), 1e-7)
+            if not chk.IsPlanar():
+                return None
+            d = chk.Plan().Axis().Direction()
         n = np.array([d.X(), d.Y(), d.Z()])
         return n / np.linalg.norm(n)
     except Exception:

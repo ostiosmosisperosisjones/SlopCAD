@@ -12,6 +12,9 @@ DimensionTool — length, gap, angle or diameter constraint.
 Point picks — press C (centre), M (midpoint) or E (endpoint) before a click:
   point, point            → distance between them
   point, line (or line, point) → perpendicular distance from the point
+
+Included geometry works everywhere a drawn line / circle does, but it is a
+fixed datum: the drawn side moves, and two includes have nothing to dimension.
 """
 
 from __future__ import annotations
@@ -58,11 +61,14 @@ class DimensionTool(BaseTool):
             _nearest_dimensionable(pt, sketch.entities)
 
     def handle_click(self, snap_result, sketch) -> bool:
-        from cad.sketch import LineEntity, ArcEntity
+        from cad.sketch import ArcEntity, circle_of, is_datum, line_ends
         pt = snap_result.point
         if pt is None:
             return False
         cb = getattr(sketch, '_dimension_callback', None)
+        ents = sketch.entities
+        is_line = lambda i: i is not None and i < len(ents) and \
+            line_ends(ents[i]) is not None
         if sketch.snap.declared_type in _snap_types():
             pick = _point_pick(snap_result, sketch)
             if pick is None:
@@ -72,7 +78,7 @@ class DimensionTool(BaseTool):
             self.first_pt = self.first_idx = None
             if first is not None:
                 return self._point_to_point(first, pick, sketch, cb)
-            if line is not None:
+            if is_line(line):
                 return self._point_to_line(pick, line, pick[0], sketch, cb)
             self.first_pt = pick
             return True
@@ -82,28 +88,41 @@ class DimensionTool(BaseTool):
             return False
         ent = sketch.entities[idx]
         if self.first_pt is not None:
-            if isinstance(ent, LineEntity):
+            if is_line(idx):
                 first, self.first_pt = self.first_pt, None
                 return self._point_to_line(first, idx, idx, sketch, cb)
             print("[Sketch] Point to a circle: press C to use its centre")
             return True
-        if isinstance(ent, ArcEntity):
+        if circle_of(ent) is not None:
             first, self.first_idx = self.first_idx, None
-            if first is not None and first < len(sketch.entities) and \
-                    isinstance(sketch.entities[first], LineEntity):
+            if is_line(first):
                 return self._line_to_edge(first, idx, sketch, cb)
+            if is_datum(ent):
+                # A datum has no diameter to set; a line picked next gaps to it.
+                self.first_idx = idx
+                return True
             if cb:
                 cb(idx, float(ent.radius * 2.0), 'arc')
             return True
         first, self.first_idx = self.first_idx, None
-        if first is None or first >= len(sketch.entities):
+        if first is None or first >= len(ents):
             self.first_idx = idx
             return True
+        if circle_of(ents[first]) is not None:
+            return self._line_to_edge(idx, first, sketch, cb)
         if first == idx:
-            if cb:
+            if is_datum(ent):
+                print(_FIXED)
+            elif cb:
                 cb(idx, float(np.linalg.norm(ent.p1 - ent.p0)), 'line')
             return True
-        gap = parallel_gap(sketch.entities[first], ent)
+        if is_datum(ents[first]) and is_datum(ent):
+            print(_FIXED)
+            return True
+        if is_datum(ent):                     # the drawn line is the one to move
+            first, idx = idx, first
+        ent = ents[idx]
+        gap = parallel_gap(ents[first], ent)
         if gap is None:
             from cad.sketch import SketchConstraint, ray_angle_deg
             ang = ray_angle_deg(sketch.entities,
@@ -121,39 +140,57 @@ class DimensionTool(BaseTool):
         return True
 
     def _line_to_edge(self, line, arc, sketch, cb) -> bool:
-        from cad.sketch import SketchConstraint, edge_gap_ends
-        A = sketch.entities[arc]
-        L = sketch.entities[line]
-        if _dist_to_line(A.center[:2], L.p0[:2], L.p1[:2]) <= A.radius + 1e-6:
+        from cad.sketch import (SketchConstraint, circle_of, edge_gap_ends,
+                                is_datum, line_ends)
+        ents = sketch.entities
+        if is_datum(ents[line]) and is_datum(ents[arc]):
+            print(_FIXED)
+            return True
+        center, radius = circle_of(ents[arc])
+        p0, p1 = (np.asarray(p, float)[:2] for p in line_ends(ents[line]))
+        if _dist_to_line(center, p0, p1) <= radius + 1e-6:
             print("[Sketch] The line cuts that circle — no gap to dimension")
             return True
-        foot, rim = edge_gap_ends(sketch.entities,
+        foot, rim = edge_gap_ends(ents,
                                   SketchConstraint('edge_gap', (line, arc), 0.0))
         if cb:
-            cb(arc, float(np.linalg.norm(foot - rim)), 'edge', line)
+            mover, other = (line, arc) if is_datum(ents[arc]) else (arc, line)
+            cb(mover, float(np.linalg.norm(foot - rim)), 'edge', other)
         return True
 
     def _point_to_point(self, a, b, sketch, cb) -> bool:
-        from cad.sketch import ref_point
-        pa, pb = ref_point(sketch.entities, *a), ref_point(sketch.entities, *b)
+        from cad.sketch import is_datum, ref_point
+        ents = sketch.entities
+        if is_datum(ents[a[0]]) and is_datum(ents[b[0]]):
+            print(_FIXED)
+            return True
+        pa, pb = ref_point(ents, *a), ref_point(ents, *b)
         d = float(np.linalg.norm(pa - pb))
         if d < 1e-6:
             print("[Sketch] Those points coincide — nothing to dimension")
             self.first_pt = b
             return True
+        if is_datum(ents[b[0]]):              # the second point is the mover
+            a, b = b, a
         if cb:
             cb(b[0], d, 'pt', ((a[0], b[0]), (a[1], b[1])))
         return True
 
     def _point_to_line(self, p, line, mover, sketch, cb) -> bool:
-        from cad.sketch import ref_point
-        L = sketch.entities[line]
-        q = ref_point(sketch.entities, *p)
-        d = _dist_to_line(q, L.p0[:2], L.p1[:2])
+        from cad.sketch import is_datum, line_ends, ref_point
+        ents = sketch.entities
+        if is_datum(ents[p[0]]) and is_datum(ents[line]):
+            print(_FIXED)
+            return True
+        q = ref_point(ents, *p)
+        p0, p1 = (np.asarray(v, float)[:2] for v in line_ends(ents[line]))
+        d = _dist_to_line(q, p0, p1)
         if p[0] == line or d < 1e-6:
             print("[Sketch] That point is on the line — pick another line")
             self.first_pt = p
             return True
+        if is_datum(ents[mover]):
+            mover = p[0] if mover == line else line
         if cb:
             cb(mover, d, 'pt', ((p[0], line), (p[1], None)))
         return True
@@ -168,6 +205,8 @@ class DimensionTool(BaseTool):
 
 PARALLEL_TOL_DEG = 0.5
 
+_FIXED = "[Sketch] Included geometry is fixed — dimension it to something drawn"
+
 
 def _snap_types():
     from cad.sketch_tools.snap import SnapType
@@ -178,7 +217,8 @@ def _snap_types():
 def _point_pick(snap_result, sketch, tol: float = 5.0):
     """(entity idx, 'center' | 'mid' | 'p0' | 'p1') for the point the
     declared snap key (C / M / E) names near the cursor, else None."""
-    from cad.sketch import LineEntity, ArcEntity, _is_full_circle
+    from cad.sketch import (LineEntity, ArcEntity, ReferenceEntity,
+                            _is_full_circle, circle_of, line_ends)
     kind = _snap_types().get(sketch.snap.declared_type)
     pt = getattr(snap_result, 'cursor_raw', None)
     if pt is None:
@@ -188,13 +228,20 @@ def _point_pick(snap_result, sketch, tol: float = 5.0):
     pt = np.asarray(pt, float)[:2]
     best, best_d = None, None
     for i, e in enumerate(sketch.entities):
-        if kind == 'center' and isinstance(e, ArcEntity):
+        ends, circ = line_ends(e), circle_of(e)
+        if kind == 'center' and circ is not None:
             # On the rim or near the centre — a big circle's centre is far.
-            d = min(float(np.linalg.norm(pt - e.center[:2])),
-                    abs(float(np.linalg.norm(pt - e.center[:2])) - e.radius))
-            cand = [(d, 'center')]
-        elif kind == 'mid' and isinstance(e, LineEntity):
-            cand = [(_pt_to_seg_dist(pt, e.p0[:2], e.p1[:2]), 'mid')]
+            r = float(np.linalg.norm(pt - circ[0]))
+            cand = [(min(r, abs(r - circ[1])), 'center')]
+        elif kind == 'mid' and ends is not None:
+            cand = [(_pt_to_seg_dist(pt, *(np.asarray(v, float)[:2] for v in ends)),
+                     'mid')]
+        elif kind == 'end' and isinstance(e, ReferenceEntity):
+            pts = [np.asarray(e.points[k], float)[:2] for k in (0, -1)]
+            if float(np.linalg.norm(pts[0] - pts[1])) < 1e-9 and len(e.points) > 1:
+                continue                      # closed: a circle has no ends
+            cand = [(float(np.linalg.norm(pt - q)), w)
+                    for q, w in zip(pts, ('p0', 'p1'))]
         elif kind == 'end' and (isinstance(e, LineEntity) or isinstance(
                 e, ArcEntity) and not _is_full_circle(e)):
             cand = [(float(np.linalg.norm(pt - getattr(e, w)[:2])), w)
@@ -216,31 +263,37 @@ def _dist_to_line(p, a, b) -> float:
 def parallel_gap(a, b) -> float | None:
     """Perpendicular distance between lines a and b if they are parallel
     (within PARALLEL_TOL_DEG) and apart; else None."""
-    da, db = a.p1 - a.p0, b.p1 - b.p0
+    from cad.sketch import line_ends
+    (a0, a1), (b0, _b1) = line_ends(a), line_ends(b)
+    da, db = a1 - a0, _b1 - b0
     la, lb = float(np.linalg.norm(da)), float(np.linalg.norm(db))
     if la < 1e-9 or lb < 1e-9:
         return None
     sin = abs(float(da[0] * db[1] - da[1] * db[0])) / (la * lb)
     if sin > np.sin(np.radians(PARALLEL_TOL_DEG)):
         return None
-    w = b.p0 - a.p0
+    w = b0 - a0
     gap = abs(float(da[0] * w[1] - da[1] * w[0])) / la
     return gap if gap > 1e-6 else None
 
 
 def _nearest_dimensionable(pt: np.ndarray, entities, tol: float = 5.0) -> int | None:
-    """Return index of the closest LineEntity or ArcEntity within tol mm, or None."""
-    from cad.sketch import LineEntity, ArcEntity
+    """Index of the closest line or arc/circle, drawn or included, within
+    tol mm, or None.  On a tie (a line drawn over an include) the drawn one."""
+    from cad.sketch import circle_of, is_datum, line_ends
     best_idx  = None
     best_dist = tol
     for i, ent in enumerate(entities):
-        if isinstance(ent, LineEntity):
-            d = _pt_to_seg_dist(pt, ent.p0, ent.p1)
-        elif isinstance(ent, ArcEntity):
-            d = abs(float(np.linalg.norm(pt - ent.center)) - ent.radius)
+        ends, circ = line_ends(ent), circle_of(ent)
+        if ends is not None:
+            d = _pt_to_seg_dist(pt, *ends)
+        elif circ is not None:
+            d = abs(float(np.linalg.norm(pt - circ[0])) - circ[1])
         else:
             continue
-        if d < best_dist:
+        drawn_over = best_idx is not None and d <= best_dist + 1e-9 and \
+            is_datum(entities[best_idx]) and not is_datum(ent)
+        if d < best_dist or drawn_over:
             best_dist = d
             best_idx  = i
     return best_idx

@@ -550,7 +550,8 @@ class ExtrudeMixin:
         pos = np.array(mesh.topo_verts[vertex_idx], dtype=float)
         panel = getattr(self, '_extrude_panel', None)
         if panel is not None:
-            panel.set_vertex_target(pos)
+            panel.set_vertex_target(pos, _picked_vertex_source(
+                self.history, body_id, mesh.shape, pos))
         return True
 
     def route_edge_pick_for_extrude(self, edge_idx: int, body_id: str) -> bool:
@@ -560,21 +561,18 @@ class ExtrudeMixin:
         mesh = self._meshes.get(body_id)
         if mesh is None or edge_idx >= len(mesh.topo_edges_occ):
             return False
-        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from cad.op_extrude import edge_tangent
+        occ = mesh.topo_edges_occ[edge_idx]
         try:
-            adp = BRepAdaptor_Curve(mesh.topo_edges_occ[edge_idx])
-            mid = (adp.FirstParameter() + adp.LastParameter()) * 0.5
-            d   = adp.DN(mid, 1)
-            vec = np.array([d.X(), d.Y(), d.Z()], dtype=float)
-            norm = np.linalg.norm(vec)
-            if norm < 1e-10:
-                return False
-            vec /= norm
+            vec = edge_tangent(occ)
         except Exception as ex:
             print(f"[Extrude] Edge tangent failed: {ex}"); return False
+        if vec is None:
+            return False
         panel = getattr(self, '_extrude_panel', None)
         if panel is not None:
-            panel.set_direction(vec)
+            panel.set_direction(vec, _picked_edge_source(self.history, body_id,
+                                                         mesh.shape, occ))
         return True
 
     # ------------------------------------------------------------------
@@ -768,6 +766,9 @@ class ExtrudeMixin:
         common = dict(
             direction     = direction.tolist() if direction is not None else None,
             target_vertex = ex.get('target_vertex'),
+            vertex_source = ex.get('vertex_source'),
+            vertex_side   = int(ex.get('vertex_side', 0)),
+            direction_source = ex.get('direction_source'),
             start_offset  = float(ex.get('start_offset', 0.0)),
             end_offset    = float(ex.get('end_offset', 0.0)),
             draft_angle   = float(ex.get('draft_angle', 0.0)))
@@ -790,7 +791,12 @@ class ExtrudeMixin:
                 getattr(self, '_editing_history_idx', None) is None:
             return
         panel = self._extrude_panel
-        target_vertex = getattr(panel, '_target_vertex', None)
+        by_vertex     = panel is not None and panel._target_group.checkedId() == 1
+        target_vertex = panel._target_vertex if by_vertex else None
+        target_source = panel._target_source if by_vertex else None
+        vertex_side   = -1 if by_vertex and panel._flip else 1
+        dir_source    = (panel._direction_source
+                         if panel is not None and panel._direction is not None else None)
         start_off     = (panel._start_offset.mm_value() or 0.0) if panel else 0.0
         end_off       = (panel._end_offset.mm_value()   or 0.0) if panel else 0.0
         draft_angle   = panel.draft_angle_deg() if panel else 0.0
@@ -809,6 +815,11 @@ class ExtrudeMixin:
         extra = {}
         if target_vertex is not None:
             extra['target_vertex'] = target_vertex.tolist()
+            extra['vertex_side'] = vertex_side
+            if target_source is not None:
+                extra['vertex_source'] = target_source
+        if dir_source is not None:
+            extra['direction_source'] = dir_source
         if start_off != 0.0:
             extra['start_offset'] = start_off
         if end_off != 0.0:
@@ -858,6 +869,9 @@ class ExtrudeMixin:
         common = dict(
             direction     = direction.tolist() if direction is not None else None,
             target_vertex = ex.get('target_vertex'),
+            vertex_source = ex.get('vertex_source'),
+            vertex_side   = int(ex.get('vertex_side', 0)),
+            direction_source = ex.get('direction_source'),
             start_offset  = float(ex.get('start_offset', 0.0)),
             end_offset    = float(ex.get('end_offset',   0.0)),
             draft_angle   = float(ex.get('draft_angle',  0.0)))
@@ -983,6 +997,32 @@ def _extrude_distance_dialog(parent) -> float | None:
     if dlg.exec() != QDialog.DialogCode.Accepted:
         return None
     return spinbox.mm_value()
+
+
+def _picked_edge_source(history, body_id, shape, occ_edge) -> dict | None:
+    """The picked direction edge as a serialized BodyEdgeSource, or None."""
+    from cad.edge_ref import EdgeRef, BodyEdgeSource
+    from cad.serializer import _edge_source_to_dict
+    try:
+        occ = getattr(shape, "wrapped", shape)
+        ref = EdgeRef.for_edge(history, body_id, occ_edge, occ, history.cursor + 1)
+        return None if ref is None else _edge_source_to_dict(
+            BodyEdgeSource(body_id, ref, ref.origin))
+    except Exception as ex:
+        print(f"[Extrude] picked direction won't follow edits: {ex}")
+        return None
+
+
+def _picked_vertex_source(history, body_id, shape, pos) -> dict | None:
+    """The picked vertex as a serialized source, or None if it has no edges."""
+    from cad.edge_ref import vertex_source_at
+    from cad.serializer import _edge_source_to_dict
+    try:
+        return _edge_source_to_dict(vertex_source_at(
+            history, body_id, shape, pos, history.cursor + 1))
+    except Exception as ex:
+        print(f"[Extrude] picked vertex won't follow edits: {ex}")
+        return None
 
 
 def _panel_bindings(panel, distance_from_field: bool) -> dict:

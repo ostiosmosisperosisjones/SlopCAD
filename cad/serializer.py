@@ -116,8 +116,10 @@ def _plane_source_from_dict(d: dict | None):
 def _edge_source_to_dict(es) -> dict | None:
     if es is None:
         return None
-    from cad.edge_ref import BodyEdgeSource, SketchEdgeSource
+    from cad.edge_ref import BodyEdgeSource, BodyVertexSource, SketchEdgeSource
     d = es.to_dict()
+    if isinstance(es, BodyVertexSource):
+        d["edges"] = [_edge_source_to_dict(e) for e in es.edges]
     if isinstance(es, BodyEdgeSource):
         er = es.edge_ref
         d["edge_ref"] = {
@@ -148,12 +150,17 @@ def _edge_source_from_dict(d: dict | None):
         from cad.face_origin import edge_origin_from_dict
         return BodyEdgeSource(body_id=d["body_id"], edge_ref=er,
                               origin=edge_origin_from_dict(d.get("origin")))
+    if t == "body_vertex":
+        from cad.edge_ref import BodyVertexSource
+        return BodyVertexSource([_edge_source_from_dict(e) for e in d["edges"]],
+                                d["point"])
     if t == "sketch_edge":
         from cad.edge_ref import SketchEdgeSource
         if "source_entry_id" in d:
             return SketchEdgeSource(
                 source_entry_id = str(d["source_entry_id"]),
                 entity_idx      = int(d["entity_idx"]),
+                entity_uid      = d.get("entity_uid"),
             )
         # Legacy v1: integer history_idx — resolved to a UUID in a post-load
         # pass once history._entries is populated.
@@ -330,6 +337,7 @@ def _snapshot_from_dict(d) -> tuple:
 
 
 def _sketch_entry_to_dict(se) -> dict:
+    from cad.sketch import links_to_list
     return {
         "plane_origin":   _arr(se.plane_origin),
         "plane_x_axis":   _arr(se.plane_x_axis),
@@ -342,11 +350,13 @@ def _sketch_entry_to_dict(se) -> dict:
         "entities":       [_entity_to_dict(e) for e in se.entities],
         "constraints":    [_constraint_to_dict(c) for c in se.constraints],
         "undo_snapshots": [_snapshot_to_list(s) for s in getattr(se, 'undo_snapshots', [])],
+        "links":          links_to_list(se.links),
+        "rev":            se.rev,
     }
 
 
 def _sketch_entry_from_dict(d: dict):
-    from cad.sketch import SketchEntry
+    from cad.sketch import SketchEntry, links_from_list
     return SketchEntry(
         plane_origin   = d["plane_origin"],
         plane_x_axis   = d["plane_x_axis"],
@@ -359,6 +369,8 @@ def _sketch_entry_from_dict(d: dict):
         plane_source   = _plane_source_from_dict(d.get("plane_source")),
         constraints    = [_constraint_from_dict(c) for c in d.get("constraints", [])],
         undo_snapshots = [_snapshot_from_dict(s) for s in d.get("undo_snapshots", [])],
+        links          = links_from_list(d.get("links")),
+        rev            = d.get("rev"),
     )
 
 
@@ -444,6 +456,7 @@ def save(workspace, history, camera=None) -> bytes:
         "history_cursor":      history._cursor,
         "entries":             entries,
         "parameters":          history.params.to_list(),
+        "good_states":         history.good_states,
     }
 
     if camera is not None:
@@ -541,6 +554,7 @@ def load(data: bytes):
 
     from cad.params import ParamTable
     history.params = ParamTable.from_list(doc.get("parameters"))
+    history.good_states = doc.get("good_states", [])
     history.embedded = embedded
 
     # v1 → v2 migration: SketchEdgeSource used to be keyed by an integer

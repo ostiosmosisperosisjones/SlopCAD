@@ -61,13 +61,18 @@ class DivideTool(BaseTool):
         joints = _tied_joints(target, target_idx, pieces, entities)
         sketch.push_undo_snapshot()
         from cad.sketch import splice_entities, SketchConstraint
+        from cad.sketch_tools.trim import orientation_of, carry_orientation
+        orient = orientation_of(sketch, target_idx)
         splice_entities(sketch, target_idx, target_idx + 1, pieces)
         # A mid/on tie at a cut point becomes a plain shared end; keep that
         # end on the original line by keeping the pieces either side of it
         # collinear (parallel + shared point) — "mid" downgrades to "on".
+        hv = carry_orientation(sketch, orient, target_idx, len(pieces))
         for k in joints:
-            sketch.constraints.append(SketchConstraint(
-                'parallel', (target_idx + k, target_idx + k + 1), 0.0))
+            a, b = target_idx + k, target_idx + k + 1
+            if a in hv and b in hv:
+                continue        # both horizontal / vertical: collinear already
+            sketch.constraints.append(SketchConstraint('parallel', (a, b), 0.0))
         return True
 
     def cancel(self) -> None:

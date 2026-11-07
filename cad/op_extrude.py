@@ -6,6 +6,7 @@ Extrude and sketch operation types:
 """
 
 from __future__ import annotations
+import math
 from cad.solid_ref import as_compound
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
@@ -197,10 +198,128 @@ def _profile_common_kwargs(params: dict) -> dict:
     return dict(
         direction      = params.get("direction"),
         target_vertex  = params.get("target_vertex"),
+        vertex_source  = params.get("vertex_source"),
+        vertex_side    = int(params.get("vertex_side", 0)),
+        direction_source = params.get("direction_source"),
         start_offset   = float(params.get("start_offset", 0.0)),
         end_offset     = float(params.get("end_offset", 0.0)),
         draft_angle    = float(params.get("draft_angle", 0.0)),
     )
+
+
+def _find_vertex_source(history, point, before_index, entry):
+    """A save from before vertex sources: bind the stored world point to the
+    body vertex sitting exactly there, or None if none does (the part moved
+    on since that point was stored, so nothing says which vertex it was)."""
+    from cad.edge_ref import vertex_source_at
+    if history._workspace is None:
+        return None
+    bids = [entry.body_id] + [b for b in history._workspace.bodies if b != entry.body_id]
+    for bid in bids:
+        shape = history._shape_for_body_at(bid, before_index)
+        if shape is not None:
+            src = vertex_source_at(history, bid, shape, point, before_index)
+            if src is not None:
+                return src
+    return None
+
+
+def edge_tangent(occ_edge):
+    """Unit tangent at the middle of an edge (the panel's edge pick), or None."""
+    import numpy as np
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    adp = BRepAdaptor_Curve(occ_edge)
+    d = adp.DN((adp.FirstParameter() + adp.LastParameter()) * 0.5, 1)
+    vec = np.array([d.X(), d.Y(), d.Z()], dtype=float)
+    norm = float(np.linalg.norm(vec))
+    return None if norm < 1e-10 else vec / norm
+
+
+def _follow_direction_edge(op, history, entry_index) -> None:
+    """A direction picked from an edge follows that edge: re-find it and take
+    its tangent, turned to the side of the last direction (a re-found edge can
+    run the other way).  A lost edge is an error, not the stale vector."""
+    import numpy as np
+    from cad.serializer import _edge_source_from_dict, _edge_source_to_dict
+    if not op.direction_source or op.direction is None:
+        return
+    before = history.fanout_members(entry_index)[0]
+    src = _edge_source_from_dict(op.direction_source)
+    try:
+        if src.origin is not None:
+            # Named by its faces: found exactly or not at all.  The fuzzy
+            # fallback could hand back a neighbour and turn the op silently.
+            shape = history._shape_for_body_at(src.body_id, before)
+            if shape is None:
+                raise RuntimeError("its body has no shape")
+            # EdgeOrigin settles for one face when the other is missing.
+            if any(f.find_in(history, shape)[1] is None
+                   for f in getattr(src.origin, "faces", [])):
+                raise RuntimeError("a face it lies on is gone")
+            found = src.origin.find_in(history, shape)
+            if found is None:
+                raise RuntimeError("its faces no longer meet")
+            occ = [found]
+        else:
+            occ = src.resolve(history, before)[1]
+        t = edge_tangent(occ[0]) if occ else None
+    except Exception as ex:
+        raise RuntimeError(f"direction edge is gone, edit the op and pick the "
+                           f"direction edge again ({ex})") from ex
+    if t is None:
+        raise RuntimeError("direction edge has no tangent")
+    if float(np.dot(t, np.asarray(op.direction, dtype=float))) < 0:
+        t = -t
+    op.direction = t.tolist()
+    op.direction_source = _edge_source_to_dict(src)
+    entry = history._entries[entry_index]
+    entry.params.update(direction=op.direction, direction_source=op.direction_source)
+
+
+def _follow_target_vertex(op, history, entry_index, face) -> None:
+    """Re-find an up-to-vertex target and re-measure the depth to it, the way
+    the panel does: along the direction until the end plane (parallel to the
+    profile *face*) passes through the vertex.  A vertex that is gone is an
+    error rather than a depth nobody asked for; a save that never recorded
+    which vertex it was keeps its depth, with a warning."""
+    import numpy as np
+    from build123d import Plane
+    from cad.serializer import _edge_source_from_dict, _edge_source_to_dict
+    if op.target_vertex is None:
+        return
+    entry = history._entries[entry_index]
+    # All of a fan-out measures on the part as it was before the first cut.
+    before = history.fanout_members(entry_index)[0]
+    src = (_edge_source_from_dict(op.vertex_source) if op.vertex_source
+           else _find_vertex_source(history, op.target_vertex, before, entry))
+    if src is None:
+        entry.warning = ("Up-to-vertex target not found on the part; depth kept "
+                         "as saved. Edit the op and pick the vertex again.")
+        print(f"[Extrude] Entry {entry_index}: {entry.warning}")
+        return
+    try:
+        v = np.asarray(src.resolve(history, before)[0][0], dtype=float)
+    except Exception as ex:
+        raise RuntimeError(f"up-to-vertex target is gone, edit the op and pick "
+                           f"the vertex again ({ex})") from ex
+    plane = Plane(face)
+    n = np.array([plane.z_dir.X, plane.z_dir.Y, plane.z_dir.Z], dtype=float)
+    o = np.array([plane.origin.X, plane.origin.Y, plane.origin.Z], dtype=float)
+    d = op._direction(history)
+    d = n if d is None else d / np.linalg.norm(d)
+    cos = float(np.dot(d, n))
+    if abs(cos) < 1e-6:
+        raise RuntimeError("up-to-vertex: direction runs along the profile plane")
+    reach = float(np.dot(v - o, n)) / cos
+    side = op.vertex_side or (1 if reach >= 0 else -1)
+    if reach * side < 0.001:
+        raise RuntimeError("up-to-vertex target is no longer ahead of the profile")
+    op.distance = math.copysign(reach * side, op.distance)
+    op.target_vertex = v.tolist()
+    op.vertex_source = _edge_source_to_dict(src)
+    op.vertex_side = side
+    entry.params.update(distance=abs(op.distance), target_vertex=op.target_vertex,
+                        vertex_source=op.vertex_source, vertex_side=side)
 
 
 def _legacy_sketch_profile(sketch_id, params: dict):
@@ -230,6 +349,13 @@ class ExtrudeOp(Op):
     distance       : signed mm — positive = extrude, negative = cut
     direction      : unit vector or None (None → each face's normal)
     target_vertex  : world-space point the depth is measured to, or None
+    vertex_source  : serialized BodyVertexSource for it; replay re-finds the
+                     vertex and re-measures distance (_follow_target_vertex)
+    vertex_side    : +1 direction heads at the vertex, -1 away from it (the
+                     panel's flip); 0 → not recorded, taken at first replay
+    direction_source : serialized BodyEdgeSource when `direction` was picked
+                     from an edge; replay re-reads the edge's tangent
+                     (_follow_direction_edge)
     start_offset   : mm offset applied to the near end of the tool solid
     end_offset     : mm offset applied to the far end
     draft_angle    : taper angle in degrees (signed)
@@ -250,6 +376,9 @@ class ExtrudeOp(Op):
     distance:       float              = 0.0
     direction:      list[float] | None = None
     target_vertex:  list[float] | None = None
+    vertex_source:  dict | None = None
+    vertex_side:    int   = 0
+    direction_source: dict | None = None
     start_offset:   float = 0.0
     end_offset:     float = 0.0
     draft_angle:    float = 0.0
@@ -412,7 +541,11 @@ class ExtrudeOp(Op):
         faces = []
         for p in free:
             faces.extend(p.resolve(history, entry_index, name))
+        _follow_direction_edge(self, history, entry_index)
         direction = self._direction(history)
+        if self.target_vertex is not None:
+            first = faces[0] if faces else glued[0].locate(shape, name)[1]
+            _follow_target_vertex(self, history, entry_index, first)
 
         # Merge: the entry is tagged to merge_body_id, so `shape` IS the
         # target's current shape — rebuild the tool and fuse it in, exactly
@@ -604,6 +737,12 @@ class ExtrudeOp(Op):
             p["direction"] = list(self.direction)
         if self.target_vertex is not None:
             p["target_vertex"] = self.target_vertex
+        if self.vertex_source is not None:
+            p["vertex_source"] = self.vertex_source
+        if self.vertex_side:
+            p["vertex_side"] = self.vertex_side
+        if self.direction_source is not None:
+            p["direction_source"] = self.direction_source
         if self.start_offset:
             p["start_offset"] = self.start_offset
         if self.end_offset:
@@ -662,7 +801,7 @@ def _restore_extrude_fields(panel, entry, op) -> None:
     """Direction / offsets / draft / depth back into a reopened extrude panel."""
     import numpy as np
     if op.direction is not None:
-        panel.set_direction(np.array(op.direction, dtype=float))
+        panel.set_direction(np.array(op.direction, dtype=float), op.direction_source)
     exprs = entry.params.get("exprs", {})
     if op.start_offset or "start_offset" in exprs:
         panel._start_offset.set_binding(exprs.get("start_offset"), op.start_offset)
@@ -673,7 +812,11 @@ def _restore_extrude_fields(panel, entry, op) -> None:
     if op.target_vertex is not None:
         panel._radio_vertex.setChecked(True)
         panel._on_target_mode_changed(1)
-        panel.set_vertex_target(np.array(op.target_vertex, dtype=float))
+        if op.vertex_side < 0:          # authored flipped: keep heading away
+            panel._flip_btn.setChecked(True)
+            panel._on_flip(True)
+        panel.set_vertex_target(np.array(op.target_vertex, dtype=float),
+                                op.vertex_source)
     else:
         panel._spinbox.set_binding(exprs.get("distance"), abs(op.distance))
     panel._emit_preview()
@@ -696,7 +839,8 @@ class CrossBodyCutOp(Op):
     direction    : unit vector the tool extends along (same convention as the
                    preview: outward from the picked face, or whatever the user
                    flipped to).  None → each face's inward normal.
-    target_vertex, start_offset, end_offset, draft_angle : as ExtrudeOp
+    target_vertex, vertex_source, vertex_side, start_offset, end_offset,
+    draft_angle : as ExtrudeOp
     along_normal : ±1 → `direction` follows the first sketch's normal; see
                    ExtrudeOp.along_normal / bind_along_normal().
     """
@@ -705,6 +849,9 @@ class CrossBodyCutOp(Op):
     distance:      float              = 0.0
     direction:     list[float] | None = None
     target_vertex: list[float] | None = None
+    vertex_source: dict | None = None
+    vertex_side:   int   = 0
+    direction_source: dict | None = None
     start_offset:  float = 0.0
     end_offset:    float = 0.0
     draft_angle:   float = 0.0
@@ -783,6 +930,9 @@ class CrossBodyCutOp(Op):
         from cad.operations.boolean import bool_op
         _fill_legacy_face_refs(self.profiles, history._entries[entry_index])
         faces = faces_of(self.profiles, history, entry_index, "CrossBodyCutOp")
+        _follow_direction_edge(self, history, entry_index)
+        if faces:
+            _follow_target_vertex(self, history, entry_index, faces[0])
         tool = self.tool_solid(faces, normal=self._direction(history))
         result = bool_op("cut", [shape], [tool])
         if result is None:
@@ -898,6 +1048,12 @@ class CrossBodyCutOp(Op):
             p["direction"] = list(self.direction)
         if self.target_vertex is not None:
             p["target_vertex"] = self.target_vertex
+        if self.vertex_source is not None:
+            p["vertex_source"] = self.vertex_source
+        if self.vertex_side:
+            p["vertex_side"] = self.vertex_side
+        if self.direction_source is not None:
+            p["direction_source"] = self.direction_source
         if self.start_offset:
             p["start_offset"] = self.start_offset
         if self.end_offset:

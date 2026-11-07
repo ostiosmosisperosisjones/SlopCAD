@@ -45,14 +45,16 @@ MODE_LABELS = {
 
 
 def _nearest_arc(pt, entities, tol: float = 5.0) -> int | None:
-    """Closest arc/circle by its rim or its centre, within tol mm."""
-    from cad.sketch import ArcEntity
+    """Closest arc/circle, drawn or included, by its rim or its centre,
+    within tol mm."""
+    from cad.sketch import circle_of
     best_idx, best_dist = None, tol
     for i, ent in enumerate(entities):
-        if not isinstance(ent, ArcEntity):
+        circ = circle_of(ent)
+        if circ is None:
             continue
-        r = float(np.linalg.norm(pt - ent.center))
-        d = min(r, abs(r - ent.radius))
+        r = float(np.linalg.norm(pt - circ[0]))
+        d = min(r, abs(r - circ[1]))
         if d < best_dist:
             best_idx, best_dist = i, d
     return best_idx
@@ -150,25 +152,24 @@ class GeometricConstraintTool(BaseTool):
         if idx == self._first_idx:
             return True
 
-        from cad.sketch import SketchConstraint, SketchEntry, ReferenceEntity, ArcEntity
+        from cad.sketch import (SketchConstraint, SketchEntry, ReferenceEntity,
+                                circle_of)
         ref_idx, mov_idx = self._first_idx, idx
         self._first_idx = None
         is_ref = lambda i: isinstance(sketch.entities[i], ReferenceEntity)
         if is_ref(ref_idx) and is_ref(mov_idx):
             return True          # both fixed: nothing for the solver to move
+        arc = lambda i: circle_of(sketch.entities[i]) is not None
         if self._mode == 'tangent':
-            from cad.sketch import ArcEntity
-            arc = lambda i: isinstance(sketch.entities[i], ArcEntity)
+            # (arc, other); with an included line it's the arc that moves.
+            if not arc(ref_idx) or (is_ref(ref_idx) and arc(mov_idx)):
+                ref_idx, mov_idx = mov_idx, ref_idx
             if not arc(ref_idx):
-                ref_idx, mov_idx = mov_idx, ref_idx     # (arc, other)
-            if not arc(ref_idx) or is_ref(mov_idx):
                 print("[Sketch] Tangent needs an arc/circle and a line or arc")
                 return True
         elif self._mode == 'equal' and any(
-                isinstance(sketch.entities[i], ArcEntity)
-                for i in (ref_idx, mov_idx)) and not all(
-                isinstance(sketch.entities[i], ArcEntity)
-                for i in (ref_idx, mov_idx)):
+                arc(i) for i in (ref_idx, mov_idx)) and not all(
+                arc(i) for i in (ref_idx, mov_idx)):
             print("[Sketch] Equal needs two lines (length) or two arcs/circles (radius)")
             return True
         elif is_ref(mov_idx):
@@ -182,9 +183,9 @@ class GeometricConstraintTool(BaseTool):
         )
         tmp = SketchEntry.from_sketch_mode(sketch)
         # Circles: the second pick moves / resizes to match the first.
-        arcs = isinstance(sketch.entities[mov_idx], ArcEntity) and \
-            isinstance(sketch.entities[ref_idx], ArcEntity)
-        if tmp.apply_constraints_local({mov_idx} if arcs else None):
+        arcs = arc(mov_idx) and arc(ref_idx)
+        if tmp.apply_constraints_local(
+                {ref_idx if is_ref(mov_idx) else mov_idx} if arcs else None):
             _writeback_entities(sketch, tmp)
         else:
             sketch.constraints.pop()

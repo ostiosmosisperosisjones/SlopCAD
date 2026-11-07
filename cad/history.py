@@ -73,6 +73,9 @@ class History:
         self._workspace: Any = None   # set by Workspace after construction
         from cad.params import ParamTable
         self.params = ParamTable()
+        # Recent parameter sets the document rebuilt cleanly with, oldest
+        # first (see "Known-good states" below).  Saved with the file.
+        self.good_states: list[dict] = []
         # Evaluated parameter values, cached for the duration of one replay
         # (sketch replay reads them via param_values()).
         self._param_cache: tuple | None = None
@@ -491,6 +494,9 @@ class History:
                 # found so later parameter changes match by identity.
                 from cad.profile_source import persist_backfilled_boundaries
                 persist_backfilled_boundaries(op, entry.params)
+                # Likewise a rim saved before rim origins (cad.face_origin).
+                if getattr(op, "edge_refs", None) and "edge_refs" in entry.params:
+                    entry.params["edge_refs"] = [r.to_dict() for r in op.edge_refs]
 
                 # Split op: the parent keeps only its own solid(s). execute()
                 # returns the FULL multi-solid boolean result (both halves of a
@@ -537,6 +543,8 @@ class History:
             self._replay_shape_cache = None
             self._param_cache = None
 
+        if not first_error and len(self.params.params):
+            self._remember_good(self.params.evaluate()[0], self.params.to_list())
         return (not first_error), first_error, mutated_bodies
 
     # ------------------------------------------------------------------
@@ -603,8 +611,9 @@ class History:
         """Add/replace a parameter and replay everything it affects.
         Raises ParamError if the parameter itself doesn't evaluate."""
         before, _ = self.params.evaluate()
+        items = self.params.to_list()
         self.params.set(param)
-        return self._replay_for_params(before)
+        return self._replay_for_params(before, items)
 
     def remove_param(self, name: str) -> None:
         """Remove an unused parameter.  Raises ParamError if params or
@@ -621,6 +630,7 @@ class History:
         change, so no replay is needed."""
         from cad.expression import rename_ref
         self.params.rename(old, new)
+        self.good_states.clear()         # keyed by the old name
         for e in self._entries:
             for b in e.params.get("exprs", {}).values():
                 b["expr"] = rename_ref(b["expr"], old, new)
@@ -634,15 +644,111 @@ class History:
         changed value."""
         from cad.params import ParamTable
         before, _ = self.params.evaluate()
+        old_items = self.params.to_list()
         self.params = ParamTable.from_list(items)
-        return self._replay_for_params(before)
+        return self._replay_for_params(before, old_items)
 
-    def _replay_for_params(self, before: dict) -> tuple[bool, str, set[str]]:
+    def _replay_for_params(self, before: dict,
+                           before_items: list | None = None) -> tuple[bool, str, set[str]]:
+        """Replay what the change from values *before* affects.
+        before_items: the table those values came from; the state the
+        document is leaving is remembered under it if it was a good one."""
+        if before_items is not None:
+            self._remember_good(before, before_items)
         after, _ = self.params.evaluate()
         users = self.param_users(self._changed_params(before, after))
         if not users:
             return True, "", set()
+        state = self._good_state_for(after)
+        if state is not None:
+            self._restore_good(state, users[0])
         return self.replay_from(users[0])
+
+    # ------------------------------------------------------------------
+    # Known-good states
+    # ------------------------------------------------------------------
+    # A sketch's solved coordinates are the only record of where its free
+    # geometry was, and each solve starts from the last one, so the outcome
+    # can depend on the path taken and a failed replay leaves its mark.  So
+    # the sketches are remembered each time the document builds cleanly, by
+    # parameter values: entering those values again brings back exactly that
+    # state, and revert_to_good() gets back to the latest one from anywhere.
+
+    MAX_GOOD_STATES = 12
+
+    def _sketches(self):
+        return [(i, e, e.params["sketch_entry"]) for i, e in enumerate(self._entries)
+                if e.params.get("sketch_entry") is not None]
+
+    def _doc_signature(self) -> list:
+        """Which entries and which version of each sketch a state is for."""
+        return [[e.entry_id, se.rev if (se := e.params.get("sketch_entry")) else None]
+                for e in self._entries]
+
+    def _doc_is_good(self) -> bool:
+        """Built with nothing failed or patched up: no errors, no warnings,
+        no lost includes, no line crushed to nothing."""
+        from cad.sketch import LineEntity
+        if any(e.error or e.warning for e in self._entries):
+            return False
+        for _, _, se in self._sketches():
+            if getattr(se, "stale_includes", None):
+                return False
+            if any(isinstance(l, LineEntity) and np.linalg.norm(l.p1 - l.p0) < 1e-6
+                   for l in se.entities):
+                return False
+        return True
+
+    def _remember_good(self, values: dict, items: list) -> None:
+        if not self._entries or not items or not self._doc_is_good():
+            return
+        from cad.sketch import sketch_geometry
+        state = {
+            "values":    {k: float(v.value) for k, v in values.items()},
+            "items":     items,
+            "signature": self._doc_signature(),
+            # Only sketches a parameter can move need restoring: bound
+            # dimensions, or includes of something a parameter moves.
+            "sketches":  {e.entry_id: sketch_geometry(se) for _, e, se in self._sketches()
+                          if se.links is not None
+                          or any(getattr(c, "expr", None) for c in se.constraints)},
+        }
+        self.good_states = [s for s in self.good_states
+                            if s["values"] != state["values"]]
+        self.good_states.append(state)
+        del self.good_states[:-self.MAX_GOOD_STATES]
+
+    def _good_state_for(self, values: dict) -> dict | None:
+        """The state remembered for these parameter values, if it still fits
+        this document.  Parameters added or removed since don't matter."""
+        sig = self._doc_signature()
+        for s in reversed(self.good_states):
+            common = set(s["values"]) & set(values)
+            if s["signature"] == sig and common and all(
+                    abs(s["values"][k] - values[k].value) < 1e-9 for k in common):
+                return s
+        return None
+
+    def _restore_good(self, state: dict, from_index: int = 0) -> None:
+        from cad.sketch import restore_sketch_geometry
+        for i, e, se in self._sketches():
+            if i >= from_index and e.entry_id in state["sketches"]:
+                restore_sketch_geometry(se, state["sketches"][e.entry_id])
+
+    def last_good(self) -> dict | None:
+        """The latest good state that fits this document, or None."""
+        sig = self._doc_signature()
+        return next((s for s in reversed(self.good_states) if s["signature"] == sig), None)
+
+    def revert_to_good(self) -> tuple[bool, str, set[str]]:
+        """Back to the parameters and sketches of the latest good state."""
+        from cad.params import ParamTable
+        state = self.last_good()
+        if state is None:
+            return False, "No working state remembered for this document", set()
+        self.params = ParamTable.from_list(state["items"])
+        self._restore_good(state)
+        return self.replay_from(0)
 
     # Legacy name — kept so existing viewer/serializer call sites keep working.
     # Both names invoke the same unified replay; pick replay_from() in new code.
@@ -754,8 +860,12 @@ def _replay_sketch_entry(se, history: History, before_index: int,
             se.entities[i].occ_edges = None
 
     # Where drawn points sit on includes, measured before the includes move.
-    from cad.sketch import include_attachments, attachment_targets, _drawn_points
-    attachments = include_attachments(se) if ref_updates else []
+    from cad.sketch import (include_attachments, attachment_targets, _drawn_points,
+                            remember_links)
+    attachments = include_attachments(se, trust_links=True) if ref_updates else []
+    if ref_updates:
+        remember_links(se, attachments)
+    sides = se.dimension_sides() if ref_updates else None
     before = {id(ent): [p.copy() for p in ent.points] for ent, _, _ in ref_updates}
 
     # All resolved successfully — now commit.
@@ -800,6 +910,8 @@ def _replay_sketch_entry(se, history: History, before_index: int,
         d_old, d_new = old[-1] - old[0], new[-1] - new[0]
         if np.linalg.norm(d_old) > 1e-6 and float(d_old @ d_new) < 0:
             ent.points = new[::-1]
+    from cad.sketch import refresh_ref_circles
+    refresh_ref_circles(se)
 
     # Re-resolving an unchanged include jitters by ~1e-7; only a real move
     # is worth a re-solve.
@@ -821,7 +933,11 @@ def _replay_sketch_entry(se, history: History, before_index: int,
     # not: one left only on a sliding constraint gets dragged along its
     # include by the snap implicit lengths of lines whose other end moved.
     pins = targets if (any_pin_moved or refs_moved) else {}
-    return _resolve_bound_dimensions(se, history, pins, attachments, refs_moved)
+    se._held_sides = sides
+    try:
+        return _resolve_bound_dimensions(se, history, pins, attachments, refs_moved)
+    finally:
+        se._held_sides = None
 
 
 def _resolve_bound_dimensions(se, history: History, pins: dict | None = None,
