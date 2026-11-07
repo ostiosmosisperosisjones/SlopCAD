@@ -971,6 +971,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             getattr(self, '_chamfer_pick_face', False) or
             getattr(self, '_offset_plane_face_active', False) or
             getattr(self, '_helix_pick_active', False) or
+            getattr(self, '_loft_profile_pick_active', False) or
+            getattr(self, '_sweep_profile_pick_active', False) or
             (thicken is not None and getattr(thicken, '_picking_face', False)) or
             (getattr(self, '_shell_panel', None) is not None and
              self._shell_panel._picking_face))
@@ -1023,6 +1025,10 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         self.update(); return True
                     if self.route_sketch_face_pick_for_revolve(hidx, fidx):
                         self.update(); return True
+                    if self.route_sketch_face_pick_for_loft(hidx, fidx):
+                        self.update(); return True
+                    if self.route_sketch_face_pick_for_sweep(hidx, fidx):
+                        self.update(); return True
             body_id, idx = self._pick_at(e.position())
             if idx is not None:
                 if self.route_face_pick_for_fillet3d(body_id, idx):
@@ -1041,6 +1047,12 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                     return True
                 if self.route_face_pick_for_helix(body_id, idx):
                     return True
+                if self.route_face_pick_for_loft(body_id, idx):
+                    self.update(); return True
+                if self.route_face_pick_for_sweep(body_id, idx):
+                    self.update(); return True
+                if self.route_face_pick_for_coil(body_id, idx):
+                    self.update(); return True
         return False
 
     def _begin_interaction(self):
@@ -2439,6 +2451,15 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                 if idx is not None and self.route_body_pick_for_revolve(body_id):
                     return
                 if idx is not None and self.route_face_pick_for_offset_plane(body_id, idx):
+                    return
+                if idx is not None and self.route_face_pick_for_loft(body_id, idx):
+                    self.update()
+                    return
+                if idx is not None and self.route_face_pick_for_sweep(body_id, idx):
+                    self.update()
+                    return
+                if idx is not None and self.route_face_pick_for_coil(body_id, idx):
+                    self.update()
                     return
                 if idx is not None and self.route_body_pick_for_loft(body_id):
                     return

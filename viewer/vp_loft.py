@@ -24,6 +24,10 @@ class LoftMixin:
             return
         self._show_loft_panel()
         p = self._loft_panel
+        for f in self.selection.faces:          # preselected body faces, in order
+            row = self._body_face_row(f.body_id, f.face_idx)
+            if row is not None:
+                p.add_profile_key(*row)
         self._arm_pick(p._pick_profile_btn, p._on_pick_profile_toggle)
 
     def _show_loft_panel(self):
@@ -103,13 +107,10 @@ class LoftMixin:
             return
 
         # Populate profile list
-        for sid, face_idx in op.from_profiles:
-            sidx = self.history.id_to_index(sid)
-            if sidx is None:
-                continue
-            label = (f"Sketch {sidx}" if face_idx is None
-                     else f"Sketch {sidx}  ·  face {face_idx}")
-            panel.add_profile(sid, label, face_idx=face_idx)
+        for prof in op.from_profiles:
+            row = self._profile_row(prof)
+            if row is not None:
+                panel.add_profile_key(*row)
 
         # Restore mode + target body
         # A fan-out member's cut_body_id is just one of the bodies it hit.
@@ -170,8 +171,12 @@ class LoftMixin:
 
         # Seek to idx-1 so the rebuild after delete is consistent.
         self.history.seek(max(idx - 1, 0))
+        keep_id = (self.history.entries[min(group_indices)].entry_id, min(group_indices))
         for j in reversed(group_indices):
             self.history.delete(j)
+        # The re-commit keeps the entry id: downstream refs name it (revolve /
+        # extrude cap and chamfer face origins of planes and edge picks).
+        self.history.reuse_entry_id(*keep_id)
         for bid in removable_bodies:
             if bid in self.workspace.bodies:
                 self.workspace.remove_body(bid)
@@ -324,6 +329,50 @@ class LoftMixin:
             panel.remove_profile(sid, key_face_idx)
         else:
             panel.add_profile(sid, label, face_idx=key_face_idx)
+        return True
+
+    def _profile_row(self, prof):
+        """(panel key, label) for a ProfileSource as of the current state, or
+        None when its sketch / face is gone.  A body face is re-found by its
+        ref so the key's index is the face's index now."""
+        from cad.profile_source import SketchProfile
+        if isinstance(prof, SketchProfile):
+            sidx = self.history.id_to_index(prof.sketch_id)
+            if sidx is None:
+                return None
+            fi = prof.single_index()
+            label = (f"Sketch {sidx}" if fi is None
+                     else f"Sketch {sidx}  ·  face {fi}")
+            return (prof.sketch_id, fi), label
+        body = self.workspace.bodies.get(prof.body_id)
+        shape = self.workspace.current_shape(prof.body_id)
+        if body is None or shape is None:
+            return None
+        try:
+            fi, _face = prof.locate(shape)
+        except RuntimeError:
+            return None
+        return ("face", prof.body_id, fi), f"{body.name}  ·  face {fi}"
+
+    def _body_face_row(self, body_id: str, face_idx: int):
+        body = self.workspace.bodies.get(body_id)
+        shape = self.workspace.current_shape(body_id)
+        if body is None or shape is None or not 0 <= face_idx < len(shape.faces()):
+            return None
+        return ("face", body_id, face_idx), f"{body.name}  ·  face {face_idx}"
+
+    def route_face_pick_for_loft(self, body_id: str, face_idx: int) -> bool:
+        """Add (or toggle off) a body face as a loft profile."""
+        if not getattr(self, '_loft_profile_pick_active', False):
+            return False
+        panel = getattr(self, '_loft_panel', None)
+        row = self._body_face_row(body_id, face_idx)
+        if panel is None or row is None:
+            return False
+        if panel.has_profile_key(row[0]):
+            panel.remove_profile_key(row[0])
+        else:
+            panel.add_profile_key(*row)
         return True
 
     def route_body_pick_for_loft(self, body_id: str) -> bool:

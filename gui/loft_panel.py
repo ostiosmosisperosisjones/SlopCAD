@@ -86,7 +86,9 @@ _SEP_STYLE = "background: #333;"
 class LoftPanel(QWidget):
     loft_requested              = pyqtSignal(list, object, object, bool, str)
     # (profiles, mode_str, target_body_id|None, ruled, continuity)
-    #   profiles is [(sketch_entry_id, face_idx_or_None), ...]
+    #   profiles is [key, ...]: (sketch_entry_id, face_idx_or_None) for a
+    #   sketch loop, ("face", body_id, face_idx) for a body face — any form
+    #   cad.profile_source.as_profile accepts
     cancelled                   = pyqtSignal()
     picking_profile_changed     = pyqtSignal(bool)
     picking_body_changed        = pyqtSignal(bool)
@@ -140,7 +142,7 @@ class LoftPanel(QWidget):
         root.addLayout(prof_header)
 
         self._profile_list = SelectionList(
-            empty_text="Pick 2+ sketch profiles in order",
+            empty_text="Pick 2+ sketch regions or body faces, in order",
             reorderable=True)
         self._profile_list.entry_removed.connect(self._on_profile_removed)
         self._profile_list.order_changed.connect(self._on_order_changed)
@@ -275,11 +277,24 @@ class LoftPanel(QWidget):
 
     def add_profile(self, sketch_entry_id: str, label: str,
                     face_idx: int | None = None) -> bool:
-        key = (sketch_entry_id, face_idx)
+        return self.add_profile_key((sketch_entry_id, face_idx), label)
+
+    def add_body_face_profile(self, body_id: str, face_idx: int, label: str) -> bool:
+        return self.add_profile_key(("face", body_id, face_idx), label)
+
+    def add_profile_key(self, key: tuple, label: str) -> bool:
         added = self._profile_list.add(key, label)
         if added:
             self._emit_changed()
         return added
+
+    def has_profile_key(self, key: tuple) -> bool:
+        return key in self._profile_list.keys
+
+    def remove_profile_key(self, key: tuple):
+        ks = self._profile_list.keys
+        if key in ks:
+            self._profile_list.remove_at(ks.index(key))
 
     def remove_profile(self, sketch_entry_id: str,
                        face_idx: int | None = None):
@@ -294,7 +309,7 @@ class LoftPanel(QWidget):
         self._emit_changed()
 
     def profiles(self) -> list:
-        """Return [(sketch_id, face_idx_or_None)] in display order."""
+        """Return the profile keys in display order (see loft_requested)."""
         return list(self._profile_list.keys)
 
     def set_picked_body(self, body_id: str, body_name: str):

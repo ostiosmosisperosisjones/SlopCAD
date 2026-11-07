@@ -4,9 +4,9 @@ cad/op_types.py
 Re-exports all operation types and the dispatch table.
 Implementation lives in:
   cad/op_base.py             — Op base class, _push_result()
-  cad/op_extrude.py          — FaceExtrudeOp, CrossBodyCutOp, SketchExtrudeOp, SketchOp, ImportOp
+  cad/op_extrude.py          — ExtrudeOp, CrossBodyCutOp, SketchOp, ImportOp
   cad/op_fillet.py           — FaceFilletOp
-  cad/op_revolve_thicken.py  — ThickenOp, FaceRevolveOp, SketchRevolveOp
+  cad/op_revolve_thicken.py  — ThickenOp, RevolveOp, CrossBodyRevolveCutOp
   cad/op_shell.py            — ShellOp
   cad/op_sweep.py            — SketchSweepOp
   cad/op_coil.py             — CoilOp
@@ -16,17 +16,15 @@ Implementation lives in:
 
 from cad.op_base import Op, _push_result
 from cad.op_extrude import (
-    FaceExtrudeOp,
+    ExtrudeOp,
     CrossBodyCutOp,
-    SketchExtrudeOp,
     SketchOp,
     ImportOp,
 )
 from cad.op_fillet import FaceFilletOp
 from cad.op_revolve_thicken import (
     ThickenOp,
-    FaceRevolveOp,
-    SketchRevolveOp,
+    RevolveOp,
     CrossBodyRevolveCutOp,
 )
 from cad.op_offset_plane import OffsetPlaneOp
@@ -47,18 +45,14 @@ def _extrude_or_cut_from_params(operation: str, params: dict) -> Op:
     sign = -1 if operation == "cut" else 1
     if "cut_body_id" in params:
         return CrossBodyCutOp._from_params(params, sign)
-    if "from_sketch_id" in params:
-        return SketchExtrudeOp._from_params(params, sign)
-    return FaceExtrudeOp._from_params(params, sign)
+    return ExtrudeOp._from_params(params, sign)
 
 
 def _revolve_from_params(operation: str, params: dict) -> Op:
     """Route revolve / revolve_cut params to the right op type."""
     if operation == "revolve_cut":
         return CrossBodyRevolveCutOp._from_params(params)
-    if "source_body_id" in params and "cut_body_id" not in params:
-        return FaceRevolveOp._from_params(params)
-    return SketchRevolveOp._from_params(params)
+    return RevolveOp._from_params(params)
 
 
 _FROM_PARAMS: dict[str, Any] = {
@@ -88,9 +82,9 @@ _FROM_PARAMS: dict[str, Any] = {
 
 __all__ = [
     "Op", "_push_result",
-    "FaceExtrudeOp", "CrossBodyCutOp", "SketchExtrudeOp", "SketchOp", "ImportOp",
+    "ExtrudeOp", "CrossBodyCutOp", "SketchOp", "ImportOp",
     "FaceFilletOp",
-    "ThickenOp", "FaceRevolveOp", "SketchRevolveOp", "CrossBodyRevolveCutOp",
+    "ThickenOp", "RevolveOp", "CrossBodyRevolveCutOp",
     "OffsetPlaneOp",
     "SketchLoftOp",
     "ChamferOp",

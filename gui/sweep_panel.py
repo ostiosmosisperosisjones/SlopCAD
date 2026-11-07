@@ -33,7 +33,7 @@ class SweepPanel(LoftPanel):
         root = self.layout()
         root.itemAt(0).widget().setText("Sweep")
         self._radio_loft.setText("Sweep")
-        self._profile_list._empty_label.setText("Pick one closed sketch region")
+        self._profile_list._empty_label.setText("Pick one sketch region or body face")
         self._pick_profile_btn.setText("+ Pick Profile")
 
         # Loft's SURFACE section is [header, continuity row, ruled checkbox];
@@ -74,10 +74,10 @@ class SweepPanel(LoftPanel):
     # Profile: exactly one — a new pick replaces the old
     # ------------------------------------------------------------------
 
-    def add_profile(self, sketch_entry_id, label, face_idx=None) -> bool:
-        if self._profile_list.keys and (sketch_entry_id, face_idx) not in self._profile_list.keys:
+    def add_profile_key(self, key, label) -> bool:
+        if self._profile_list.keys and key not in self._profile_list.keys:
             self._profile_list.clear()
-        added = super().add_profile(sketch_entry_id, label, face_idx)
+        added = super().add_profile_key(key, label)
         if added and self._picking_profile:
             self._end_pick_profile()
             if not len(self._path_list):

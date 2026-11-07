@@ -12,7 +12,6 @@ Expects self to have:
 """
 
 from __future__ import annotations
-from cad.solid_ref import as_compound
 
 class RevolveMixin:
 
@@ -50,14 +49,6 @@ class RevolveMixin:
 
         panel = RevolvePanel(self.workspace, parent=self)
 
-        if body_id is not None and face_idx is not None:
-            body = self.workspace.bodies.get(body_id)
-            label = f"{body.name}  ·  face {face_idx}" if body else "⚠  face lost"
-            panel.add_face_entry(body_id, face_idx, label,
-                                 valid=body is not None)
-        elif sketch_idx is not None:
-            panel.add_face_entry(None, None, f"Sketch {sketch_idx}")
-
         panel.revolve_requested.connect(self._on_revolve_panel_ok)
         panel.cancelled.connect(self._close_revolve_panel)
         panel.face_entry_removed.connect(self._on_revolve_face_removed)
@@ -72,6 +63,7 @@ class RevolveMixin:
         self._revolve_face_active    = False
         self._revolve_body_active    = False
         self._revolve_preview_mesh   = None
+        self._refresh_revolve_rows()
 
         self._position_revolve_panel()
         panel.show()
@@ -144,20 +136,7 @@ class RevolveMixin:
         sketch_idx = getattr(self, '_revolve_sketch_idx', None)
         face_pairs = getattr(self, '_revolve_face_pairs', [])
 
-        faces = []
-        if sketch_idx is not None:
-            all_sketch = self._sketch_faces.get(sketch_idx, [])
-            fidx_sel   = self._selected_sketch_face
-            faces = ([all_sketch[i][0] for i in fidx_sel if 0 <= i < len(all_sketch)]
-                     if fidx_sel is not None else [f[0] for f in all_sketch])
-        elif face_pairs:
-            for bid, fi in face_pairs:
-                shape = self.workspace.current_shape(bid)
-                if shape is None:
-                    continue
-                all_f = list(shape.faces())
-                if fi < len(all_f):
-                    faces.append(all_f[fi])
+        faces = self._selection_faces(sketch_idx, face_pairs)
 
         if not faces:
             self._revolve_cage_wires   = None
@@ -467,46 +446,44 @@ class RevolveMixin:
         panel.set_axis(axis_pt, axis_dir)
         return True
 
+    def _refresh_revolve_rows(self):
+        panel = getattr(self, '_revolve_panel', None)
+        if panel is None:
+            return
+        panel.clear_face_entries()
+        for bid, fi, label, valid in self._selection_rows(
+                self._revolve_sketch_idx, self._revolve_face_pairs):
+            panel.add_face_entry(bid, fi, label, valid=valid)
+
     def route_face_pick_for_revolve(self, body_id: str, face_idx: int) -> bool:
+        """Toggle a body face in the selection (alongside any sketch loops)."""
         if not getattr(self, '_revolve_face_active', False):
             return False
         panel = getattr(self, '_revolve_panel', None)
-        if panel is None:
+        if panel is None or self.workspace.bodies.get(body_id) is None:
             return False
-        body = self.workspace.bodies.get(body_id)
-        if body is None:
-            return False
-        label = f"{body.name}  ·  face {face_idx}"
-        panel.add_face_entry(body_id, face_idx, label)
-        self._revolve_face_pairs.append((body_id, face_idx))
+        pairs = list(getattr(self, '_revolve_face_pairs', []))
+        pair = (body_id, face_idx)
+        self._revolve_face_pairs = ([p for p in pairs if p != pair]
+                                    if pair in pairs else pairs + [pair])
+        self._refresh_revolve_rows()
+        panel._emit_preview()
         return True
 
     def _on_revolve_face_removed(self, index: int):
-        """Remove a profile entry from the revolve panel's face list."""
-        sketch_idx = getattr(self, '_revolve_sketch_idx', None)
+        """Remove a profile row from the revolve panel's list."""
+        self._revolve_sketch_idx, self._revolve_face_pairs = \
+            self._remove_selection_row(index, getattr(self, '_revolve_sketch_idx', None),
+                                       getattr(self, '_revolve_face_pairs', []))
         panel = getattr(self, '_revolve_panel', None)
-        if sketch_idx is not None:
-            # Sketch-loop mode: drop the loop at this list index.
-            faces = list(self._selected_sketch_face or [])
-            if 0 <= index < len(faces):
-                faces.pop(index)
-            self._selected_sketch_face = faces if faces else None
-            if panel is not None:
-                panel._emit_preview()
-            return
-        pairs = getattr(self, '_revolve_face_pairs', [])
-        if 0 <= index < len(pairs):
-            self._revolve_face_pairs = [p for i, p in enumerate(pairs)
-                                        if i != index]
         if panel is not None:
             panel._emit_preview()
 
     def route_sketch_face_pick_for_revolve(self, sketch_idx: int,
                                            face_idx: int) -> bool:
-        """Route a sketch-face (loop) click to the revolve panel while the
-        '+ Add Face' pick mode is active.  Toggles individual loops in
-        _selected_sketch_face so the user can build the profile from one or
-        more loops of a single sketch."""
+        """Toggle a sketch loop in the selection (alongside any body faces)
+        while '+ Add Face' is active.  Loops of a different sketch replace
+        the previous sketch's loops."""
         if not getattr(self, '_revolve_face_active', False):
             return False
         panel = getattr(self, '_revolve_panel', None)
@@ -515,25 +492,15 @@ class RevolveMixin:
 
         current_indices = list(self._selected_sketch_face or []) \
             if getattr(self, '_revolve_sketch_idx', None) == sketch_idx else []
-
-        # Toggle: clicking an already-selected loop removes it.
         if face_idx in current_indices:
             current_indices.remove(face_idx)
         else:
             current_indices.append(face_idx)
 
         self._revolve_sketch_idx    = sketch_idx
-        self._revolve_face_pairs    = []
         self._selected_sketch_entry = sketch_idx
         self._selected_sketch_face  = current_indices if current_indices else None
-
-        panel.clear_face_entries()
-        if current_indices:
-            for i in current_indices:
-                panel.add_face_entry(None, None,
-                                     f"Sketch {sketch_idx}  ·  face {i}")
-        else:
-            panel.add_face_entry(None, None, f"Sketch {sketch_idx}")
+        self._refresh_revolve_rows()
         panel._emit_preview()
         return True
 
@@ -581,9 +548,6 @@ class RevolveMixin:
 
     def _on_revolve_panel_ok(self, angle_deg: float, axis_point, axis_dir,
                               merge_body_id, is_cut: bool):
-        from cad.op_types import (SketchRevolveOp, FaceRevolveOp,
-                                  CrossBodyRevolveCutOp)
-
         sketch_idx  = getattr(self, '_revolve_sketch_idx', None)
         face_pairs  = getattr(self, '_revolve_face_pairs', [])
         editing_idx = getattr(self, '_editing_history_idx', None)
@@ -599,11 +563,21 @@ class RevolveMixin:
         self._revolve_commit_extra = exprs_extra(
             angle_deg=panel._angle_spinbox if panel else None)
 
+        # Built before the panel closes (closing clears the sketch selection).
+        profiles = self._selection_profiles(sketch_idx, face_pairs)
+
         # Prevent _close_revolve_panel from cancelling the edit
         if editing_idx is not None:
             self._editing_history_idx = None
 
         self._close_revolve_panel()
+
+        if not profiles:
+            print("[Revolve] No profile selected.")
+            if editing_idx is not None:
+                self._editing_history_idx = editing_idx
+                self._cancel_revolve_edit()
+            return
 
         # Editing path: defer all branching to _commit_revolve_edit so the
         # seek/delete/replay bookkeeping stays in one place.
@@ -611,223 +585,95 @@ class RevolveMixin:
             self._editing_history_idx = editing_idx  # restore for _commit
             self._commit_revolve_edit_from_panel(
                 editing_idx, angle, axis_pt, axis_d, merge_body_id, is_cut,
-                sketch_idx, face_pairs)
+                profiles)
             return
 
-        # Cut paths --------------------------------------------------------
+        # No-target cut: one CrossBodyRevolveCutOp per intersecting body.
+        if is_cut and merge_body_id in (None, "__new_body__"):
+            self._do_revolve_cut_all_intersecting(angle, axis_pt, axis_d, profiles)
+            return
+
+        op = self._build_revolve_op(profiles, angle, axis_pt, axis_d,
+                                    merge_body_id, is_cut)
+        extra = getattr(self, '_revolve_commit_extra', None)
         if is_cut:
-            if sketch_idx is None:
-                if not face_pairs:
-                    print("[Revolve cut] No profile selected.")
-                    return
-                body_id, face_idx = face_pairs[0]
-                if merge_body_id in (None, "__new_body__"):
-                    self._do_revolve_face_cut_all_intersecting(
-                        angle, axis_pt, axis_d, body_id, face_idx)
-                    return
-                CrossBodyRevolveCutOp(
-                    cut_body_id     = merge_body_id,
-                    source_body_id  = body_id,
-                    source_face_idx = face_idx,
-                    angle_deg       = angle,
-                    axis_point      = axis_pt,
-                    axis_dir        = axis_d,
-                ).commit(self, self._revolve_commit_extra)
-                return
-            entries = self.history.entries
-            if sketch_idx >= len(entries):
-                print("[Revolve] Invalid sketch index.")
-                return
-            sketch_id = entries[sketch_idx].entry_id
-            se = entries[sketch_idx].params.get("sketch_entry")
-            src_body_id = se.body_id if se else None
-            if merge_body_id in (None, "__new_body__"):
-                self._do_revolve_cut_all_intersecting(
-                    angle, axis_pt, axis_d, sketch_id, src_body_id)
-                return
-            fidx_sel = self._selected_sketch_face
-            cut_face_indices = None
-            if fidx_sel is not None:
-                all_sketch = self._sketch_faces.get(sketch_idx, [])
-                cut_face_indices = [i for i in fidx_sel
-                                    if 0 <= i < len(all_sketch)] or None
-            op = CrossBodyRevolveCutOp(
-                cut_body_id      = merge_body_id,
-                source_body_id   = src_body_id,
-                source_sketch_id = sketch_id,
-                angle_deg        = angle,
-                axis_point       = axis_pt,
-                axis_dir         = axis_d,
-                face_indices     = cut_face_indices,
-            )
-            op.commit(self, self._revolve_commit_extra)
-            return
-
-        # Revolve (merge / new body) ---------------------------------------
-        if sketch_idx is not None:
-            entries = self.history.entries
-            if sketch_idx >= len(entries):
-                print("[Revolve] Invalid sketch index.")
-                return
-            force_new = (merge_body_id is None or merge_body_id == "__new_body__")
-            new_op = SketchRevolveOp(
-                from_sketch_id = entries[sketch_idx].entry_id,
-                angle_deg      = angle,
-                axis_point     = axis_pt,
-                axis_dir       = axis_d,
-                merge_body_id  = None if force_new else merge_body_id,
-            )
-        elif face_pairs:
-            body_id, face_idx = face_pairs[0]
-            new_op = FaceRevolveOp(
-                source_body_id = body_id,
-                face_idx       = face_idx,
-                angle_deg      = angle,
-                axis_point     = axis_pt,
-                axis_dir       = axis_d,
-            )
+            op.commit(self, extra)
         else:
-            print("[Revolve] No profile selected.")
-            return
+            op.commit_async(self, extra)
 
-        new_op.commit_async(self, getattr(self, '_revolve_commit_extra', None))
+    @staticmethod
+    def _build_revolve_op(profiles, angle, axis_pt, axis_d, merge_body_id, is_cut):
+        """CrossBodyRevolveCutOp into a chosen body, else a RevolveOp
+        (merge_body_id None / "__new_body__" → new body)."""
+        from cad.op_types import RevolveOp, CrossBodyRevolveCutOp
+        common = dict(profiles=profiles, angle_deg=angle,
+                      axis_point=list(axis_pt), axis_dir=list(axis_d))
+        if is_cut:
+            return CrossBodyRevolveCutOp(cut_body_id=merge_body_id, **common)
+        new_body = merge_body_id in (None, "__new_body__")
+        return RevolveOp(merge_body_id=None if new_body else merge_body_id,
+                         **common)
 
     def _do_revolve_cut_all_intersecting(self, angle_deg, axis_pt, axis_d,
-                                          sketch_id, src_body_id):
+                                          profiles):
         """
         No-target revolve cut: build the revolved tool solid once, fan out
-        one CrossBodyRevolveCutOp per workspace body it intersects.
+        one CrossBodyRevolveCutOp per workspace body it intersects.  A
+        face-driven tool's source body goes last — cutting it first would
+        change the face the later ops revolve.
         """
         import numpy as np
         from cad.op_types import CrossBodyRevolveCutOp
-        from cad.operations.revolve import _do_revolve_solid
+        from cad.op_revolve_thicken import _revolve_faces_to_tool
+        from cad.profile_source import BodyFaceProfile
         from cad.cut_all import fan_out_cut
-        from build123d import Compound
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
 
-        # Resolve sketch profile faces from the cache
-        sketch_idx = self.history.id_to_index(sketch_id)
-        if sketch_idx is None:
-            print("[Revolve cut] Sketch entry missing."); return
-        all_sketch = self._sketch_faces.get(sketch_idx, [])
-        if not all_sketch:
-            print("[Revolve cut] Sketch has no faces."); return
-        fidx_sel = self._selected_sketch_face
-        if fidx_sel is not None:
-            cut_face_indices = [i for i in fidx_sel
-                                if 0 <= i < len(all_sketch)]
-        else:
-            cut_face_indices = list(range(len(all_sketch)))
-        tool_faces = [all_sketch[i][0] for i in cut_face_indices]
+        try:
+            tool_faces = []
+            for p in profiles:
+                tool_faces += p.resolve_live(self, "[Revolve cut]")
+        except Exception as ex:
+            print(f"[Revolve cut] {ex}"); return
         if not tool_faces:
             print("[Revolve cut] No tool faces."); return
-
-        axis_pt_arr  = np.asarray(axis_pt, dtype=float)
-        axis_dir_arr = np.asarray(axis_d,  dtype=float)
-
         try:
-            tool_solid = None
-            for face in tool_faces:
-                s = _do_revolve_solid(face, axis_pt_arr, axis_dir_arr, angle_deg)
-                if tool_solid is None:
-                    tool_solid = s
-                else:
-                    lst_a = TopTools_ListOfShape(); lst_a.Append(tool_solid.wrapped)
-                    lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
-                    fu = BRepAlgoAPI_Fuse()
-                    fu.SetArguments(lst_a); fu.SetTools(lst_b)
-                    fu.SetRunParallel(True); fu.Build()
-                    if fu.IsDone():
-                        tool_solid = as_compound(fu.Shape())
-        except Exception as ex:
-            print(f"[Revolve cut] Tool construction failed: {ex}"); return
-
-        def build_op(bid: str):
-            return CrossBodyRevolveCutOp(
-                cut_body_id      = bid,
-                source_body_id   = src_body_id,
-                source_sketch_id = sketch_id,
-                angle_deg        = angle_deg,
-                axis_point       = list(axis_pt),
-                axis_dir         = list(axis_d),
-                face_indices     = cut_face_indices,
-            )
-
-        fan_out_cut(self, tool_solid, build_op,
-                    getattr(self, '_revolve_commit_extra', None),
-                    op_label="Revolve cut")
-
-    def _do_revolve_face_cut_all_intersecting(self, angle_deg, axis_pt, axis_d,
-                                               body_id, face_idx):
-        """No-target face-driven revolve cut: one CrossBodyRevolveCutOp per
-        body the revolved face intersects. The source body goes last — cutting
-        it first would renumber the face the later ops revolve."""
-        import numpy as np
-        from cad.op_types import CrossBodyRevolveCutOp
-        from cad.operations.revolve import _do_revolve_solid
-        from cad.cut_all import fan_out_cut
-
-        src_shape = self.workspace.current_shape(body_id)
-        all_faces = list(src_shape.faces()) if src_shape is not None else []
-        if face_idx is None or face_idx >= len(all_faces):
-            print("[Revolve cut] Source face missing."); return
-        try:
-            tool_solid = _do_revolve_solid(
-                all_faces[face_idx], np.asarray(axis_pt, dtype=float),
+            tool_solid = _revolve_faces_to_tool(
+                tool_faces, np.asarray(axis_pt, dtype=float),
                 np.asarray(axis_d, dtype=float), angle_deg)
         except Exception as ex:
             print(f"[Revolve cut] Tool construction failed: {ex}"); return
+        if tool_solid is None:
+            print("[Revolve cut] Tool construction failed."); return
 
         def build_op(bid: str):
             return CrossBodyRevolveCutOp(
-                cut_body_id     = bid,
-                source_body_id  = body_id,
-                source_face_idx = face_idx,
-                angle_deg       = angle_deg,
-                axis_point      = list(axis_pt),
-                axis_dir        = list(axis_d),
+                cut_body_id = bid,
+                profiles    = [p.copy() for p in profiles],
+                angle_deg   = angle_deg,
+                axis_point  = list(axis_pt),
+                axis_dir    = list(axis_d),
             )
 
+        faces = [p for p in profiles if isinstance(p, BodyFaceProfile)]
         fan_out_cut(self, tool_solid, build_op,
                     getattr(self, '_revolve_commit_extra', None),
-                    op_label="Revolve cut", last=body_id)
+                    op_label="Revolve cut",
+                    last=faces[0].body_id if faces else None)
 
     def _commit_revolve_edit_from_panel(self, editing_idx, angle, axis_pt,
                                          axis_d, merge_body_id, is_cut,
-                                         sketch_idx, face_pairs):
+                                         profiles):
         """
         Bridge from panel OK to the edit-commit routine: builds the new op
         (or dispatches to fan-out for no-target cuts) so _commit_revolve_edit
         deletes the old entry group correctly in every mode.
         """
-        from cad.op_types import (SketchRevolveOp, FaceRevolveOp,
-                                  CrossBodyRevolveCutOp)
-
-        # No-target / self cut: special-case because we need to call
-        # _do_revolve_cut_all_intersecting which pushes per-body entries
-        # instead of producing a single new_op.
+        # No-target / self cut: fan-out pushes per-body entries instead of
+        # producing a single new_op.
         if is_cut and merge_body_id in (None, "__new_body__"):
-            if sketch_idx is None:
-                if not face_pairs:
-                    return
-                body_id, face_idx = face_pairs[0]
-                self._editing_history_idx = None
-                self._delete_revolve_edit_group(editing_idx)
-                self._do_revolve_face_cut_all_intersecting(
-                    angle, axis_pt, axis_d, body_id, face_idx)
-            else:
-                entries = self.history.entries
-                if sketch_idx >= len(entries):
-                    return
-                sketch_id = entries[sketch_idx].entry_id
-                se = entries[sketch_idx].params.get("sketch_entry")
-                src_body_id = se.body_id if se else None
-
-                self._editing_history_idx = None
-                self._delete_revolve_edit_group(editing_idx)
-                self._do_revolve_cut_all_intersecting(
-                    angle, axis_pt, axis_d, sketch_id, src_body_id)
+            self._editing_history_idx = None
+            self._delete_revolve_edit_group(editing_idx)
+            self._do_revolve_cut_all_intersecting(angle, axis_pt, axis_d, profiles)
             new_idx = self.history.cursor
             ok, err, _ = self.history.replay_all_from(new_idx + 1)
             if not ok:
@@ -838,68 +684,8 @@ class RevolveMixin:
             self.history_changed.emit()
             return
 
-        # Cross-body cut with a specific target
-        if is_cut:
-            if sketch_idx is None:
-                if not face_pairs:
-                    return
-                body_id, face_idx = face_pairs[0]
-                self._commit_revolve_edit(editing_idx, CrossBodyRevolveCutOp(
-                    cut_body_id     = merge_body_id,
-                    source_body_id  = body_id,
-                    source_face_idx = face_idx,
-                    angle_deg       = angle,
-                    axis_point      = axis_pt,
-                    axis_dir        = axis_d,
-                ))
-                return
-            entries = self.history.entries
-            sketch_id = entries[sketch_idx].entry_id
-            se = entries[sketch_idx].params.get("sketch_entry")
-            src_body_id = se.body_id if se else None
-            fidx_sel = self._selected_sketch_face
-            cut_face_indices = None
-            if fidx_sel is not None:
-                all_sketch = self._sketch_faces.get(sketch_idx, [])
-                cut_face_indices = [i for i in fidx_sel
-                                    if 0 <= i < len(all_sketch)] or None
-            new_op = CrossBodyRevolveCutOp(
-                cut_body_id      = merge_body_id,
-                source_body_id   = src_body_id,
-                source_sketch_id = sketch_id,
-                angle_deg        = angle,
-                axis_point       = axis_pt,
-                axis_dir         = axis_d,
-                face_indices     = cut_face_indices,
-            )
-            self._commit_revolve_edit(editing_idx, new_op)
-            return
-
-        # Plain revolve (merge or new body)
-        if sketch_idx is not None:
-            entries = self.history.entries
-            force_new = (merge_body_id is None or merge_body_id == "__new_body__")
-            new_op = SketchRevolveOp(
-                from_sketch_id = entries[sketch_idx].entry_id,
-                angle_deg      = angle,
-                axis_point     = axis_pt,
-                axis_dir       = axis_d,
-                merge_body_id  = None if force_new else merge_body_id,
-            )
-        elif face_pairs:
-            body_id, face_idx = face_pairs[0]
-            new_op = FaceRevolveOp(
-                source_body_id = body_id,
-                face_idx       = face_idx,
-                angle_deg      = angle,
-                axis_point     = axis_pt,
-                axis_dir       = axis_d,
-            )
-        else:
-            print("[Revolve] No profile selected.")
-            return
-
-        self._commit_revolve_edit(editing_idx, new_op)
+        self._commit_revolve_edit(editing_idx, self._build_revolve_op(
+            profiles, angle, axis_pt, axis_d, merge_body_id, is_cut))
 
     def _delete_revolve_edit_group(self, idx: int) -> list:
         """Seek to idx-1, delete the group, remove created bodies (shared
@@ -925,8 +711,12 @@ class RevolveMixin:
             body = self.workspace.bodies.get(bid)
             if body is not None and body.created_at_entry_id in group_entry_ids:
                 removable.add(bid)
+        keep_id = (self.history.entries[min(group_indices)].entry_id, min(group_indices))
         for j in reversed(group_indices):
             self.history.delete(j)
+        # The re-commit keeps the entry id: downstream refs name it (revolve /
+        # extrude cap and chamfer face origins of planes and edge picks).
+        self.history.reuse_entry_id(*keep_id)
         for bid in removable:
             if bid in self.workspace.bodies:
                 self.workspace.remove_body(bid)

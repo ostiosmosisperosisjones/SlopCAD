@@ -62,10 +62,13 @@ class FacePlaneSource(SketchPlaneSource):
             return None
         origin = None
         if history is not None:
-            from cad.face_origin import origin_for_face, chamfer_origin_for_face
+            from cad.face_origin import (origin_for_face, chamfer_origin_for_face,
+                                         revolve_origin_for_face)
             try:
                 origin = (origin_for_face(history, body_id, face.wrapped, before_index)
                           or chamfer_origin_for_face(history, body_id, face.wrapped,
+                                                     before_index)
+                          or revolve_origin_for_face(history, body_id, face.wrapped,
                                                      before_index))
             except Exception as ex:
                 print(f"[Sketch] face provenance skipped: {ex}")
@@ -87,6 +90,17 @@ class FacePlaneSource(SketchPlaneSource):
             face_idx, face = self.face_ref.find_in(shape)
         if face is None and self.face_ref is not None:
             face_idx, face = self.face_ref.find_coplanar_in(shape)
+        if face is None:
+            # Saved before revolve caps got an origin (or the origin names an
+            # entry that is gone): recognise the cap by its rotation
+            # invariants and keep the origin from now on.
+            from cad.face_origin import revolve_origin_from_ref
+            origin = revolve_origin_from_ref(history, self.body_id,
+                                             self.face_ref, before_index)
+            if origin is not None:
+                _, face = origin.find_in(history, shape)
+                if face is not None:
+                    self.origin = origin
         if face is None:
             detail = ""
             if self.face_ref is not None:

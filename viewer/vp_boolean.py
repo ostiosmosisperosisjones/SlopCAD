@@ -539,8 +539,12 @@ class BooleanMixin:
         if old_op_str in ("union", "intersect"):
             new_op.result_body_id = entry.body_id
 
+        keep_id = (self.history.entries[min(group_indices)].entry_id, min(group_indices))
         for j in reversed(group_indices):
             self.history.delete(j)
+        # The re-commit keeps the entry id: downstream refs name it (revolve /
+        # extrude cap and chamfer face origins of planes and edge picks).
+        self.history.reuse_entry_id(*keep_id)
         for bid in removable:
             if bid in self.workspace.bodies:
                 self.workspace.remove_body(bid)

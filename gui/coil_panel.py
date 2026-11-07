@@ -2,7 +2,8 @@
 gui/coil_panel.py
 
 CoilPanel — LoftPanel's mode / target handling around a coil: pick a sketch
-circle (the axis + diameter), then height, turns and section.  The profile
+circle or a cylindrical body face (the axis + diameter), then height, turns
+and section.  The profile
 list and loft surface options are hidden.
 """
 
@@ -22,12 +23,14 @@ from gui.expr_spinbox import ExprSpinBox
 class CoilPanel(LoftPanel):
     coil_requested        = pyqtSignal(object, object, dict)
     # (mode_str, target_body_id|None, fields) — fields: circle_sketch_id,
-    # circle_uid, height, turns, section, section_size, left_hand, flip
+    # circle_uid (or body_id, face_ref for a cylinder face), height, turns,
+    # section, section_size, left_hand, flip
     picking_circle_changed = pyqtSignal(bool)
 
     def __init__(self, workspace, parent=None):
         self._picking_circle = False
         self._circle: tuple | None = None          # (sketch_id, uid)
+        self._cylinder: tuple | None = None        # (body_id, AnyFaceRef)
         super().__init__(workspace, parent)
         self.setWindowTitle("Coil")
         self._preview_timer = QTimer(self)
@@ -47,12 +50,13 @@ class CoilPanel(LoftPanel):
         hdr.itemAt(0).widget().setText("CIRCLE")
         self._pick_profile_btn.hide()
         self._profile_list.hide()
-        self._pick_circle_btn = QPushButton("Pick Circle")
+        self._pick_circle_btn = QPushButton("Pick Axis")
         self._pick_circle_btn.setObjectName("pick_profile")
         self._pick_circle_btn.setCheckable(True)
         self._pick_circle_btn.clicked.connect(self._on_pick_circle_toggle)
         hdr.addWidget(self._pick_circle_btn)
-        self._circle_label = QLabel("Pick a sketch circle — the coil's axis + diameter")
+        self._circle_label = QLabel("Pick a sketch circle or cylindrical face "
+                                    "— the coil's axis + diameter")
         self._circle_label.setWordWrap(True)
         self._circle_label.setStyleSheet(prefs.scale_stylesheet(
             "color: #555; font-size: 11px; font-family: monospace;"))
@@ -110,7 +114,19 @@ class CoilPanel(LoftPanel):
     # ------------------------------------------------------------------
 
     def set_circle(self, sketch_id: str, uid: str, label: str):
-        self._circle = (sketch_id, uid)
+        self._circle, self._cylinder = (sketch_id, uid), None
+        self._show_source(label)
+
+    def set_cylinder(self, body_id: str, face_ref, label: str,
+                     length: float | None = None):
+        """A cylindrical body face as the axis; *length* (the face's) seeds
+        the height on a fresh pick."""
+        self._circle, self._cylinder = None, (body_id, face_ref)
+        if length and self._height.binding() is None:
+            self._height.set_mm(float(length))
+        self._show_source(label)
+
+    def _show_source(self, label: str):
         self._circle_label.setText(label)
         self._circle_label.setStyleSheet(prefs.scale_stylesheet(
             "color: #7ab3d4; font-size: 11px; font-family: monospace;"))
@@ -119,6 +135,9 @@ class CoilPanel(LoftPanel):
         self._emit_changed()
 
     def circle(self) -> tuple | None:
+        """The picked axis source: (sketch_id, uid) or ("face", body_id)."""
+        if self._cylinder is not None:
+            return ("face", self._cylinder[0])
         return self._circle
 
     def _on_pick_circle_toggle(self, checked: bool):
@@ -148,10 +167,12 @@ class CoilPanel(LoftPanel):
     def fields(self) -> dict | None:
         """The op fields, or None while the panel is incomplete / invalid."""
         h, s = self._height.mm_value(), self._size.mm_value()
-        if self._circle is None or not h or not s:
+        if (self._circle is None and self._cylinder is None) or not h or not s:
             return None
-        return dict(circle_sketch_id=self._circle[0], circle_uid=self._circle[1],
-                    height=h, turns=self._turns.value(),
+        src = (dict(body_id=self._cylinder[0], face_ref=self._cylinder[1])
+               if self._cylinder is not None else
+               dict(circle_sketch_id=self._circle[0], circle_uid=self._circle[1]))
+        return dict(**src, height=h, turns=self._turns.value(),
                     section=self._section.currentData(), section_size=s,
                     left_hand=self._left_chk.isChecked(),
                     flip=self._flip_chk.isChecked())
@@ -176,7 +197,7 @@ class CoilPanel(LoftPanel):
             return super()._update_ok_enabled()
         if self.fields() is None:
             self._ok_btn.setEnabled(False)
-            self._ok_btn.setToolTip("Pick a sketch circle")
+            self._ok_btn.setToolTip("Pick a sketch circle or cylindrical face")
             return
         if self._mode_str() == "merge" and self._target_body_id is None:
             self._ok_btn.setEnabled(False)

@@ -14,7 +14,7 @@ normal.  Resolving re-evaluates that frame from the line's CURRENT position
 with the wall, and the face is whichever planar face of the body passes
 through the probe with that normal.
 
-Only straight lines (and straight includes) consumed by a SketchExtrudeOp on the face's body get an
+Only straight lines (and straight includes) consumed by a sketch-driven ExtrudeOp on the face's body get an
 origin; everything else keeps relying on FaceRef alone.
 """
 
@@ -218,10 +218,172 @@ class ChamferFaceOrigin:
         return best[0], best[1]
 
 
+# ---------------------------------------------------------------------------
+# revolve caps: "the far (or start) face of revolve X's profile k"
+# ---------------------------------------------------------------------------
+
+_CAP_ON_PLANE = 1e-3   # mm — the body face lies in the rebuilt cap's plane
+_CAP_NORMAL   = 0.999  # |cos| between body face and rebuilt cap normals
+
+
+@dataclass
+class RevolveCapOrigin:
+    """A planar end face of a revolve (or revolve cut), named by the revolve
+    entry, which of its profile faces made it, and which end: 0 = the
+    profile's own plane, 1 = the profile swung through the angle.  Resolving
+    rebuilds that cap from the revolve's CURRENT profile, axis and angle, so
+    the far cap is followed when the angle (or the profile) is edited —
+    its plane rotates, which FaceRef's normal match can't follow."""
+    revolve_of: str      # entry_id of the RevolveOp / CrossBodyRevolveCutOp
+    profile:    int      # index into the op's resolved profile faces
+    end:        int      # 0 = start cap, 1 = far cap
+
+    def to_dict(self) -> dict:
+        return {"revolve_of": self.revolve_of, "profile": self.profile,
+                "end": self.end}
+
+    def cap(self, history):
+        """The rebuilt cap as a build123d Face, or None."""
+        caps = _revolve_caps(history, self.revolve_of)
+        if caps is None or self.profile >= len(caps):
+            return None
+        return caps[self.profile][self.end]
+
+    def find_in(self, history, shape) -> tuple[int, object] | tuple[None, None]:
+        cap = self.cap(history)
+        if cap is None:
+            return None, None
+        return _coplanar_nearest(shape, cap)
+
+
+def _revolve_caps(history, entry_id):
+    """[(start cap, far cap), ...] per profile face of a revolve entry, as of
+    its own replay (sketch profiles reproject, the axis follows its sketch).
+    None for a full turn (no caps) or when the entry can't be resolved."""
+    from build123d import Axis
+    ci = history.id_to_index(entry_id)
+    if ci is None:
+        return None
+    e = history._entries[ci]
+    op = e.op
+    if type(op).__name__ not in ("RevolveOp", "CrossBodyRevolveCutOp") or e.error:
+        return None
+    if abs(float(op.angle_deg)) >= 360.0 - 1e-9 or op.axis_point is None:
+        return None
+    try:
+        from cad.profile_source import faces_of
+        from cad.op_revolve_thicken import _revolve_axis
+        faces = faces_of(op.profiles, history, ci, "RevolveCap")
+        pt, d = _revolve_axis(op, history)
+        axis = Axis(tuple(map(float, pt)), tuple(map(float, d)))
+        return [(f, f.rotate(axis, float(op.angle_deg))) for f in faces]
+    except Exception:
+        return None
+
+
+def _coplanar_nearest(shape, cap):
+    """The planar face of `shape` in `cap`'s plane nearest its centre."""
+    N = _occ_face_normal(cap.wrapped)
+    if N is None:
+        return None, None
+    C, area = _occ_face_props(cap.wrapped)
+    best = (None, None, max(1.0, float(np.sqrt(abs(area)))))
+    for fi, face in enumerate(shape.faces()):
+        fn = _occ_face_normal(face.wrapped)
+        if fn is None or abs(float(np.dot(fn, N))) < _CAP_NORMAL:
+            continue
+        c, _ = _occ_face_props(face.wrapped)
+        if abs(float(np.dot(C - c, fn))) > _CAP_ON_PLANE:
+            continue
+        d = _dist_to_face(C, face.wrapped)
+        if d is not None and d < best[2]:
+            best = (fi, face, d)
+    return best[0], best[1]
+
+
+def _revolves_on(history, body_id, before_index):
+    """Revolve entries that wrote body_id, most recent first."""
+    for e in reversed(history._entries[:max(0, before_index)]):
+        op = e.op
+        if type(op).__name__ not in ("RevolveOp", "CrossBodyRevolveCutOp") or e.error:
+            continue
+        if body_id in (e.body_id, getattr(op, "merge_body_id", None),
+                       getattr(op, "cut_body_id", None)) or \
+                body_id in (e.params.get("child_body_ids") or []):
+            yield e
+
+
+def revolve_origin_for_face(history, body_id: str, occ_face,
+                            before_index: int) -> RevolveCapOrigin | None:
+    """Which revolve cap this planar face is, if any."""
+    N = _occ_face_normal(occ_face)
+    if N is None:
+        return None
+    c, _ = _occ_face_props(occ_face)
+    P = _point_on_face(c, occ_face)
+    if P is None:
+        return None
+    for e in _revolves_on(history, body_id, before_index):
+        for k, ends in enumerate(_revolve_caps(history, e.entry_id) or []):
+            for end in (1, 0):
+                cap = ends[end]
+                cn = _occ_face_normal(cap.wrapped)
+                cc, _ = _occ_face_props(cap.wrapped)
+                if cn is None or abs(float(np.dot(cn, N))) < 1 - 1e-6 or \
+                        abs(float(np.dot(cc - P, N))) > _CAP_ON_PLANE:
+                    continue
+                d = _dist_to_face(P, cap.wrapped)
+                if d is not None and d < _CAP_ON_PLANE:
+                    return RevolveCapOrigin(e.entry_id, k, end)
+    return None
+
+
+def revolve_origin_from_ref(history, body_id: str, face_ref,
+                            before_index: int) -> RevolveCapOrigin | None:
+    """Older saves: a FaceRef taken off a revolve's far cap, from before
+    caps had an origin.  The cap swings with the angle, so match by what a
+    rotation about the axis keeps: height along the axis, distance from it,
+    the normal's axial part and the area.  The far cap of any angle fits."""
+    if face_ref is None or not hasattr(face_ref, "centroid_perp"):
+        return None
+    n = np.asarray(face_ref.normal, dtype=float)
+    c = np.asarray(face_ref.centroid_perp, dtype=float) + face_ref.centroid_along * n
+    for e in _revolves_on(history, body_id, before_index):
+        caps = _revolve_caps(history, e.entry_id)
+        if not caps:
+            continue
+        from cad.op_revolve_thicken import _revolve_axis
+        try:
+            p, a = (np.asarray(v, dtype=float) for v in _revolve_axis(e.op, history))
+        except Exception:
+            continue
+        a = a / np.linalg.norm(a)
+
+        def inv(cen, nor):
+            r = cen - p
+            h = float(r @ a)
+            return h, float(np.linalg.norm(r - h * a)), abs(float(nor @ a))
+
+        h, rad, na = inv(c, n)
+        for k, (start, _far) in enumerate(caps):
+            sc, sa = _occ_face_props(start.wrapped)
+            sn = _occ_face_normal(start.wrapped)
+            if sn is None:
+                continue
+            h0, rad0, na0 = inv(np.asarray(sc, dtype=float), sn)
+            tol = 1e-3 * max(1.0, rad0)
+            if abs(h - h0) < tol and abs(rad - rad0) < tol and abs(na - na0) < 1e-4 \
+                    and abs(face_ref.area - sa) < 1e-3 * max(1.0, sa):
+                return RevolveCapOrigin(e.entry_id, k, 1)
+    return None
+
+
 def face_origin_from_dict(d: dict | None):
-    """FaceOrigin or ChamferFaceOrigin, by shape of the dict."""
+    """FaceOrigin, ChamferFaceOrigin or RevolveCapOrigin, by shape of the dict."""
     if d and "chamfer_of" in d:
         return ChamferFaceOrigin(d["chamfer_of"], int(d["edge"]))
+    if d and "revolve_of" in d:
+        return RevolveCapOrigin(d["revolve_of"], int(d["profile"]), int(d["end"]))
     return FaceOrigin.from_dict(d)
 
 
@@ -398,14 +560,14 @@ class EdgeOrigin:
 
 
 def edge_origin(history, body_id: str, shape_occ, occ_edge,
-                before_index: int) -> EdgeOrigin | None:
+                before_index: int) -> "EdgeOrigin | RevolveEdgeOrigin | None":
     """Provenance for an edge of body_id, or None if neither face has any."""
     from build123d import Edge
     faces = _adjacent_faces(shape_occ, occ_edge)
     origins = [o for o in (origin_for_face(history, body_id, f, before_index)
                            for f in faces) if o is not None]
     if not origins:
-        return None
+        return revolve_edge_origin(history, body_id, shape_occ, occ_edge, before_index)
     e = Edge(occ_edge)
     mid, tan = np.array(tuple(e.position_at(0.5))), np.array(tuple(e.tangent_at(0.5)))
     anchor = _edge_anchor(history, origins[0], mid, tan)
@@ -418,6 +580,154 @@ def edge_origin(history, body_id: str, shape_occ, occ_edge,
         tan    = tuple(round(x, 9) for x in FaceOrigin.local(frame, v=tan)),
         anchor = anchor,
     )
+
+
+# ---------------------------------------------------------------------------
+# revolve edges: an edge of a revolve cap, or the arc a profile vertex swept
+# ---------------------------------------------------------------------------
+
+def _rotate(v, d, deg, about=None):
+    """Rotate point (about a point on the axis) or vector v about unit d."""
+    v = np.asarray(v, dtype=float)
+    o = np.zeros(3) if about is None else np.asarray(about, dtype=float)
+    r = v - o
+    t = np.radians(deg)
+    r = (r * np.cos(t) + np.cross(d, r) * np.sin(t)
+         + d * float(d @ r) * (1 - np.cos(t)))
+    return r + o
+
+
+def _revolve_axis_now(history, entry_id):
+    """(point, unit dir, angle) of a revolve entry as of its replay, or None."""
+    ci = history.id_to_index(entry_id)
+    if ci is None:
+        return None
+    op = history._entries[ci].op
+    if type(op).__name__ not in ("RevolveOp", "CrossBodyRevolveCutOp") or op.axis_point is None:
+        return None
+    from cad.op_revolve_thicken import _revolve_axis
+    try:
+        pt, d = (np.asarray(v, dtype=float) for v in _revolve_axis(op, history))
+    except Exception:
+        return None
+    return pt, d / np.linalg.norm(d), float(op.angle_deg)
+
+
+@dataclass
+class RevolveEdgeOrigin:
+    """An edge a revolve made, named through the revolve so it follows angle
+    edits (a far-cap edge swings with the cap; a swept arc grows).
+      end 0/1 : an edge of that cap (see RevolveCapOrigin); p / t are its
+                midpoint / direction turned back onto the profile's plane.
+      end None: the arc profile vertex p swept, from the start cap to the
+                far cap (t unused)."""
+    revolve_of: str
+    profile:    int
+    end:        int | None
+    p:          tuple
+    t:          tuple = (0.0, 0.0, 0.0)
+
+    def to_dict(self) -> dict:
+        return {"revolve_of": self.revolve_of, "profile": self.profile,
+                "end": self.end, "p": list(self.p), "t": list(self.t)}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RevolveEdgeOrigin":
+        return cls(d["revolve_of"], int(d.get("profile", 0)), d.get("end"),
+                   tuple(d["p"]), tuple(d.get("t", (0.0, 0.0, 0.0))))
+
+    def faces_apart(self, history, shape) -> bool:
+        return False
+
+    def find_in(self, history, shape):
+        """The TopoDS_Edge this names now, or None."""
+        ax = _revolve_axis_now(history, self.revolve_of)
+        if ax is None:
+            return None
+        pt, d, angle = ax
+        if self.end is None:
+            return _swept_arc(shape, np.asarray(self.p, dtype=float),
+                              _rotate(self.p, d, angle, pt))
+        _, face = RevolveCapOrigin(self.revolve_of, self.profile, self.end
+                                   ).find_in(history, shape)
+        if face is None:
+            return None
+        turn = angle * self.end
+        mid = _rotate(self.p, d, turn, pt)
+        tan = _rotate(self.t, d, turn)
+        scored = sorted(((_edge_mid_dist(e, mid), e) for e in face.edges()
+                         if _edge_dir_ok(e, tan, _ONE_FACE_DOT)), key=lambda x: x[0])
+        if not scored or scored[0][0] > max(1e-3, 1e-4 * float(np.linalg.norm(mid - pt))):
+            return None
+        return scored[0][1].wrapped
+
+
+def _swept_arc(shape, a, b, tol=1e-4):
+    """The edge of shape running between points a and b (either way)."""
+    scale = max(1.0, float(np.linalg.norm(a)), float(np.linalg.norm(b)))
+    for e in shape.edges():
+        ends = _edge_ends(e)
+        if ends is None:
+            continue
+        p0, p1 = ends
+        if ((np.linalg.norm(p0 - a) < tol * scale and np.linalg.norm(p1 - b) < tol * scale)
+                or (np.linalg.norm(p0 - b) < tol * scale and np.linalg.norm(p1 - a) < tol * scale)):
+            return e.wrapped
+    return None
+
+
+def _edge_ends(e):
+    try:
+        return (np.array(tuple(e.position_at(0.0))), np.array(tuple(e.position_at(1.0))))
+    except Exception:
+        return None
+
+
+def revolve_edge_origin(history, body_id: str, shape_occ, occ_edge,
+                        before_index: int) -> RevolveEdgeOrigin | None:
+    """Provenance for an edge a revolve on body_id made, or None."""
+    from build123d import Edge
+    e = Edge(occ_edge)
+    mid = np.array(tuple(e.position_at(0.5)))
+    tan = np.array(tuple(e.tangent_at(0.5)))
+    # On a cap: prefer the far cap (the start cap doesn't move with the angle).
+    caps = [o for o in (revolve_origin_for_face(history, body_id, f, before_index)
+                        for f in _adjacent_faces(shape_occ, occ_edge)) if o is not None]
+    caps.sort(key=lambda o: -o.end)
+    for o in caps:
+        ax = _revolve_axis_now(history, o.revolve_of)
+        if ax is None:
+            continue
+        pt, d, angle = ax
+        turn = -angle * o.end
+        return RevolveEdgeOrigin(
+            o.revolve_of, o.profile, o.end,
+            tuple(round(float(x), 9) for x in _rotate(mid, d, turn, pt)),
+            tuple(round(float(x), 9) for x in _rotate(tan, d, turn)))
+    # A swept arc: one end is the other turned through the angle.
+    ends = _edge_ends(e)
+    if ends is None:
+        return None
+    for rev in _revolves_on(history, body_id, before_index):
+        ax = _revolve_axis_now(history, rev.entry_id)
+        if ax is None or abs(ax[2]) >= 360.0 - 1e-9:
+            continue
+        pt, d, angle = ax
+        scale = max(1.0, *(float(np.linalg.norm(x - pt)) for x in ends))
+        for a, b in (ends, ends[::-1]):
+            if np.linalg.norm(_rotate(a, d, angle, pt) - b) < 1e-6 * scale:
+                return RevolveEdgeOrigin(rev.entry_id, 0, None,
+                                         tuple(round(float(x), 9) for x in a))
+    return None
+
+
+def edge_origin_from_dict(d: dict | None):
+    """EdgeOrigin or RevolveEdgeOrigin, by shape of the dict."""
+    if not d:
+        return None
+    if "revolve_of" in d:
+        return RevolveEdgeOrigin.from_dict(d)
+    return EdgeOrigin.from_dict(d)
 
 
 def _edge_anchor(history, face_origin, mid, tan) -> FaceOrigin | None:
@@ -509,11 +819,10 @@ def _line_frame(se, line):
 
 def _sketch_id_of(op):
     """The driving sketch of a sketch extrude / sketch-driven cut, else None."""
-    from cad.op_types import SketchExtrudeOp, CrossBodyCutOp
-    if isinstance(op, SketchExtrudeOp):
-        return op.from_sketch_id
-    if isinstance(op, CrossBodyCutOp):
-        return op.source_sketch_id
+    from cad.op_types import ExtrudeOp, CrossBodyCutOp
+    if isinstance(op, (ExtrudeOp, CrossBodyCutOp)):
+        ids = op.from_sketch_ids
+        return ids[0] if ids else None
     return None
 
 

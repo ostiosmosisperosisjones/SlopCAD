@@ -643,7 +643,7 @@ class MainWindow(QMainWindow):
         from viewer.vp_extrude import _extrude_distance_dialog
         dist = _extrude_distance_dialog(self)
         if dist is not None:
-            self._viewport.do_extrude(body_id, face_idx, dist)
+            self._viewport.do_extrude([(body_id, face_idx)], dist)
 
     def save_project(self):
         if not self._viewport:

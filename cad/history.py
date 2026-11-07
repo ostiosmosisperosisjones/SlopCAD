@@ -79,6 +79,8 @@ class History:
         # Imported STEP files carried inside the project: {zip name: bytes}.
         # Import entries point here via params["embed"] (cad/importer.py).
         self.embedded: dict[str, bytes] = {}
+        # (entry_id, index) armed by an edit's teardown: see reuse_entry_id().
+        self._reuse_id: tuple[str, int] | None = None
 
     # ------------------------------------------------------------------
     # Mutation
@@ -89,6 +91,10 @@ class History:
              entry_id: str | None = None) -> HistoryEntry:
         from cad.op_types import Op
         insert_at = self._cursor + 1
+        reuse, self._reuse_id = getattr(self, "_reuse_id", None), None
+        if entry_id is None and reuse is not None and reuse[1] == insert_at \
+                and self.id_to_index(reuse[0]) is None:
+            entry_id = reuse[0]
         op = Op.from_params(operation, params)
         entry = HistoryEntry(
             label=label, operation=operation, params=params,
@@ -110,6 +116,15 @@ class History:
         self._entries.append(entry)
         self._cursor = insert_at
         return entry
+
+    def reuse_entry_id(self, entry_id: str, index: int) -> None:
+        """Arm an edit's re-commit: the next push, if it lands at *index*,
+        takes *entry_id* (the deleted entry it replaces).  An edit tears the
+        old entry down and commits a fresh op; without this the new entry gets
+        a new uuid and every reference to the old one (face / edge origins
+        naming the revolve, extrude or chamfer that made a face) dangles.
+        Any push disarms it."""
+        self._reuse_id = (entry_id, index)
 
     @property
     def is_mid_history(self) -> bool:
@@ -137,8 +152,8 @@ class History:
 
         if new_distance is not None:
             entry.params["distance"] = abs(new_distance)
-            # For FaceExtrudeOp the sign is stored on the op distance field.
-            # Rebuild op first, then patch sign.
+            # The sign lives in the operation ("cut" / "extrude"), which
+            # Op.from_params turns back into a signed distance.
             is_cut = new_distance < 0
             entry.operation = "cut" if is_cut else "extrude"
 
@@ -474,9 +489,8 @@ class History:
                 # Ops saved before region boundaries existed matched their
                 # sketch region by centroid; persist the boundary that match
                 # found so later parameter changes match by identity.
-                fb = getattr(op, "face_boundaries", None)
-                if fb and "face_boundaries" not in entry.params:
-                    entry.params["face_boundaries"] = fb
+                from cad.profile_source import persist_backfilled_boundaries
+                persist_backfilled_boundaries(op, entry.params)
 
                 # Split op: the parent keeps only its own solid(s). execute()
                 # returns the FULL multi-solid boolean result (both halves of a
@@ -636,20 +650,16 @@ class History:
 
     def replay_sketch_dependents(self, sketch_entry_id: str) -> tuple[bool, str, set[str]]:
         """
-        Replay every body chain that contains a SketchExtrudeOp or
-        SketchRevolveOp referencing sketch_entry_id.  Called after a sketch is
-        re-edited so that ops built from it are automatically recomputed.
+        Replay every body chain that contains an op with a profile drawn from
+        sketch_entry_id (extrude, cut, revolve, loft, sweep …).  Called after
+        a sketch is re-edited so that ops built from it are recomputed.
 
         Returns (all_ok, first_error, mutated_body_ids).
         """
-        from cad.op_types import SketchExtrudeOp, SketchRevolveOp
-
         earliest = None
         for i, entry in enumerate(self._entries):
-            op = entry.op
-            if not isinstance(op, (SketchExtrudeOp, SketchRevolveOp)):
-                continue
-            if op.from_sketch_id != sketch_entry_id:
+            ids = getattr(entry.op, "from_sketch_ids", None)
+            if not ids or sketch_entry_id not in ids:
                 continue
             if earliest is None or i < earliest:
                 earliest = i

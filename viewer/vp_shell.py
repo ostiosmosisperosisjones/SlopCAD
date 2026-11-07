@@ -206,8 +206,12 @@ class ShellMixin:
                 if (b := self.workspace.bodies.get(entries[j].body_id)) is not None
                 and b.created_at_entry_id in ids}
         self.history.seek(max(idx - 1, 0))
+        keep_id = (self.history.entries[min(group)].entry_id, min(group))
         for j in reversed(group):
             self.history.delete(j)
+        # The re-commit keeps the entry id: downstream refs name it (revolve /
+        # extrude cap and chamfer face origins of planes and edge picks).
+        self.history.reuse_entry_id(*keep_id)
         for bid in made:
             if bid in self.workspace.bodies:
                 self.workspace.remove_body(bid)

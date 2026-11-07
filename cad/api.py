@@ -314,7 +314,7 @@ class Doc:
         """Extrude the sketch's closed regions (all, or *regions* indices).
         Sketch on a body face → adds to (or cuts, cut=True) that body.
         World-plane sketch → new body, or fused into / cut from *into*."""
-        from cad.op_types import SketchExtrudeOp
+        from cad.op_types import ExtrudeOp
         se = sk.se
         sk_entry = self.commit_sketch(sk)
         faces, regions_uv = se.build_faces()
@@ -322,8 +322,8 @@ class Doc:
             raise ApiError("sketch has no closed regions")
         idx = list(range(len(faces))) if regions is None else list(regions)
         bounds = se.build_face_boundaries()
-        op = SketchExtrudeOp(
-            from_sketch_id=sk_entry.entry_id, distance=1.0, face_indices=idx,
+        op = ExtrudeOp.from_sketch(
+            sk_entry.entry_id, distance=1.0, face_indices=idx,
             face_centroids=[np.array(regions_uv[i][0]).mean(axis=0).tolist() for i in idx],
             face_boundaries=[sorted(bounds[i]) for i in idx])
         if into is not None and not se.body_id and not cut:
@@ -399,15 +399,47 @@ class Doc:
         self._commit(entry)
         return target
 
-    def sweep(self, profile: Sketch, path: Sketch, region: int | None = None,
+    def _profile(self, spec, region: int | None = None):
+        """A ProfileSource from an API profile spec: a Sketch (its only
+        region, or *region*), (sketch, region), or (body, face) with face an
+        index or a '>Z'-style planar selector."""
+        from cad.profile_source import SketchProfile, BodyFaceProfile, make_face_ref
+        if isinstance(spec, tuple) and len(spec) == 2:
+            spec, sel = spec
+            if isinstance(spec, Sketch):
+                region = sel
+            else:
+                fi = self.face_index(spec, sel)
+                face = list(spec.shape.faces())[fi]
+                return BodyFaceProfile(body_id=spec.id, face_idx=fi,
+                                       face_ref=make_face_ref(face))
+        if isinstance(spec, Sketch):
+            entry = self.commit_sketch(spec)
+            return SketchProfile(sketch_id=entry.entry_id,
+                                 face_indices=None if region is None else [int(region)])
+        raise ApiError(f"bad profile {spec!r}: use a Sketch, (sketch, region) "
+                       f"or (body, face)")
+
+    def loft(self, profiles: list, ruled: bool = False, continuity: str = "C1",
+             cut: Body | None = None, into: Body | None = None) -> Body:
+        """Loft through *profiles* in order — each a Sketch (its only region),
+        (sketch, region) or (body, face).  New body, or fused into *into* /
+        cut from *cut*."""
+        from cad.op_loft import SketchLoftOp
+        op = SketchLoftOp(from_profiles=[self._profile(p) for p in profiles],
+                          ruled=ruled, continuity=continuity)
+        op._bake_profiles(self.history, self.history.cursor + 1)
+        return self._push_body_op(op, "loft", cut, into)
+
+    def sweep(self, profile, path: Sketch, region: int | None = None,
               edges: list[int] | None = None, cut: Body | None = None,
               into: Body | None = None, frenet: bool = True) -> Body:
-        """Sweep one closed region of *profile* (the only one, or *region*)
-        along *path*'s drawn entities (all, or the *edges* indices), or
-        along a helix entry (doc.helix).  New body, or fused into *into* /
-        cut from *cut*."""
+        """Sweep one profile — a Sketch's closed region (the only one, or
+        *region*) or a (body, face) — along *path*'s drawn entities (all, or
+        the *edges* indices), or along a helix entry (doc.helix).  New body,
+        or fused into *into* / cut from *cut*."""
         from cad.op_sweep import SketchSweepOp, HELIX_PATH
-        sk_entry = self.commit_sketch(profile)
+        prof = self._profile(profile, region)
         if isinstance(path, Sketch):
             path_entry = self.commit_sketch(path)
             ents = path.se.entities
@@ -415,23 +447,39 @@ class Doc:
             uids = [ents[i].uid for i in idx]
         else:
             path_entry, uids = path, [HELIX_PATH]
-        op = SketchSweepOp(from_profiles=[(sk_entry.entry_id, region)],
+        op = SketchSweepOp(from_profiles=[prof],
                            path_sketch_id=path_entry.entry_id,
                            path_uids=uids, frenet=frenet)
+        op._bake_profiles(self.history, self.history.cursor + 1)
         return self._push_body_op(op, "sweep", cut, into)
 
-    def coil(self, sk: Sketch, circle: int = 0, height=20.0, turns=5.0,
+    def coil(self, on, circle: int = 0, height=20.0, turns=5.0,
              size=1.0, section: str = "circle", left_hand: bool = False,
              flip: bool = False, cut: Body | None = None,
-             into: Body | None = None) -> Body:
-        """Helical coil around the sketch's *circle* (entity index): its
-        centre + the sketch normal are the axis, its diameter the coil's.
-        height / turns / size (section diameter or side) take expressions."""
+             into: Body | None = None, face: int | None = None) -> Body:
+        """Helical coil around a Sketch's *circle* (entity index: its centre
+        + the sketch normal are the axis, its diameter the coil's) or a
+        cylindrical face of a Body (*face* index; the first cylindrical one
+        by default).  height / turns / size (section diameter or side) take
+        expressions."""
         from cad.op_coil import CoilOp
-        entry = self.commit_sketch(sk)
-        op = CoilOp(circle_sketch_id=entry.entry_id,
-                    circle_uid=sk.se.entities[circle].uid, section=section,
-                    left_hand=left_hand, flip=flip)
+        if isinstance(on, Body):
+            from cad.op_helix import cylinder_axis
+            from cad.face_ref import AnyFaceRef
+            faces = list(on.shape.faces())
+            if face is None:
+                face = next((i for i, f in enumerate(faces)
+                             if cylinder_axis(f.wrapped) is not None), None)
+                if face is None:
+                    raise ApiError("body has no cylindrical face")
+            op = CoilOp(body_id=on.id,
+                        face_ref=AnyFaceRef.from_occ_face(faces[face].wrapped),
+                        section=section, left_hand=left_hand, flip=flip)
+        else:
+            entry = self.commit_sketch(on)
+            op = CoilOp(circle_sketch_id=entry.entry_id,
+                        circle_uid=on.se.entities[circle].uid, section=section,
+                        left_hand=left_hand, flip=flip)
         return self._push_body_op(op, "coil", cut, into,
                                   dict(height=height, turns=turns, section_size=size))
 

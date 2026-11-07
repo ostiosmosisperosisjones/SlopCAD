@@ -2,12 +2,12 @@
 cad/op_revolve_thicken.py
 
 Revolve and thicken operation types:
-  ThickenOp, FaceRevolveOp, SketchRevolveOp, CrossBodyRevolveCutOp
+  ThickenOp, RevolveOp (sketch loops and/or body faces), CrossBodyRevolveCutOp
 """
 
 from __future__ import annotations
 from cad.solid_ref import as_compound
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 from cad.op_base import Op, _push_result
@@ -198,209 +198,7 @@ class ThickenOp(Op):
 
 
 # ---------------------------------------------------------------------------
-# FaceRevolveOp  —  revolve a body face around an axis (new body result)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class FaceRevolveOp(Op):
-    """
-    Revolve a planar face on a body around a world-space axis.
-
-    source_body_id : body whose face is revolved
-    face_idx       : face index at commit time (face_ref used for replay)
-    angle_deg      : degrees of revolution
-    axis_point     : world-space point on the rotation axis
-    axis_dir       : unit direction of the rotation axis
-    face_ref       : FaceRef fingerprint for stable re-resolution during replay
-    force_new_body : always True — revolve produces a new standalone solid
-    """
-    source_body_id : str
-    face_idx       : int
-    angle_deg      : float
-    axis_point     : list[float]
-    axis_dir       : list[float]
-    face_ref       : Any = None
-    force_new_body : bool = True
-
-    def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
-        import numpy as np
-        from cad.operations.revolve import revolve_face_direct
-        from build123d import Compound
-
-        src_shape = history._shape_for_body_at(self.source_body_id, entry_index)
-        if src_shape is None:
-            raise RuntimeError(
-                f"FaceRevolveOp: no shape for body '{self.source_body_id}'")
-
-        if self.face_ref is not None:
-            _, face_obj = self.face_ref.find_in(src_shape)
-            if face_obj is None:
-                raise RuntimeError("FaceRevolveOp: could not re-locate face")
-        else:
-            all_f = list(src_shape.faces())
-            if self.face_idx >= len(all_f):
-                raise RuntimeError(f"FaceRevolveOp: face_idx {self.face_idx} out of range")
-            face_obj = all_f[self.face_idx]
-
-        axis_pt  = np.array(self.axis_point, dtype=float)
-        axis_dir = np.array(self.axis_dir,   dtype=float)
-        result = revolve_face_direct(None, face_obj, axis_pt, axis_dir, self.angle_deg)
-
-        entry = history._entries[entry_index]
-        child_body_ids = entry.params.get("child_body_ids", [])
-        if child_body_ids and history._workspace is not None:
-            from cad.solid_ref import (assign_solids_to_children,
-                                       solid_refs_from_dicts)
-            refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
-            assigned = assign_solids_to_children(result, child_body_ids, refs,
-                                                 history._workspace, history,
-                                                 entry_index)
-            return _own_child_shape(entry, child_body_ids, assigned, shape)
-        return shape
-
-    def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
-        try:
-            compute, finalize = self._split_commit(viewport, extra_params)
-        except Exception as ex:
-            print(f"[Op] FAILED: {ex}")
-            self._push_failed_entry(viewport, str(ex), extra_params)
-            return None
-        try:
-            shape_after = compute()
-        except Exception as ex:
-            print(f"[Op] FAILED: {ex}")
-            shape_after = None
-            viewport._pending_op_error = str(ex)
-        else:
-            viewport._pending_op_error = None
-        try:
-            finalize(shape_after)
-        finally:
-            viewport._pending_op_error = None
-        return shape_after
-
-    def _split_commit(self, viewport: Any, extra_params: dict | None = None):
-        import numpy as np
-        from cad.operations.revolve import revolve_face_direct
-        from cad.face_ref import FaceRef
-        from build123d import Compound
-        from cad.units import format_op_label as _lbl
-
-        body_id     = self.source_body_id
-        shape       = viewport.workspace.current_shape(body_id)
-        if shape is None:
-            raise RuntimeError(f"[Revolve] Body '{body_id}' has no shape.")
-
-        all_faces = list(shape.faces())
-        if self.face_idx >= len(all_faces):
-            raise RuntimeError(f"[Revolve] face_idx {self.face_idx} out of range.")
-        face_obj = all_faces[self.face_idx]
-
-        mesh     = viewport._meshes.get(body_id)
-        face_ref = FaceRef.from_b3d_face(mesh.occt_faces[self.face_idx]) if mesh else None
-        self.face_ref = face_ref
-
-        axis_pt  = np.array(self.axis_point, dtype=float)
-        axis_dir = np.array(self.axis_dir,   dtype=float)
-        angle    = self.angle_deg
-
-        op_params = self.to_params()
-        if extra_params:
-            op_params.update(extra_params)
-        preserved_body_ids = list(op_params.pop("_preserved_body_ids", []))
-
-        def compute():
-            return revolve_face_direct(None, face_obj, axis_pt, axis_dir, angle)
-
-        def finalize(shape_after):
-            if shape_after is None:
-                err = getattr(viewport, '_pending_op_error', None) or "Revolve failed"
-                entry = viewport.history.push(
-                    label=_lbl("revolve", op_params), operation="revolve",
-                    params=op_params, body_id=body_id, face_ref=face_ref,
-                    shape_before=shape, shape_after=None)
-                entry.error = True; entry.error_msg = err
-                viewport._post_push_cascade(body_id)
-                viewport.history_changed.emit()
-                return
-
-            from cad.solid_ref import solid_refs_to_dicts
-            solids = list(shape_after.solids())
-            new_bodies = _add_child_bodies(viewport.workspace, solids,
-                                           preserved_body_ids)
-            op_params["child_body_ids"] = [b.id for b in new_bodies]
-            # Per-child geometric fingerprint, aligned with child_body_ids.
-            op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
-
-            tag_body = new_bodies[0] if new_bodies else None
-            tag_id   = tag_body.id if tag_body else body_id
-            parent_entry = viewport.history.push(
-                label=_lbl("revolve", op_params), operation="revolve",
-                params=op_params, body_id=tag_id, face_ref=face_ref,
-                shape_before=shape, shape_after=shape_after)
-            for nb in new_bodies:
-                nb.created_at_entry_id = parent_entry.entry_id
-            viewport._rebuild_bodies({b.id for b in new_bodies})
-            viewport.history_changed.emit()
-
-        return compute, finalize
-
-    def reopen(self, viewport: Any, history_idx: int) -> None:
-        import numpy as np
-        entry = viewport.history.entries[history_idx]
-        if history_idx > 0:
-            viewport.history.seek(history_idx - 1)
-            viewport._rebuild_body_mesh(self.source_body_id)
-        viewport.history_changed.emit()
-        viewport._show_revolve_panel(
-            body_id=self.source_body_id, face_idx=self.face_idx,
-            editing_entry=entry)
-        panel = getattr(viewport, '_revolve_panel', None)
-        if panel is None:
-            return
-        panel.set_axis(
-            np.array(self.axis_point, dtype=float),
-            np.array(self.axis_dir,   dtype=float))
-        panel._angle_spinbox.set_binding(
-            entry.params.get("exprs", {}).get("angle_deg"), self.angle_deg)
-        panel._emit_preview()
-
-    def to_params(self) -> dict:
-        p: dict[str, Any] = {
-            "angle_deg":      self.angle_deg,
-            "source_body_id": self.source_body_id,
-            "face_idx":       self.face_idx,
-            "axis_point":     self.axis_point,
-            "axis_dir":       self.axis_dir,
-        }
-        if self.face_ref is not None:
-            r = self.face_ref
-            p["face_ref"] = {"normal": list(r.normal), "area": r.area,
-                             "centroid_perp": list(r.centroid_perp),
-                             "centroid_along": r.centroid_along}
-        return p
-
-    @classmethod
-    def _from_params(cls, params: dict) -> "FaceRevolveOp":
-        face_ref = None
-        if "face_ref" in params:
-            from cad.face_ref import FaceRef
-            r = params["face_ref"]
-            face_ref = FaceRef(normal=tuple(r["normal"]), area=r["area"],
-                               centroid_perp=tuple(r["centroid_perp"]),
-                               centroid_along=r["centroid_along"])
-        return cls(
-            source_body_id = params["source_body_id"],
-            face_idx       = int(params.get("face_idx", 0)),
-            angle_deg      = float(params.get("angle_deg", 360.0)),
-            axis_point     = params["axis_point"],
-            axis_dir       = params["axis_dir"],
-            face_ref       = face_ref,
-        )
-
-
-# ---------------------------------------------------------------------------
-# SketchRevolveOp  —  revolve a sketch profile around an axis
+# Revolve helpers (shared by RevolveOp and CrossBodyRevolveCutOp)
 # ---------------------------------------------------------------------------
 
 def _own_child_shape(entry, child_body_ids, assigned, shape):
@@ -552,141 +350,175 @@ def _fuse_tool_into_target(tool, target_occ):
     return as_compound(fu.Shape())
 
 
-@dataclass
-class SketchRevolveOp(Op):
-    """
-    Revolve a closed-loop profile built from a SketchEntry around an axis.
 
-    from_sketch_id : entry_id of the sketch entry
+def _revolve_axis(op, history):
+    """The op's world axis now.  With a sketch profile the stored
+    sketch-relative axis (axis_line_uid / axis_local, anchored to the first
+    sketch) follows that sketch; otherwise the world axis is used as stored.
+    Call after the profiles resolved (they reproject the sketch)."""
+    from cad.profile_source import sketch_profiles
+    sp = sketch_profiles(op.profiles)
+    se = sp[0].sketch_entry(history) if sp else None
+    return sketch_axis(se, op.axis_point, op.axis_dir,
+                       op.axis_local, op.axis_line_uid)
+
+
+def _bake_revolve_axis(op, viewport):
+    """Commit-time axis_local / axis_line_uid against the first sketch."""
+    import numpy as np
+    from cad.profile_source import sketch_profiles
+    sp = sketch_profiles(op.profiles)
+    if not sp:
+        op.axis_local, op.axis_line_uid = None, None
+        return
+    se = sp[0].sketch_entry(viewport.history)
+    op.axis_local, op.axis_line_uid = _axis_fields(
+        viewport, sp[0].sketch_id, se,
+        np.array(op.axis_point, dtype=float), np.array(op.axis_dir, dtype=float))
+
+
+def _revolve_axis_params(op, p: dict) -> dict:
+    if op.axis_local is not None:
+        p["axis_local"] = op.axis_local
+    if op.axis_line_uid is not None:
+        p["axis_line_uid"] = op.axis_line_uid
+    return p
+
+
+def _restore_revolve_panel_profiles(vp, op, entry):
+    """Open the revolve panel on the op's profiles (sketch loops first, then
+    body faces re-found on the current shapes) and set the axis + angle."""
+    from cad.profile_source import sketch_profiles
+    sk = sketch_profiles(op.profiles)
+    sketch_idx = vp.history.id_to_index(sk[0].sketch_id) if sk else None
+    pairs = vp._live_face_pairs(op.profiles)
+    if sk:
+        vp._selected_sketch_entry = sketch_idx
+        vp._selected_sketch_face = (list(sk[0].face_indices)
+                                    if sk[0].face_indices else None)
+    first_face = pairs[0] if pairs and not sk else (None, None)
+    vp._show_revolve_panel(sketch_idx=sketch_idx, body_id=first_face[0],
+                           face_idx=first_face[1], editing_entry=entry)
+    panel = getattr(vp, "_revolve_panel", None)
+    if panel is None:
+        return None
+    vp._revolve_sketch_idx = sketch_idx
+    vp._revolve_face_pairs = list(pairs)
+    vp._refresh_revolve_rows()
+    if op.axis_point is not None and op.axis_dir is not None:
+        se = sk[0].sketch_entry(vp.history) if sk else None
+        if op.axis_line_uid and sk:
+            vp._revolve_axis_ref = (sk[0].sketch_id, op.axis_line_uid)
+        panel.set_axis(*sketch_axis(se, op.axis_point, op.axis_dir,
+                                    op.axis_local, op.axis_line_uid))
+    panel._angle_spinbox.set_binding(
+        entry.params.get("exprs", {}).get("angle_deg"), abs(op.angle_deg))
+    return panel
+
+
+# ---------------------------------------------------------------------------
+# RevolveOp  —  revolve sketch loops and/or body faces around an axis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RevolveOp(Op):
+    """
+    Revolve profiles (sketch loops and/or body faces, see
+    cad/profile_source.py) around an axis.  The result is new body/bodies,
+    or is fused into *merge_body_id*.
+
+    profiles       : ordered ProfileSource list
     angle_deg      : revolution arc in degrees (positive = CCW from axis_dir tip)
     axis_point     : world-space point on the rotation axis
     axis_dir       : unit direction of the rotation axis
-    merge_body_id  : body to fuse into, or None for a new body
-    face_indices   : which faces of the sketch to revolve (None = all)
-    face_centroids : UV centroids for stable face matching across sketch edits
+    merge_body_id  : body to fuse into, or None for new body/bodies
+    axis_local     : [u, v, du, dv] in the first sketch's plane — the axis
+                     follows that sketch when an upstream edit moves it
+    axis_line_uid  : the sketch line the axis follows
     """
-    from_sketch_id : str
-    angle_deg      : float
-    axis_point     : list[float]
-    axis_dir       : list[float]
-    merge_body_id  : str | None       = None
-    face_indices   : list[int] | None = None
-    face_centroids : list[list[float]] | None = None
-    face_boundaries: list[list[str]] | None = None
-    force_new_body : bool = True   # revolves always produce a standalone solid
-    axis_local     : list[float] | None = None   # [u, v, du, dv] in the sketch plane
-    axis_line_uid  : str | None = None           # sketch line the axis follows
+    profiles:      list               = field(default_factory=list)
+    angle_deg:     float              = 360.0
+    axis_point:    list[float] | None = None
+    axis_dir:      list[float] | None = None
+    merge_body_id: str | None         = None
+    axis_local:    list[float] | None = None
+    axis_line_uid: str | None         = None
+
+    def __post_init__(self):
+        from cad.profile_source import as_profile
+        self.profiles = [as_profile(p) for p in self.profiles]
+        if self.merge_body_id == "__new_body__":
+            self.merge_body_id = None
+
+    @classmethod
+    def from_sketch(cls, from_sketch_id: str, face_indices=None,
+                    face_centroids=None, face_boundaries=None, **kw) -> "RevolveOp":
+        from cad.profile_source import SketchProfile
+        prof = SketchProfile(sketch_id=from_sketch_id,
+                             face_indices=None if face_indices is None else list(face_indices),
+                             face_centroids=face_centroids,
+                             face_boundaries=face_boundaries)
+        return cls(profiles=[prof], **kw)
+
+    @classmethod
+    def from_face(cls, source_body_id: str, face_idx: int, face_ref=None,
+                  **kw) -> "RevolveOp":
+        from cad.profile_source import BodyFaceProfile
+        return cls(profiles=[BodyFaceProfile(source_body_id, int(face_idx), face_ref)], **kw)
+
+    @property
+    def from_sketch_ids(self) -> list[str]:
+        from cad.profile_source import sketch_profiles
+        return [p.sketch_id for p in sketch_profiles(self.profiles)]
+
+    @property
+    def from_sketch_id(self) -> str | None:
+        ids = self.from_sketch_ids
+        return ids[0] if ids else None
+
+    @property
+    def source_body_id(self) -> str | None:
+        from cad.profile_source import BodyFaceProfile
+        fp = [p for p in self.profiles if isinstance(p, BodyFaceProfile)]
+        return fp[0].body_id if fp else None
+
+    @property
+    def force_new_body(self) -> bool:
+        return self.merge_body_id is None
+
+    @property
+    def sketch_style(self) -> bool:
+        from cad.profile_source import SketchProfile
+        return bool(self.profiles) and isinstance(self.profiles[0], SketchProfile)
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         import numpy as np
-        from cad.operations.revolve import revolve_face_direct
-        from build123d import Compound
+        from cad.profile_source import faces_of
+        from cad.op_extrude import _child_result, _largest_solid_with_imports
+        name = "RevolveOp"
+        faces = faces_of(self.profiles, history, entry_index, name)
+        if not faces:
+            raise RuntimeError(f"{name}: no profile faces")
+        axis_pt, axis_dir = _revolve_axis(self, history)
+        tool = _revolve_faces_to_tool(faces, axis_pt, axis_dir, self.angle_deg)
+        if tool is None:
+            raise RuntimeError(f"{name}: revolve produced no tool")
 
-        sketch_idx = history.id_to_index(self.from_sketch_id)
-        if sketch_idx is None:
-            raise RuntimeError(
-                f"SketchRevolveOp: sketch entry '{self.from_sketch_id}' not found")
-        if sketch_idx >= entry_index:
-            raise RuntimeError(
-                "SketchRevolveOp: sketch entry is after this entry — invalid reorder")
-
-        sketch_entry_rec = history._entries[sketch_idx]
-        if sketch_entry_rec.error:
-            raise RuntimeError("SketchRevolveOp: sketch entry is in an error state")
-
-        se = sketch_entry_rec.params.get("sketch_entry")
-        if se is None:
-            raise RuntimeError(
-                f"SketchRevolveOp: no sketch_entry at id '{self.from_sketch_id}'")
-
-        if se.plane_source is not None:
-            from cad.history import reproject_consumed_sketch
-            # Reproject at this op's position (not the sketch's) so the sketch
-            # follows intervening ops on its parent body; fall back to the
-            # authored plane if the anchor face was destroyed.
-            ok, err = reproject_consumed_sketch(se, history, entry_index,
-                                                sketch_entry_rec)
-            if not ok:
-                raise RuntimeError(
-                    f"SketchRevolveOp: sketch reprojection failed: {err}")
-
-        all_faces, all_regions = se.build_faces()
-        if not all_faces:
-            raise RuntimeError("SketchRevolveOp: sketch has no closed loops")
-
-        if self.face_centroids:
-            from cad.op_base import _match_sketch_faces
-            from cad.op_base import _lost_region_warning
-            lost = []
-            faces, matched = _match_sketch_faces(
-                se, all_faces, all_regions, self.face_centroids,
-                self.face_boundaries, "SketchRevolveOp", lost)
-            _lost_region_warning(history, entry_index, lost)
-            if not self.face_boundaries:
-                self.face_boundaries = matched   # backfill (see History.replay_from)
-        elif self.face_indices is not None:
-            faces = [all_faces[i] for i in self.face_indices if i < len(all_faces)]
-            if not faces:
-                raise RuntimeError("SketchRevolveOp: stored face indices out of range")
-        else:
-            faces = all_faces
-
-        axis_pt, axis_dir = sketch_axis(se, self.axis_point, self.axis_dir,
-                                        self.axis_local, self.axis_line_uid)
-
-        # Merge-into-target case: the entry is tagged to merge_body_id, so the
-        # `shape` passed in by replay IS that target body's current shape. We
-        # must reproduce the same fuse the commit did (build the tool, fuse it
-        # into the target) — otherwise replay would replace the target body
-        # with the bare revolve and silently drop the merge.
-        force_new = self.merge_body_id is None or self.merge_body_id == "__new_body__"
-        if not force_new:
+        # Merge: the entry is tagged to merge_body_id, so `shape` IS the
+        # target — reproduce the commit's fuse instead of replacing it.
+        if self.merge_body_id is not None:
             if shape is None:
-                raise RuntimeError(
-                    "SketchRevolveOp: merge target has no shape on replay")
-            tool = _revolve_faces_to_tool(faces, axis_pt, axis_dir, self.angle_deg)
-            if tool is None:
-                raise RuntimeError("SketchRevolveOp: revolve produced no tool")
+                raise RuntimeError(f"{name}: merge target has no shape on replay")
             return _fuse_tool_into_target(tool, shape.wrapped)
 
-        result = None
-        for face in faces:
-            result = revolve_face_direct(result, face, axis_pt, axis_dir, self.angle_deg)
-
         entry = history._entries[entry_index]
-        child_body_ids = entry.params.get("child_body_ids", [])
-
-        # force_new_body split mirror — see SketchExtrudeOp.execute. Without it
-        # reload leaves non-primary children shapeless; SolidRef keeps the
-        # child→segment mapping stable across OCCT solid-ordering churn.
-        if self.force_new_body and child_body_ids:
-            from cad.solid_ref import assign_solids_to_children, solid_refs_from_dicts
-            if not list(result.solids()):
-                raise RuntimeError("SketchRevolveOp: result contains no solids")
-            refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
-            assigned = assign_solids_to_children(
-                result, child_body_ids, refs, history._workspace,
-                history, entry_index)
-            if assigned[0] is None:
-                raise RuntimeError(
-                    "SketchRevolveOp: could not assign a solid to the primary "
-                    "child body")
-            return assigned[0]
-
-        solids = list(result.solids())
-        solids.sort(key=lambda s: s.volume, reverse=True)
-        if not solids:
-            raise RuntimeError("SketchRevolveOp: result contains no solids")
-
-        this_id = entry.entry_id
-        for j in range(entry_index + 1, len(history._entries)):
-            e = history._entries[j]
-            if (e.operation == "import" and
-                    e.params.get("source_entry_id") == this_id):
-                solid_idx = e.params.get("solid_index", 1)
-                e.shape_after = solids[solid_idx] if solid_idx < len(solids) else None
-
-        return solids[0]
+        own = _child_result(entry, history, entry_index, tool, shape,
+                            self.sketch_style, name)
+        if own is not None:
+            return own
+        if not self.sketch_style:
+            return shape
+        return _largest_solid_with_imports(entry, history, entry_index, tool, name)
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
@@ -711,341 +543,202 @@ class SketchRevolveOp(Op):
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
         import numpy as np
-        from cad.operations.revolve import revolve_face_direct
-        from build123d import Compound
-        from cad.face_ref import FaceRef
+        from cad.profile_source import faces_live
+        from cad.op_extrude import (_apply_live_sketch_selection, _entry_face_ref,
+                                    _clear_sketch_selection, _push_child_bodies)
+        if not self.profiles:
+            raise RuntimeError("[Revolve] No profile selected.")
+        _apply_live_sketch_selection(self.profiles, viewport)
+        faces = faces_live(self.profiles, viewport, "[Revolve]")
+        _bake_revolve_axis(self, viewport)
+        axis_pt  = np.array(self.axis_point, dtype=float)
+        axis_dir = np.array(self.axis_dir,   dtype=float)
+        angle    = self.angle_deg
+        face_ref = _entry_face_ref(viewport, self.profiles)
+        host     = self.profiles[0].owner_body_id(viewport.history)
+        profiles = list(self.profiles)
 
-        entries    = viewport.history.entries
-        sketch_idx = viewport.history.id_to_index(self.from_sketch_id)
-        if sketch_idx is None:
-            raise RuntimeError(f"[Revolve] Sketch entry '{self.from_sketch_id}' not found.")
-        se = entries[sketch_idx].params.get("sketch_entry")
-        if se is None:
-            raise RuntimeError("[Revolve] No sketch entry.")
-        all_faces = viewport._sketch_faces.get(sketch_idx, [])
-        if not all_faces:
-            raise RuntimeError("[Revolve] Sketch has no closed loops.")
-
-        # Prefer indices baked into the op (edit path) over the mutable
-        # viewport selection (see op pick/selection pitfalls).
-        fidx = (self.face_indices if self.face_indices is not None
-                else viewport._selected_sketch_face)
-        if fidx is not None:
-            face_indices = [i for i in fidx if 0 <= i < len(all_faces)]
-        else:
-            face_indices = list(range(len(all_faces)))
-        faces = [all_faces[i][0] for i in face_indices]
-
-        def _uv_centroid(outer_uvs):
-            arr = np.array(outer_uvs)
-            return arr.mean(axis=0).tolist()
-        face_centroids = [_uv_centroid(all_faces[i][1]) for i in face_indices]
-        _bounds = se.build_face_boundaries()
-        face_boundaries = [sorted(_bounds[i]) for i in face_indices
-                           if i < len(_bounds)]
-
-        body_id      = se.body_id
-        shape_before = viewport.workspace.current_shape(body_id)
-        axis_pt      = np.array(self.axis_point, dtype=float)
-        axis_dir     = np.array(self.axis_dir,   dtype=float)
-        angle_deg    = self.angle_deg
-        self.axis_local, self.axis_line_uid = _axis_fields(
-            viewport, self.from_sketch_id, se, axis_pt, axis_dir)
-
-        op_params = {
-            "angle_deg":      angle_deg,
-            "from_sketch_id": self.from_sketch_id,
-            "face_indices":   face_indices,
-            "face_centroids": face_centroids,
-            "face_boundaries": face_boundaries,
-            "axis_point":     self.axis_point,
-            "axis_dir":       self.axis_dir,
-        }
-        if self.axis_local is not None:
-            op_params["axis_local"] = self.axis_local
-        if self.axis_line_uid is not None:
-            op_params["axis_line_uid"] = self.axis_line_uid
+        op_params = self.to_params()
         if extra_params:
             op_params.update(extra_params)
         preserved_body_ids = list(op_params.pop("_preserved_body_ids", []))
 
-        mesh     = viewport._meshes.get(body_id)
-        face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[se.face_idx]) if mesh else None)
+        def tool():
+            t = _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle)
+            if t is None:
+                raise RuntimeError("Revolve produced no tool.")
+            return t
 
-        original_solid_count = len(list(shape_before.solids())) if shape_before else 0
-        force_new = self.merge_body_id is None or self.merge_body_id == "__new_body__"
-
-        if not force_new:
+        if self.merge_body_id is not None:
             target_shape = viewport.workspace.current_shape(self.merge_body_id)
             if target_shape is None:
                 raise RuntimeError("[Revolve] Merge target has no shape.")
-            target_occ      = target_shape.wrapped
-            merge_body_id   = self.merge_body_id
-            orig_merge_count = len(list(target_shape.solids()))
-            merge_params = dict(op_params)
-            merge_params["merge_body_id"] = merge_body_id
+            target_occ = target_shape.wrapped
+            target     = self.merge_body_id
+            count      = len(list(target_shape.solids()))
 
             def compute():
-                tool = _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle_deg)
-                if tool is None:
-                    raise RuntimeError("Revolve produced no tool.")
-                return _fuse_tool_into_target(tool, target_occ)
+                return _fuse_tool_into_target(tool(), target_occ)
 
             def finalize(merged):
-                _push_result(viewport, "revolve", merge_params, merge_body_id,
-                             None, target_shape, merged, orig_merge_count)
-                viewport._selected_sketch_entry = None
-                viewport._selected_sketch_face  = None
+                _push_result(viewport, "revolve", op_params, target,
+                             None, target_shape, merged, count)
+                _clear_sketch_selection(viewport, profiles)
 
             return compute, finalize
 
-        def compute():
-            result = None if force_new else shape_before
-            for face in faces:
-                result = revolve_face_direct(result, face, axis_pt, axis_dir, angle_deg)
-            return result
+        # A face revolve records its source body's shape as shape_before.
+        shape_before = (None if self.sketch_style or host is None
+                        else viewport.workspace.current_shape(host))
 
         def finalize(shape_after):
-            if force_new:
-                from cad.units import format_op_label as _lbl
-                from cad.solid_ref import solid_refs_to_dicts
-                solids    = list(shape_after.solids())
-                op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
-                new_bodies = _add_child_bodies(viewport.workspace, solids,
-                                               preserved_body_ids)
-                op_params["child_body_ids"] = [b.id for b in new_bodies]
-                primary_body = new_bodies[0] if new_bodies else None
-                tag_body_id  = primary_body.id if primary_body else body_id
-                parent_entry = viewport.history.push(
-                    label=_lbl("revolve", op_params), operation="revolve",
-                    params=op_params, body_id=tag_body_id, face_ref=face_ref,
-                    shape_before=None, shape_after=shape_after)
-                for nb in new_bodies:
-                    nb.created_at_entry_id = parent_entry.entry_id
-                viewport._rebuild_bodies({b.id for b in new_bodies})
-                viewport.history_changed.emit()
+            if shape_after is None:
+                _push_result(viewport, "revolve", op_params, host, face_ref,
+                             shape_before, None, 0)
             else:
-                _push_result(viewport, "revolve", op_params, body_id,
-                             face_ref, shape_before, shape_after, original_solid_count)
-            viewport._selected_sketch_entry = None
-            viewport._selected_sketch_face  = None
+                _push_child_bodies(viewport, "revolve", op_params, shape_after,
+                                   preserved_body_ids, host, face_ref,
+                                   shape_before=shape_before, log="[Revolve]")
+            _clear_sketch_selection(viewport, profiles)
 
-        return compute, finalize
+        return tool, finalize
 
     def reopen(self, viewport: Any, history_idx: int) -> None:
-        import numpy as np
-        entry      = viewport.history.entries[history_idx]
-        vp         = viewport
-        sketch_idx = vp.history.id_to_index(self.from_sketch_id)
-
+        vp = viewport
+        entry = vp.history.entries[history_idx]
         if history_idx > 0:
             vp.history.seek(history_idx - 1)
             vp._rebuild_all_meshes()
         vp.history_changed.emit()
-
-        vp._selected_sketch_entry = sketch_idx
-        face_indices = self.face_indices
-        vp._selected_sketch_face  = list(face_indices) if face_indices else None
-
-        vp._show_revolve_panel(sketch_idx=sketch_idx, editing_entry=entry)
-
-        panel = vp._revolve_panel
+        panel = _restore_revolve_panel_profiles(vp, self, entry)
         if panel is None:
             return
-
-        se = (vp.history.entries[sketch_idx].params.get("sketch_entry")
-              if sketch_idx is not None else None)
-        if self.axis_line_uid:
-            vp._revolve_axis_ref = (self.from_sketch_id, self.axis_line_uid)
-        panel.set_axis(*sketch_axis(se, self.axis_point, self.axis_dir,
-                                    self.axis_local, self.axis_line_uid))
-        panel._angle_spinbox.set_binding(
-            entry.params.get("exprs", {}).get("angle_deg"), abs(self.angle_deg))
-
         if self.merge_body_id and self.merge_body_id in vp.workspace.bodies:
-            panel.set_merge_body(
-                self.merge_body_id,
-                vp.workspace.bodies[self.merge_body_id].name)
+            panel.set_merge_body(self.merge_body_id,
+                                 vp.workspace.bodies[self.merge_body_id].name)
             panel._radio_merge.setChecked(True)
             panel._on_op_changed(1)
-
         panel._emit_preview()
 
     def to_params(self) -> dict:
+        from cad.profile_source import profiles_to_dicts
         p: dict[str, Any] = {
-            "angle_deg":      self.angle_deg,
-            "from_sketch_id": self.from_sketch_id,
-            "axis_point":     self.axis_point,
-            "axis_dir":       self.axis_dir,
+            "angle_deg":  self.angle_deg,
+            "profiles":   profiles_to_dicts(self.profiles),
+            "axis_point": self.axis_point,
+            "axis_dir":   self.axis_dir,
         }
         if self.merge_body_id is not None:
             p["merge_body_id"] = self.merge_body_id
-        if self.face_indices is not None:
-            p["face_indices"] = self.face_indices
-        if self.face_centroids is not None:
-            p["face_centroids"] = self.face_centroids
-        if self.face_boundaries is not None:
-            p["face_boundaries"] = self.face_boundaries
-        if self.axis_local is not None:
-            p["axis_local"] = self.axis_local
-        if self.axis_line_uid is not None:
-            p["axis_line_uid"] = self.axis_line_uid
-        return p
+        return _revolve_axis_params(self, p)
 
     @classmethod
-    def _from_params(cls, params: dict) -> "SketchRevolveOp":
+    def _from_params(cls, params: dict) -> "RevolveOp":
+        """Older saves: SketchRevolveOp keys (from_sketch_id + loop
+        selection) or FaceRevolveOp keys (source_body_id + face_idx +
+        face_ref)."""
+        from cad.profile_source import (profiles_from_dicts, BodyFaceProfile,
+                                        face_ref_from_dict)
+        from cad.op_extrude import _legacy_sketch_profile
+        if "profiles" in params:
+            profiles = profiles_from_dicts(params["profiles"])
+        elif "from_sketch_id" in params:
+            profiles = [_legacy_sketch_profile(params["from_sketch_id"], params)]
+        else:
+            profiles = [BodyFaceProfile(
+                body_id=params["source_body_id"],
+                face_idx=int(params.get("face_idx", 0)),
+                face_ref=face_ref_from_dict(params.get("face_ref")))]
         return cls(
-            from_sketch_id = params["from_sketch_id"],
-            angle_deg      = float(params.get("angle_deg", 360.0)),
-            axis_point     = params["axis_point"],
-            axis_dir       = params["axis_dir"],
-            merge_body_id  = params.get("merge_body_id"),
-            face_indices   = params.get("face_indices"),
-            face_centroids = params.get("face_centroids"),
-            face_boundaries = params.get("face_boundaries"),
-            axis_local     = params.get("axis_local"),
-            axis_line_uid  = params.get("axis_line_uid"),
+            profiles      = profiles,
+            angle_deg     = float(params.get("angle_deg", 360.0)),
+            axis_point    = params.get("axis_point"),
+            axis_dir      = params.get("axis_dir"),
+            merge_body_id = params.get("merge_body_id"),
+            axis_local    = params.get("axis_local"),
+            axis_line_uid = params.get("axis_line_uid"),
         )
 
 
 # ---------------------------------------------------------------------------
-# CrossBodyRevolveCutOp  —  revolve a sketch profile and cut another body
+# CrossBodyRevolveCutOp  —  revolve profiles and cut another body
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CrossBodyRevolveCutOp(Op):
     """
-    Revolve a sketch profile around an axis to form a tool solid, then
-    BRepAlgoAPI_Cut it from *cut_body_id*.  Mirrors CrossBodyCutOp for the
-    revolve operation.
+    Revolve profiles (sketch loops and/or body faces) around an axis into a
+    tool solid and cut it from *cut_body_id*.  Mirrors CrossBodyCutOp.
 
-    cut_body_id      : body being cut
-    source_sketch_id : entry_id of the sketch entry whose profile is revolved,
-                       or None for a face-driven cut (CrossBodyCutOp-style):
-                       source_body_id's face source_face_idx, re-found on
-                       replay through the entry's face_ref; axis is world-space
-    source_body_id   : sketch's parent body (informational), or the body whose
-                       face is revolved (face-driven)
-    source_face_idx  : face index at commit time (face-driven only)
-    angle_deg        : revolution arc in degrees
-    axis_point       : world-space point on the rotation axis
-    axis_dir         : unit direction of the rotation axis
+    cut_body_id : body being cut
+    profiles    : ProfileSource list
+    angle_deg, axis_point, axis_dir, axis_local, axis_line_uid : see RevolveOp
     """
-    cut_body_id      : str
-    source_body_id   : str  | None       = None
-    source_sketch_id : str  | None       = None
-    source_face_idx  : int  | None       = None
-    angle_deg        : float = 360.0
-    axis_point       : list[float] | None = None
-    axis_dir         : list[float] | None = None
-    face_indices     : list[int]   | None = None
-    face_centroids   : list[list[float]] | None = None
-    face_boundaries  : list[list[str]] | None = None
-    axis_local       : list[float] | None = None   # see SketchRevolveOp
-    axis_line_uid    : str | None = None
+    cut_body_id:   str
+    profiles:      list               = field(default_factory=list)
+    angle_deg:     float              = 360.0
+    axis_point:    list[float] | None = None
+    axis_dir:      list[float] | None = None
+    axis_local:    list[float] | None = None
+    axis_line_uid: str | None         = None
 
     # Used by Op._push_failed_entry to tag the failed history entry correctly
     # (the base class's fallback otherwise produces "crossbodyrevolvecut").
     _op_str = "revolve_cut"
 
+    def __post_init__(self):
+        from cad.profile_source import as_profile
+        self.profiles = [as_profile(p) for p in self.profiles]
+
+    @classmethod
+    def from_source(cls, cut_body_id: str, source_body_id: str | None = None,
+                    source_sketch_id: str | None = None,
+                    source_face_idx: int | None = None, face_indices=None,
+                    face_centroids=None, face_boundaries=None,
+                    **kw) -> "CrossBodyRevolveCutOp":
+        """The pre-profile signature: a sketch (+ loop selection) or one face."""
+        from cad.profile_source import SketchProfile, BodyFaceProfile
+        if source_sketch_id is not None:
+            prof = SketchProfile(sketch_id=source_sketch_id,
+                                 face_indices=None if face_indices is None else list(face_indices),
+                                 face_centroids=face_centroids,
+                                 face_boundaries=face_boundaries)
+        else:
+            if source_face_idx is None:
+                raise ValueError("CrossBodyRevolveCutOp: give a sketch or a source face")
+            prof = BodyFaceProfile(body_id=source_body_id, face_idx=int(source_face_idx))
+        return cls(cut_body_id=cut_body_id, profiles=[prof], **kw)
+
+    @property
+    def from_sketch_ids(self) -> list[str]:
+        from cad.profile_source import sketch_profiles
+        return [p.sketch_id for p in sketch_profiles(self.profiles)]
+
+    @property
+    def source_sketch_id(self) -> str | None:
+        ids = self.from_sketch_ids
+        return ids[0] if ids else None
+
+    @property
+    def body_id(self) -> str:
+        return self.cut_body_id
+
+    def _tool(self, faces, axis_pt, axis_dir):
+        import numpy as np
+        t = _revolve_faces_to_tool(faces, np.asarray(axis_pt, dtype=float),
+                                   np.asarray(axis_dir, dtype=float), self.angle_deg)
+        if t is None:
+            raise RuntimeError("CrossBodyRevolveCutOp: revolve produced no tool")
+        return t
+
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
-        import numpy as np
-        from cad.operations.revolve import _do_revolve_solid
-        from build123d import Compound
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
-
-        if self.source_sketch_id is None:
-            return self._execute_face(shape, history, entry_index)
-        sketch_idx = history.id_to_index(self.source_sketch_id)
-        if sketch_idx is None:
-            raise RuntimeError(
-                f"CrossBodyRevolveCutOp: sketch entry '{self.source_sketch_id}' not found")
-        sketch_rec = history._entries[sketch_idx]
-        if sketch_rec.error:
-            raise RuntimeError(
-                "CrossBodyRevolveCutOp: source sketch entry is in an error state")
-        se = sketch_rec.params.get("sketch_entry")
-        if se is None:
-            raise RuntimeError(
-                f"CrossBodyRevolveCutOp: no sketch_entry at id '{self.source_sketch_id}'")
-
-        # Reproject the sketch's plane at *this* op's history position so
-        # intervening edits on the parent face move the profile with it; fall
-        # back to the sketch's authored plane if an intervening op destroyed the
-        # anchor face (see reproject_consumed_sketch).
-        if se.plane_source is not None:
-            from cad.history import reproject_consumed_sketch
-            ok, err = reproject_consumed_sketch(se, history, entry_index,
-                                                sketch_rec)
-            if not ok:
-                raise RuntimeError(
-                    f"CrossBodyRevolveCutOp: sketch reprojection failed: {err}")
-
-        all_faces, all_regions = se.build_faces()
-        if not all_faces:
-            raise RuntimeError("CrossBodyRevolveCutOp: sketch has no closed loops")
-
-        if self.face_centroids:
-            from cad.op_base import _match_sketch_faces, _lost_region_warning
-            lost = []
-            faces, matched = _match_sketch_faces(
-                se, all_faces, all_regions, self.face_centroids,
-                self.face_boundaries, "CrossBodyRevolveCutOp", lost)
-            _lost_region_warning(history, entry_index, lost)
-            if not self.face_boundaries:
-                self.face_boundaries = matched   # backfill (see History.replay_from)
-        elif self.face_indices is not None:
-            faces = [all_faces[i] for i in self.face_indices if i < len(all_faces)]
-            if not faces:
-                raise RuntimeError("CrossBodyRevolveCutOp: stored face indices out of range")
-        else:
-            faces = all_faces
-
-        axis_pt, axis_dir = sketch_axis(se, self.axis_point, self.axis_dir,
-                                        self.axis_local, self.axis_line_uid)
-
-        tool = None
-        for face in faces:
-            s = _do_revolve_solid(face, axis_pt, axis_dir, self.angle_deg)
-            if tool is None:
-                tool = s
-            else:
-                lst_a = TopTools_ListOfShape(); lst_a.Append(tool.wrapped)
-                lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
-                fu = BRepAlgoAPI_Fuse()
-                fu.SetArguments(lst_a); fu.SetTools(lst_b)
-                fu.SetRunParallel(True); fu.Build()
-                if fu.IsDone():
-                    tool = as_compound(fu.Shape())
-
+        from cad.profile_source import faces_of
         from cad.operations.boolean import bool_op
-        result = bool_op("cut", [shape], [tool])
-        if result is None:
-            raise RuntimeError("CrossBodyRevolveCutOp: boolean cut failed")
-        return result
-
-    def _execute_face(self, shape, history, entry_index):
-        import numpy as np
-        from cad.operations.revolve import _do_revolve_solid
-        from cad.operations.boolean import bool_op
-        src_shape = history._shape_for_body_at(self.source_body_id, entry_index)
-        if src_shape is None:
-            raise RuntimeError(
-                f"CrossBodyRevolveCutOp: no shape for source body '{self.source_body_id}'")
-        face_ref = getattr(history._entries[entry_index], "face_ref", None)
-        if face_ref is not None:
-            _, face = face_ref.find_in(src_shape)
-            if face is None:
-                raise RuntimeError("CrossBodyRevolveCutOp: could not re-locate source face")
-        else:
-            all_f = list(src_shape.faces())
-            if self.source_face_idx is None or self.source_face_idx >= len(all_f):
-                raise RuntimeError("CrossBodyRevolveCutOp: source face index out of range")
-            face = all_f[self.source_face_idx]
-        tool = _do_revolve_solid(face, np.array(self.axis_point, dtype=float),
-                                 np.array(self.axis_dir, dtype=float), self.angle_deg)
-        result = bool_op("cut", [shape], [tool])
+        from cad.op_extrude import _fill_legacy_face_refs
+        _fill_legacy_face_refs(self.profiles, history._entries[entry_index])
+        faces = faces_of(self.profiles, history, entry_index, "CrossBodyRevolveCutOp")
+        axis_pt, axis_dir = _revolve_axis(self, history)
+        result = bool_op("cut", [shape], [self._tool(faces, axis_pt, axis_dir)])
         if result is None:
             raise RuntimeError("CrossBodyRevolveCutOp: boolean cut failed")
         return result
@@ -1072,226 +765,95 @@ class CrossBodyRevolveCutOp(Op):
         return shape_after
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
-        import numpy as np
-        from cad.operations.revolve import _do_revolve_solid
-        from build123d import Compound
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
-
-        if self.source_sketch_id is None:
-            return self._split_commit_face(viewport, extra_params)
-        entries = viewport.history.entries
-        sketch_idx = viewport.history.id_to_index(self.source_sketch_id)
-        if sketch_idx is None:
-            raise RuntimeError(
-                f"[Revolve cut] Sketch entry '{self.source_sketch_id}' not found.")
-        se = entries[sketch_idx].params.get("sketch_entry")
-        if se is None:
-            raise RuntimeError("[Revolve cut] No sketch_entry.")
-        all_sketch = viewport._sketch_faces.get(sketch_idx, [])
-        if not all_sketch:
-            raise RuntimeError("[Revolve cut] Sketch has no faces.")
-
-        # Prefer indices already baked into the op (fan-out / replay) over the
-        # mutable viewport selection, which the first finalize clears.
-        if self.face_indices is not None:
-            face_indices = [i for i in self.face_indices
-                            if 0 <= i < len(all_sketch)]
-        elif viewport._selected_sketch_face is not None:
-            face_indices = [i for i in viewport._selected_sketch_face
-                            if 0 <= i < len(all_sketch)]
-        else:
-            face_indices = list(range(len(all_sketch)))
-        faces = [all_sketch[i][0] for i in face_indices]
-
-        def _uv_centroid(outer_uvs):
-            arr = np.array(outer_uvs)
-            return arr.mean(axis=0).tolist()
-        face_centroids = [_uv_centroid(all_sketch[i][1]) for i in face_indices]
-        _bounds = se.build_face_boundaries()
-        face_boundaries = [sorted(_bounds[i]) for i in face_indices
-                           if i < len(_bounds)]
-
-        target_shape = viewport.workspace.current_shape(self.cut_body_id)
-        if target_shape is None:
-            raise RuntimeError("[Revolve cut] Target body has no shape.")
-        original_solid_count = len(list(target_shape.solids()))
-        target_occ = target_shape.wrapped
-
-        axis_pt  = np.array(self.axis_point, dtype=float)
-        axis_dir = np.array(self.axis_dir,   dtype=float)
-        angle    = self.angle_deg
-        self.axis_local, self.axis_line_uid = _axis_fields(
-            viewport, self.source_sketch_id, se, axis_pt, axis_dir)
-
-        op_params = self.to_params()
-        op_params["face_indices"]   = face_indices
-        op_params["face_centroids"] = face_centroids
-        op_params["face_boundaries"] = face_boundaries
-        if extra_params:
-            op_params.update(extra_params)
-
-        def compute():
-            tool = None
-            for face in faces:
-                s = _do_revolve_solid(face, axis_pt, axis_dir, angle)
-                if tool is None:
-                    tool = s
-                else:
-                    lst_a = TopTools_ListOfShape(); lst_a.Append(tool.wrapped)
-                    lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
-                    fu = BRepAlgoAPI_Fuse()
-                    fu.SetArguments(lst_a); fu.SetTools(lst_b)
-                    fu.SetRunParallel(True); fu.Build()
-                    if fu.IsDone():
-                        tool = as_compound(fu.Shape())
-            from cad.operations.boolean import bool_op
-            result = bool_op("cut", [target_occ], [tool])
-            if result is None:
-                raise RuntimeError("Revolve cut failed.")
-            return result
-
-        def finalize(result):
-            _push_result(viewport, "revolve_cut", op_params, self.cut_body_id,
-                         None, target_shape, result, original_solid_count,
-                         split_key="split_from")
-            viewport._selected_sketch_entry = None
-            viewport._selected_sketch_face  = None
-
-        return compute, finalize
-
-    def _split_commit_face(self, viewport, extra_params):
-        import numpy as np
-        from cad.operations.revolve import _do_revolve_solid
+        from cad.profile_source import faces_live, BodyFaceProfile
         from cad.operations.boolean import bool_op
-        from cad.face_ref import FaceRef, AnyFaceRef
-
-        src_shape = viewport.workspace.current_shape(self.source_body_id)
-        if src_shape is None:
-            raise RuntimeError("[Revolve cut] Source body has no shape.")
-        all_f = list(src_shape.faces())
-        if self.source_face_idx is None or self.source_face_idx >= len(all_f):
-            raise RuntimeError("[Revolve cut] source_face_idx out of range.")
-        face = all_f[self.source_face_idx]
-        face_ref = (FaceRef.from_occ_face(face.wrapped)
-                    or AnyFaceRef.from_occ_face(face.wrapped))
+        from cad.op_extrude import _apply_live_sketch_selection, _clear_sketch_selection
+        if not self.profiles:
+            raise RuntimeError("[Revolve cut] No profile selected.")
+        # Baked loop indices (fan-out / edit) win over the viewport selection,
+        # which the first finalize clears.
+        _apply_live_sketch_selection(self.profiles, viewport)
+        faces = faces_live(self.profiles, viewport, "[Revolve cut]")
+        _bake_revolve_axis(self, viewport)
+        axis_pt, axis_dir = self.axis_point, self.axis_dir
+        first = self.profiles[0]
+        face_ref = first.face_ref if isinstance(first, BodyFaceProfile) else None
 
         target_shape = viewport.workspace.current_shape(self.cut_body_id)
         if target_shape is None:
             raise RuntimeError("[Revolve cut] Target body has no shape.")
-        original_solid_count = len(list(target_shape.solids()))
+        count      = len(list(target_shape.solids()))
         target_occ = target_shape.wrapped
+        profiles   = list(self.profiles)
 
-        axis_pt  = np.array(self.axis_point, dtype=float)
-        axis_dir = np.array(self.axis_dir, dtype=float)
-        angle    = self.angle_deg
         op_params = self.to_params()
         if extra_params:
             op_params.update(extra_params)
 
         def compute():
-            tool = _do_revolve_solid(face, axis_pt, axis_dir, angle)
-            result = bool_op("cut", [target_occ], [tool])
+            result = bool_op("cut", [target_occ], [self._tool(faces, axis_pt, axis_dir)])
             if result is None:
                 raise RuntimeError("Revolve cut failed.")
             return result
 
         def finalize(result):
             _push_result(viewport, "revolve_cut", op_params, self.cut_body_id,
-                         face_ref, target_shape, result, original_solid_count,
+                         face_ref, target_shape, result, count,
                          split_key="split_from")
+            _clear_sketch_selection(viewport, profiles)
 
         return compute, finalize
 
     def reopen(self, viewport: Any, history_idx: int) -> None:
-        import numpy as np
-        entry      = viewport.history.entries[history_idx]
-        vp         = viewport
-        sketch_idx = (vp.history.id_to_index(self.source_sketch_id)
-                      if self.source_sketch_id is not None else None)
-
+        vp = viewport
+        entry = vp.history.entries[history_idx]
         if history_idx > 0:
             vp.history.seek(history_idx - 1)
             vp._rebuild_all_meshes()
         vp.history_changed.emit()
-
-        if sketch_idx is not None:
-            vp._selected_sketch_entry = sketch_idx
-            vp._selected_sketch_face  = (list(self.face_indices)
-                                          if self.face_indices else None)
-
-        if sketch_idx is None and self.source_face_idx is not None:
-            vp._show_revolve_panel(body_id=self.source_body_id,
-                                   face_idx=self.source_face_idx,
-                                   editing_entry=entry)
-        else:
-            vp._show_revolve_panel(sketch_idx=sketch_idx, editing_entry=entry)
-
-        panel = vp._revolve_panel
+        panel = _restore_revolve_panel_profiles(vp, self, entry)
         if panel is None:
             return
-
-        if self.axis_point is not None and self.axis_dir is not None:
-            se = (vp.history.entries[sketch_idx].params.get("sketch_entry")
-                  if sketch_idx is not None else None)
-            if self.axis_line_uid:
-                vp._revolve_axis_ref = (self.source_sketch_id, self.axis_line_uid)
-            panel.set_axis(*sketch_axis(se, self.axis_point, self.axis_dir,
-                                        self.axis_local, self.axis_line_uid))
-        panel._angle_spinbox.set_binding(
-            entry.params.get("exprs", {}).get("angle_deg"), abs(self.angle_deg))
-
         panel._radio_cut.setChecked(True)
         panel._on_mode_changed(1)
-
         # A fan-out member's cut_body_id is just one of the bodies it hit:
         # leave the target empty so the edit re-fans (no-target cut).
         if (self.cut_body_id in vp.workspace.bodies
                 and "fanout_id" not in entry.params):
-            panel.set_merge_body(
-                self.cut_body_id,
-                vp.workspace.bodies[self.cut_body_id].name)
-
+            panel.set_merge_body(self.cut_body_id,
+                                 vp.workspace.bodies[self.cut_body_id].name)
         panel._emit_preview()
 
     def to_params(self) -> dict:
+        from cad.profile_source import profiles_to_dicts
         p: dict[str, Any] = {
             "angle_deg":   self.angle_deg,
             "cut_body_id": self.cut_body_id,
+            "profiles":    profiles_to_dicts(self.profiles),
             "axis_point":  self.axis_point,
             "axis_dir":    self.axis_dir,
         }
-        if self.source_body_id is not None:
-            p["source_body_id"] = self.source_body_id
-        if self.source_sketch_id is not None:
-            p["source_sketch_id"] = self.source_sketch_id
-        if self.source_face_idx is not None:
-            p["source_face_idx"] = self.source_face_idx
-        if self.face_indices is not None:
-            p["face_indices"] = self.face_indices
-        if self.face_centroids is not None:
-            p["face_centroids"] = self.face_centroids
-        if self.face_boundaries is not None:
-            p["face_boundaries"] = self.face_boundaries
-        if self.axis_local is not None:
-            p["axis_local"] = self.axis_local
-        if self.axis_line_uid is not None:
-            p["axis_line_uid"] = self.axis_line_uid
-        return p
+        return _revolve_axis_params(self, p)
 
     @classmethod
     def _from_params(cls, params: dict) -> "CrossBodyRevolveCutOp":
+        """Older saves: source_sketch_id (+ loop selection), or
+        source_body_id + source_face_idx with the face's FaceRef on the entry."""
+        from cad.profile_source import profiles_from_dicts, BodyFaceProfile
+        from cad.op_extrude import _legacy_sketch_profile
+        if "profiles" in params:
+            profiles = profiles_from_dicts(params["profiles"])
+        elif params.get("source_sketch_id") is not None:
+            profiles = [_legacy_sketch_profile(params["source_sketch_id"], params)]
+        else:
+            profiles = [BodyFaceProfile(body_id=params.get("source_body_id") or "",
+                                        face_idx=int(params.get("source_face_idx") or 0))]
         return cls(
-            cut_body_id      = params.get("cut_body_id", ""),
-            source_body_id   = params.get("source_body_id"),
-            source_sketch_id = params.get("source_sketch_id"),
-            source_face_idx  = params.get("source_face_idx"),
-            angle_deg        = float(params.get("angle_deg", 360.0)),
-            axis_point       = params.get("axis_point"),
-            axis_dir         = params.get("axis_dir"),
-            face_indices     = params.get("face_indices"),
-            face_centroids   = params.get("face_centroids"),
-            face_boundaries  = params.get("face_boundaries"),
-            axis_local       = params.get("axis_local"),
-            axis_line_uid    = params.get("axis_line_uid"),
+            cut_body_id   = params.get("cut_body_id", ""),
+            profiles      = profiles,
+            angle_deg     = float(params.get("angle_deg", 360.0)),
+            axis_point    = params.get("axis_point"),
+            axis_dir      = params.get("axis_dir"),
+            axis_local    = params.get("axis_local"),
+            axis_line_uid = params.get("axis_line_uid"),
         )

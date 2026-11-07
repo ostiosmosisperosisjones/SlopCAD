@@ -145,9 +145,9 @@ def _edge_source_from_dict(d: dict | None):
             tangent  = tuple(er_d["tangent"]),
             face_sigs = list(er_d.get("face_sigs", [])),
         )
-        from cad.face_origin import EdgeOrigin
+        from cad.face_origin import edge_origin_from_dict
         return BodyEdgeSource(body_id=d["body_id"], edge_ref=er,
-                              origin=EdgeOrigin.from_dict(d.get("origin")))
+                              origin=edge_origin_from_dict(d.get("origin")))
     if t == "sketch_edge":
         from cad.edge_ref import SketchEdgeSource
         if "source_entry_id" in d:
@@ -548,7 +548,7 @@ def load(data: bytes):
     # now that all entries (with their UUIDs) are loaded.
     _migrate_legacy_sketch_edge_sources(history)
 
-    # Saved before SketchExtrudeOp.along_normal: the file's sketch planes are
+    # Saved before ExtrudeOp.along_normal: the file's sketch planes are
     # the ones its extrudes were authored against, so bind now, pre-replay.
     from cad.op_extrude import bind_along_normal
     for e in history._entries:

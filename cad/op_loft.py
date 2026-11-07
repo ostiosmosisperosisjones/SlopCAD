@@ -1,12 +1,13 @@
 """
 cad/op_loft.py
 
-SketchLoftOp — loft between 2+ ordered sketch profiles to form a solid,
-optionally fused into or cut from another body.
+SketchLoftOp — loft between 2+ ordered profiles to form a solid, optionally
+fused into or cut from another body.
 
-Each profile sketch must produce exactly one closed-loop face; multi-loop
-profiles are rejected with a clear error.  Profile order in
-from_sketch_ids defines the loft sweep direction.
+A profile is a ProfileSource (cad/profile_source.py): one loop of a sketch,
+or one face of a body.  Each must resolve to exactly one face; a multi-loop
+sketch given without a loop index is rejected with a clear error.  Profile
+order in from_profiles defines the loft direction.
 """
 
 from __future__ import annotations
@@ -24,13 +25,14 @@ if TYPE_CHECKING:
 @dataclass
 class SketchLoftOp(Op):
     """
-    Loft (or cut-loft) between ordered sketch profiles.
+    Loft (or cut-loft) between ordered profiles.
 
-    from_profiles    : ordered [(sketch_entry_id, face_idx_or_None)] tuples.
-                       face_idx=None means "use the first/only face of the
-                       sketch" (preserves v1 single-loop behavior).  Otherwise
-                       use that specific face of the sketch — supports lofting
-                       between disconnected loops on the same sketch.
+    from_profiles    : ordered ProfileSource list — SketchProfile (one loop of
+                       a sketch; face_indices=None means "the sketch's only
+                       loop") or BodyFaceProfile (a body face).  Anything
+                       cad.profile_source.as_profile accepts is normalized on
+                       construction, incl. the legacy (sketch_id, face_idx)
+                       tuples and bare sketch ids of older saves.
     merge_body_id    : body to fuse the result into (mutually exclusive
                        with cut_body_id and force_new_body)
     cut_body_id      : body to subtract the loft from (defines a loft_cut)
@@ -53,13 +55,8 @@ class SketchLoftOp(Op):
     merged_from:     str  | None              = None   # source body id (loft into merge target)
 
     def __post_init__(self):
-        # Normalize: a stored from_sketch_ids (legacy) becomes (sid, None) pairs.
-        # Tuples may also come back from JSON as lists — coerce to tuples.
-        self.from_profiles = [
-            (p[0], p[1] if len(p) > 1 else None) if isinstance(p, (list, tuple))
-            else (p, None)
-            for p in self.from_profiles
-        ]
+        from cad.profile_source import as_profile
+        self.from_profiles = [as_profile(p) for p in self.from_profiles]
         # Tolerate junk continuity values (e.g. from a corrupt save) by
         # clamping to the default instead of raising.
         if self.continuity not in self._CONTINUITY_VALID:
@@ -81,8 +78,17 @@ class SketchLoftOp(Op):
 
     @property
     def from_sketch_ids(self) -> list[str]:
-        """Back-compat read accessor — returns just the sketch ids."""
-        return [sid for sid, _fi in self.from_profiles]
+        """The sketch ids among the profiles (body-face profiles skipped)."""
+        from cad.profile_source import SketchProfile
+        return [p.sketch_id for p in self.from_profiles
+                if isinstance(p, SketchProfile)]
+
+    def profile_keys(self) -> list[tuple]:
+        """Panel keys of the profiles: (sketch_id, loop_idx_or_None) for a
+        sketch loop, ("face", body_id, face_idx) for a body face."""
+        from cad.profile_source import SketchProfile
+        return [(p.sketch_id, p.single_index()) if isinstance(p, SketchProfile)
+                else p.key() for p in self.from_profiles]
 
     def creates_body_from_nothing(self, history: "History", entry_index: int) -> bool:
         # A loft creating a fresh body has no source shape requirement.
@@ -95,56 +101,27 @@ class SketchLoftOp(Op):
     # ------------------------------------------------------------------
 
     def _resolve_profile_faces(self, history: "History", entry_index: int) -> list:
-        """Resolve every profile to its build123d Face.
-
-        Each entry in from_profiles is (sketch_id, face_idx_or_None).  When
-        face_idx is None the sketch must produce exactly one face (otherwise
-        the loft would be ambiguous).
-        """
-        from cad.history import _replay_sketch_entry
+        """Resolve every profile to its build123d Face — exactly one each
+        (a multi-loop sketch needs a loop index, or the loft is ambiguous)."""
         if len(self.from_profiles) < self._MIN_PROFILES:
             raise RuntimeError(f"{type(self).__name__}: {self._OP} requires at "
                                f"least {self._MIN_PROFILES} profile(s)")
         faces = []
-        for n, (sid, face_idx) in enumerate(self.from_profiles, start=1):
-            idx = history.id_to_index(sid)
-            if idx is None:
+        for n, prof in enumerate(self.from_profiles, start=1):
+            got = prof.resolve(history, entry_index,
+                               f"{type(self).__name__}: profile #{n}")
+            if len(got) != 1:
                 raise RuntimeError(
-                    f"SketchLoftOp: profile #{n} sketch '{sid}' not found")
-            if idx >= entry_index:
-                raise RuntimeError(
-                    f"SketchLoftOp: profile #{n} sketch is after this op — "
-                    f"invalid reorder")
-            rec = history._entries[idx]
-            if rec.error:
-                raise RuntimeError(
-                    f"SketchLoftOp: profile #{n} sketch is in an error state")
-            se = rec.params.get("sketch_entry")
-            if se is None:
-                raise RuntimeError(
-                    f"SketchLoftOp: profile #{n} has no sketch_entry")
-            if se.plane_source is not None:
-                ok, err = _replay_sketch_entry(se, history, before_index=entry_index)
-                if not ok:
-                    raise RuntimeError(
-                        f"SketchLoftOp: profile #{n} reprojection failed: {err}")
-            all_faces, _ = se.build_faces()
-            if not all_faces:
-                raise RuntimeError(
-                    f"SketchLoftOp: profile #{n} has no closed loops")
-            if face_idx is None:
-                if len(all_faces) != 1:
-                    raise RuntimeError(
-                        f"SketchLoftOp: profile #{n} has {len(all_faces)} faces; "
-                        f"pick a specific face for this profile")
-                faces.append(all_faces[0])
-            else:
-                if face_idx < 0 or face_idx >= len(all_faces):
-                    raise RuntimeError(
-                        f"SketchLoftOp: profile #{n} face index {face_idx} "
-                        f"out of range (sketch has {len(all_faces)} faces)")
-                faces.append(all_faces[face_idx])
+                    f"{type(self).__name__}: profile #{n} has {len(got)} faces; "
+                    f"pick a specific face for this profile")
+            faces.append(got[0])
         return faces
+
+    def _bake_profiles(self, history: "History", entry_index: int) -> None:
+        """Commit-time: fingerprint each profile (sketch loop centroids +
+        boundaries, body face refs) so replay re-finds it after edits."""
+        for prof in self.from_profiles:
+            prof.bake(history, entry_index)
 
     # ------------------------------------------------------------------
     # Execute (replay)
@@ -189,7 +166,7 @@ class SketchLoftOp(Op):
         entry = (history._entries[entry_index]
                  if 0 <= entry_index < len(history._entries) else None)
         child_body_ids = entry.params.get("child_body_ids", []) if entry else []
-        # force_new_body split mirror — see SketchExtrudeOp.execute. Assign each
+        # force_new_body split mirror — see ExtrudeOp.execute. Assign each
         # loft lump to its child body by SolidRef so the mapping survives reload.
         if self.force_new_body and child_body_ids:
             from cad.solid_ref import assign_solids_to_children, solid_refs_from_dicts
@@ -234,6 +211,7 @@ class SketchLoftOp(Op):
         # Resolve profiles up-front so the panel-side error message is precise.
         faces = self._resolve_profile_faces(viewport.history,
                                             viewport.history.cursor + 1)
+        self._bake_profiles(viewport.history, viewport.history.cursor + 1)
 
         op_params = self.to_params()
         if extra_params:
@@ -329,10 +307,9 @@ class SketchLoftOp(Op):
     # ------------------------------------------------------------------
 
     def to_params(self) -> dict:
-        # Serialize profiles as a list of [sid, face_idx_or_null] lists so
-        # they round-trip cleanly through JSON.
+        from cad.profile_source import profiles_to_dicts
         p: dict[str, Any] = {
-            "from_profiles": [[sid, fi] for sid, fi in self.from_profiles],
+            "from_profiles": profiles_to_dicts(self.from_profiles),
         }
         if self.merge_body_id is not None:
             p["merge_body_id"] = self.merge_body_id
@@ -354,7 +331,7 @@ class SketchLoftOp(Op):
         if raw is None:
             # Legacy save: only sketch ids stored, treat each as a "whole sketch"
             # (face_idx=None) profile.
-            raw = [(sid, None) for sid in params.get("from_sketch_ids", [])]
+            raw = list(params.get("from_sketch_ids", []))
         return cls(
             from_profiles  = list(raw),
             merge_body_id  = params.get("merge_body_id"),

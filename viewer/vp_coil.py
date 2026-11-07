@@ -15,7 +15,9 @@ class CoilMixin:
         if getattr(self, '_coil_panel', None) is not None:
             return
         self._show_coil_panel()
-        for se in self.selection.sketch_edges:     # a preselected circle
+        sel = self.selection
+        done = any(self._set_coil_face(f.body_id, f.face_idx) for f in sel.faces[:1])
+        for se in ([] if done else sel.sketch_edges):   # a preselected circle
             if se.history_idx != -1 and self._set_coil_circle(se.history_idx,
                                                                se.entity_idx):
                 break
@@ -94,8 +96,14 @@ class CoilMixin:
 
         self._show_coil_panel()
         panel = self._coil_panel
-        cidx = self.history.id_to_index(op.circle_sketch_id)
-        if cidx is not None:
+        cidx = (self.history.id_to_index(op.circle_sketch_id)
+                if op.circle_sketch_id else None)
+        if op.face_ref is not None:
+            shape = self.workspace.current_shape(op.body_id)
+            fidx = op.face_ref.find_in(shape)[0] if shape is not None else None
+            if fidx is not None:
+                self._set_coil_face(op.body_id, fidx, seed_height=False)
+        elif cidx is not None:
             se = entries[cidx].params.get("sketch_entry")
             for i, e in enumerate(se.entities if se else []):
                 if e.uid == op.circle_uid:
@@ -142,6 +150,37 @@ class CoilMixin:
         panel.set_circle(entries[history_idx].entry_id, ent.uid,
                          f"Sketch {history_idx}  ·  circle {entity_idx}  ⌀ {d}")
         return True
+
+    def _set_coil_face(self, body_id: str, face_idx: int,
+                       seed_height: bool = True) -> bool:
+        """A cylindrical body face as the coil's axis + diameter."""
+        from cad.face_ref import AnyFaceRef
+        from cad.op_helix import cylinder_axis
+        from cad.units import format_value
+        from cad.prefs import prefs
+        panel = getattr(self, '_coil_panel', None)
+        shape = self.workspace.current_shape(body_id)
+        if panel is None or shape is None:
+            return False
+        faces = list(shape.faces())
+        if not 0 <= face_idx < len(faces):
+            return False
+        ax = cylinder_axis(faces[face_idx].wrapped)
+        if ax is None:
+            print("[Coil] Pick a cylindrical face (or a sketch circle).")
+            return False
+        body = self.workspace.bodies.get(body_id)
+        d = format_value(2 * ax[3], prefs.default_unit, prefs.display_decimals)
+        panel.set_cylinder(body_id, AnyFaceRef.from_occ_face(faces[face_idx].wrapped),
+                           f"{body.name if body else body_id}  ·  face {face_idx}  ⌀ {d}",
+                           length=ax[4] if seed_height else None)
+        return True
+
+    def route_face_pick_for_coil(self, body_id: str, face_idx: int) -> bool:
+        if not getattr(self, '_coil_circle_pick_active', False):
+            return False
+        self._set_coil_face(body_id, face_idx)
+        return True                          # swallow non-cylinders while picking
 
     def route_sketch_edge_pick_for_coil(self, history_idx: int, entity_idx: int) -> bool:
         if not getattr(self, '_coil_circle_pick_active', False):

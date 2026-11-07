@@ -21,12 +21,18 @@ class SweepMixin:
             return
         self._show_sweep_panel()
         p = self._sweep_panel
-        # Preselection: a sketch face → the profile; committed sketch edges → path.
+        # Preselection: a sketch face or body face → the profile; committed
+        # sketch edges → path.
         hidx = getattr(self, '_selected_sketch_entry', None)
         if hidx is not None and getattr(self, '_selected_sketch_face', None):
             self._sweep_profile_pick_active = True
             self.route_sketch_face_pick_for_sweep(hidx, self._selected_sketch_face[0])
             self._sweep_profile_pick_active = False
+        elif self.selection.faces:
+            f = self.selection.faces[0]
+            row = self._body_face_row(f.body_id, f.face_idx)
+            if row is not None:
+                p.add_profile_key(*row)
         for se in self.selection.sketch_edges:
             if se.history_idx != -1:
                 self._add_sweep_path_edge(se.history_idx, se.entity_idx)
@@ -116,11 +122,10 @@ class SweepMixin:
 
         self._show_sweep_panel()
         panel = self._sweep_panel
-        for sid, face_idx in op.from_profiles:
-            sidx = self.history.id_to_index(sid)
-            if sidx is not None:
-                panel.add_profile(sid, self._sweep_profile_label(sidx, face_idx),
-                                  face_idx=face_idx)
+        for prof in op.from_profiles:
+            row = self._profile_row(prof)
+            if row is not None:
+                panel.add_profile_key(*row)
         pidx = self.history.id_to_index(op.path_sketch_id)
         if pidx is not None and entries[pidx].operation == "helix":
             self.route_helix_pick_for_sweep(pidx, force=True)
@@ -171,6 +176,17 @@ class SweepMixin:
         panel.add_profile(entry.entry_id,
                           self._sweep_profile_label(sketch_idx, key_face_idx),
                           face_idx=key_face_idx)
+        return True
+
+    def route_face_pick_for_sweep(self, body_id: str, face_idx: int) -> bool:
+        """A body face as the sweep profile (replaces any previous one)."""
+        if not getattr(self, '_sweep_profile_pick_active', False):
+            return False
+        panel = getattr(self, '_sweep_panel', None)
+        row = self._body_face_row(body_id, face_idx)
+        if panel is None or row is None:
+            return False
+        panel.add_profile_key(*row)
         return True
 
     def _add_sweep_path_edge(self, history_idx: int, entity_idx: int) -> bool:

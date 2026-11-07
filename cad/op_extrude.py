@@ -2,7 +2,7 @@
 cad/op_extrude.py
 
 Extrude and sketch operation types:
-  FaceExtrudeOp, CrossBodyCutOp, SketchExtrudeOp, SketchOp, ImportOp
+  ExtrudeOp (sketch loops and/or body faces), CrossBodyCutOp, SketchOp, ImportOp
 """
 
 from __future__ import annotations
@@ -67,187 +67,381 @@ def _fuse_tool_into_target(tool, target_occ):
 
 
 # ---------------------------------------------------------------------------
-# FaceExtrudeOp  —  extrude or self-cut from a body face
+# Shared profile-op plumbing (extrude, cut, revolve, revolve-cut)
+# ---------------------------------------------------------------------------
+
+def _apply_live_sketch_selection(profiles, viewport) -> None:
+    """A lone sketch profile with no baked loop selection takes the viewport's
+    picked loops (callers that construct the op before baking).  Ops built
+    for an edit or a fan-out already carry their indices and are untouched."""
+    from cad.profile_source import SketchProfile
+    sk = [p for p in profiles if isinstance(p, SketchProfile)]
+    if len(sk) != 1 or sk[0].face_indices is not None:
+        return
+    sel = getattr(viewport, "_selected_sketch_face", None)
+    if sel is None:
+        return
+    # Only the picked sketch's loops (an unset entry = no sketch tracked).
+    idx = viewport.history.id_to_index(sk[0].sketch_id)
+    if getattr(viewport, "_selected_sketch_entry", None) in (None, idx):
+        sk[0].face_indices = list(sel)
+
+
+def _clear_sketch_selection(viewport, profiles) -> None:
+    from cad.profile_source import SketchProfile
+    if any(isinstance(p, SketchProfile) for p in profiles):
+        viewport._selected_sketch_entry = None
+        viewport._selected_sketch_face  = None
+
+
+def _sketch_parent_face_ref(viewport, se):
+    """FaceRef of the body face a sketch sits on (the entry's face_ref for a
+    sketch-driven op), or None for world / datum planes."""
+    from cad.face_ref import FaceRef
+    mesh = viewport._meshes.get(se.body_id) if se.body_id else None
+    try:
+        return FaceRef.from_b3d_face(mesh.occt_faces[se.face_idx]) if mesh else None
+    except Exception:
+        return None
+
+
+def _entry_face_ref(viewport, profiles):
+    """face_ref recorded on the pushed entry: the first face profile's ref
+    when the op is face-driven, else the sketch's parent face."""
+    from cad.profile_source import BodyFaceProfile, SketchProfile
+    first = profiles[0]
+    if isinstance(first, BodyFaceProfile):
+        return first.face_ref
+    se = first.sketch_entry(viewport.history)
+    return _sketch_parent_face_ref(viewport, se) if se is not None else None
+
+
+def _fill_legacy_face_refs(profiles, entry) -> None:
+    """Face-driven cuts saved before profiles kept their face's FaceRef on the
+    history entry, not the op — hand it to the (single) face profile."""
+    from cad.profile_source import BodyFaceProfile
+    fp = [p for p in profiles if isinstance(p, BodyFaceProfile)]
+    ref = getattr(entry, "face_ref", None)
+    if len(fp) == 1 and fp[0].face_ref is None and ref is not None:
+        fp[0].face_ref = ref
+
+
+def _push_child_bodies(viewport, op_str, op_params, shape_after,
+                       preserved_body_ids, fallback_body_id, face_ref,
+                       shape_before=None, log="[Extrude]"):
+    """force_new_body finalize: one new body per solid (reusing preserved ids
+    on an edit re-commit), a SolidRef per child so replay re-finds each
+    segment by shape, and the parent entry tagged to the primary child."""
+    from cad.units import format_op_label as _lbl
+    from cad.solid_ref import solid_refs_to_dicts
+    from cad.op_revolve_thicken import _add_child_bodies
+    solids = list(shape_after.solids())
+    op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
+    new_bodies = _add_child_bodies(viewport.workspace, solids, preserved_body_ids)
+    op_params["child_body_ids"] = [b.id for b in new_bodies]
+    for b in new_bodies:
+        print(f"{log} New body '{b.name}'")
+    tag = new_bodies[0].id if new_bodies else fallback_body_id
+    # The entry is tagged to the primary child, so it carries that child's
+    # solid only — what replay returns (_child_result).  The whole tool here
+    # would show every solid on the primary child until the next replay.
+    own = new_bodies[0].source_shape if new_bodies else shape_after
+    parent = viewport.history.push(
+        label=_lbl(op_str, op_params), operation=op_str, params=op_params,
+        body_id=tag, face_ref=face_ref,
+        shape_before=shape_before, shape_after=own)
+    for b in new_bodies:
+        b.created_at_entry_id = parent.entry_id
+    viewport._rebuild_bodies({b.id for b in new_bodies})
+    viewport.history_changed.emit()
+
+
+def _child_result(entry, history, entry_index, result, shape, sketch_style, name):
+    """force_new_body replay mirror: assign the result's solids to the child
+    bodies by SolidRef (OCCT solid order isn't reproducible) and return the
+    entry's own child.  None when the entry recorded no children."""
+    child_body_ids = entry.params.get("child_body_ids", [])
+    if not child_body_ids or history._workspace is None:
+        return None
+    from cad.solid_ref import assign_solids_to_children, solid_refs_from_dicts
+    if not list(result.solids()):
+        raise RuntimeError(f"{name}: result contains no solids")
+    refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
+    assigned = assign_solids_to_children(result, child_body_ids, refs,
+                                         history._workspace, history, entry_index)
+    if sketch_style:
+        if assigned[0] is None:
+            raise RuntimeError(
+                f"{name}: could not assign a solid to the primary child body")
+        return assigned[0]
+    from cad.op_revolve_thicken import _own_child_shape
+    return _own_child_shape(entry, child_body_ids, assigned, shape)
+
+
+def _largest_solid_with_imports(entry, history, entry_index, result, name):
+    """Sketch-style in-place result: the body keeps its largest solid; split
+    pieces go to the import entries this op produced (by solid_index)."""
+    solids = sorted(result.solids(), key=lambda s: s.volume, reverse=True)
+    if not solids:
+        raise RuntimeError(f"{name}: result contains no solids")
+    this_id = entry.entry_id
+    for j in range(entry_index + 1, len(history._entries)):
+        e = history._entries[j]
+        if e.operation == "import" and e.params.get("source_entry_id") == this_id:
+            k = e.params.get("solid_index", 1)
+            e.shape_after = solids[k] if k < len(solids) else None
+    return solids[0]
+
+
+def _profile_common_kwargs(params: dict) -> dict:
+    return dict(
+        direction      = params.get("direction"),
+        target_vertex  = params.get("target_vertex"),
+        start_offset   = float(params.get("start_offset", 0.0)),
+        end_offset     = float(params.get("end_offset", 0.0)),
+        draft_angle    = float(params.get("draft_angle", 0.0)),
+    )
+
+
+def _legacy_sketch_profile(sketch_id, params: dict):
+    from cad.profile_source import SketchProfile
+    fi = params.get("face_indices")
+    return SketchProfile(sketch_id=sketch_id,
+                         face_indices=list(fi) if fi is not None else None,
+                         face_centroids=params.get("face_centroids"),
+                         face_boundaries=params.get("face_boundaries"))
+
+
+# ---------------------------------------------------------------------------
+# ExtrudeOp  —  extrude / self-cut sketch loops and/or body faces
 # ---------------------------------------------------------------------------
 
 @dataclass
-class FaceExtrudeOp(Op):
+class ExtrudeOp(Op):
     """
-    Extrude (distance > 0) or self-cut (distance < 0) from a face on a body.
+    Extrude (distance > 0) or cut (distance < 0) one or more profiles —
+    sketch loops and body faces, mixed freely (cad/profile_source.py).
 
-    source_body_id : body whose face is selected
-    face_idx       : index of the face at op-creation time (FaceRef handles
-                     parametric re-resolution during replay)
+    profiles       : ordered ProfileSource list; the first decides the host
+                     body (a sketch's parent body / the face's body) and the
+                     replay style (sketch-first: the host keeps its largest
+                     solid, split pieces go to import children; face-first:
+                     the whole boolean result)
     distance       : signed mm — positive = extrude, negative = cut
-    direction      : unit vector or None (None → use face normal)
-    target_vertex  : world-space point the extrusion depth is measured to, or None
+    direction      : unit vector or None (None → each face's normal)
+    target_vertex  : world-space point the depth is measured to, or None
     start_offset   : mm offset applied to the near end of the tool solid
     end_offset     : mm offset applied to the far end
-    force_new_body : True when the result should be a new body instead of
-                     modifying the source body
+    draft_angle    : taper angle in degrees (signed)
+    force_new_body : every resulting solid becomes a new body
+    merge_body_id  : fuse the extruded tool into this body instead
+    merged_from    : the host body when merging (reopen UI fallback, legacy)
+    along_normal   : ±1 → `direction` is the first sketch's normal (signed)
+                     and follows it when an upstream edit turns the sketch
+                     plane; 0 → `direction` is a fixed world vector.  Bound
+                     once by bind_along_normal() while the normal is still
+                     the authored one.
+
+    In place, a face profile on the host body is re-found on the running
+    shape and extruded glued to it (extrude_face); every other profile is
+    extruded as a free face and fused / cut (extrude_face_direct).
     """
-    source_body_id: str
-    face_idx:       int
-    distance:       float
+    profiles:       list               = field(default_factory=list)
+    distance:       float              = 0.0
     direction:      list[float] | None = None
     target_vertex:  list[float] | None = None
     start_offset:   float = 0.0
     end_offset:     float = 0.0
-    draft_angle:    float = 0.0     # taper angle in degrees (signed)
+    draft_angle:    float = 0.0
     force_new_body: bool  = False
-    face_indices:   list  = None   # face indices (single body, compat)
-    face_refs:      list  = None   # FaceRef per face, built at commit
-    face_pairs:     list  = None   # list of (body_id, face_idx) — multi-body support
-    merge_body_id:  str | None = None  # fuse the extruded tool into this body
+    merge_body_id:  str | None = None
+    merged_from:    str | None = None
+    along_normal:   int   = 0
 
     def __post_init__(self):
-        if self.face_pairs is None:
-            if self.face_indices:
-                self.face_pairs = [(self.source_body_id, fi) for fi in self.face_indices]
-            else:
-                self.face_pairs = [(self.source_body_id, self.face_idx)]
-        if self.face_indices is None:
-            self.face_indices = [fi for _, fi in self.face_pairs
-                                 if _ == self.source_body_id]
-        if self.face_refs is None:
-            self.face_refs = []
+        from cad.profile_source import as_profile
+        self.profiles = [as_profile(p) for p in self.profiles]
 
-    def _resolve_faces_on(self, shape, refs_subset, indices_subset):
-        """Resolve a subset of faces on a given shape. Returns list of (idx, b3d_face)."""
-        resolved = []
-        if refs_subset:
-            for ref in refs_subset:
-                idx, face = ref.find_in(shape)
-                if idx is None:
-                    raise RuntimeError(
-                        f"FaceExtrudeOp: could not re-locate face "
-                        f"(normal={ref.normal}, area={ref.area:.3f})")
-                resolved.append((idx, face))
-        else:
-            all_faces = list(shape.faces())
-            for fi in indices_subset:
-                if fi >= len(all_faces):
-                    raise RuntimeError(f"FaceExtrudeOp: face_idx {fi} out of range")
-                resolved.append((fi, all_faces[fi]))
-        return resolved
+    # -- construction ------------------------------------------------------
+
+    @classmethod
+    def from_sketch(cls, from_sketch_id: str, distance: float = 0.0,
+                    face_indices=None, face_centroids=None, face_boundaries=None,
+                    **kw) -> "ExtrudeOp":
+        from cad.profile_source import SketchProfile
+        prof = SketchProfile(sketch_id=from_sketch_id,
+                             face_indices=None if face_indices is None else list(face_indices),
+                             face_centroids=face_centroids,
+                             face_boundaries=face_boundaries)
+        return cls(profiles=[prof], distance=distance, **kw)
+
+    @classmethod
+    def from_faces(cls, source_body_id: str | None = None, face_idx: int = 0,
+                   distance: float = 0.0, face_pairs=None, face_indices=None,
+                   face_refs=None, **kw) -> "ExtrudeOp":
+        """Body-face extrude: face_pairs [(body_id, face_idx)], else
+        source_body_id + face_indices / face_idx; face_refs align with them."""
+        from cad.profile_source import BodyFaceProfile
+        if face_pairs is None:
+            face_pairs = [(source_body_id, fi) for fi in (face_indices or [face_idx])]
+        refs = list(face_refs or [])
+        profs = [BodyFaceProfile(body_id=b, face_idx=int(fi),
+                                 face_ref=refs[i] if i < len(refs) else None)
+                 for i, (b, fi) in enumerate(face_pairs)]
+        return cls(profiles=profs, distance=distance, **kw)
+
+    # -- views over the profiles ------------------------------------------
+
+    @property
+    def from_sketch_ids(self) -> list[str]:
+        from cad.profile_source import sketch_profiles
+        return [p.sketch_id for p in sketch_profiles(self.profiles)]
+
+    @property
+    def from_sketch_id(self) -> str | None:
+        ids = self.from_sketch_ids
+        return ids[0] if ids else None
+
+    @from_sketch_id.setter
+    def from_sketch_id(self, sid: str) -> None:
+        from cad.profile_source import sketch_profiles
+        sp = sketch_profiles(self.profiles)
+        if sp:
+            sp[0].sketch_id = sid
+
+    @property
+    def face_pairs(self) -> list[tuple]:
+        from cad.profile_source import BodyFaceProfile
+        return [(p.body_id, p.face_idx) for p in self.profiles
+                if isinstance(p, BodyFaceProfile)]
+
+    @property
+    def source_body_id(self) -> str | None:
+        """First face profile's body (failed-entry tagging, reopen)."""
+        pairs = self.face_pairs
+        return pairs[0][0] if pairs else None
+
+    @property
+    def sketch_style(self) -> bool:
+        from cad.profile_source import SketchProfile
+        return bool(self.profiles) and isinstance(self.profiles[0], SketchProfile)
+
+    def host_body_id(self, history) -> str | None:
+        return self.profiles[0].owner_body_id(history) if self.profiles else None
+
+    def creates_body_from_nothing(self, history: "History", entry_index: int) -> bool:
+        """True when this extrude builds its body from scratch: new-body /
+        merge mode, or a first profile that is a world-plane sketch (no prior
+        shape; extrude_face_direct handles shape=None)."""
+        if self.force_new_body or self.merge_body_id is not None:
+            return True
+        if not self.sketch_style:
+            return False
+        se = self.profiles[0].sketch_entry(history)
+        if se is None:
+            return False
+        from cad.plane_ref import WorldPlaneSource
+        return isinstance(se.plane_source, WorldPlaneSource)
+
+    def _mode(self) -> str:
+        if self.force_new_body:
+            return "new"
+        if self.merge_body_id is not None:
+            return "merge"
+        return "inplace"
+
+    def _direction(self, history):
+        """Effective direction once sketches are reprojected (along_normal
+        re-reads the first sketch's normal)."""
+        import numpy as np
+        from cad.profile_source import sketch_profiles
+        d = (np.array(self.direction, dtype=float)
+             if self.direction is not None else None)
+        sp = sketch_profiles(self.profiles)
+        if self.along_normal and d is not None and sp:
+            n = sp[0].plane_normal(history)
+            if n is not None:
+                d = self.along_normal * np.asarray(n, dtype=float)
+        return d
+
+    def _split_glued(self, host, mode):
+        """(glued face profiles, other profiles): in place, faces on the host
+        body extrude glued to it; everything else is a free tool face."""
+        from cad.profile_source import BodyFaceProfile
+        glued, free = [], []
+        for p in self.profiles:
+            if (mode == "inplace" and host is not None
+                    and isinstance(p, BodyFaceProfile) and p.body_id == host):
+                glued.append(p)
+            else:
+                free.append(p)
+        return glued, free
+
+    def _in_place(self, shape, glued, free_faces, direction):
+        """Glued host faces first (re-found after every step), then free
+        faces fused / cut into the running shape."""
+        from cad.operations.extrude import extrude_face, extrude_face_direct
+        kw = dict(direction=direction, start_offset=self.start_offset,
+                  end_offset=self.end_offset, draft_angle=self.draft_angle)
+        current = shape
+        for p in glued:
+            fi, _f = p.locate(current, "ExtrudeOp")
+            current = extrude_face(current, fi, self.distance, **kw)
+        for face in free_faces:
+            current = extrude_face_direct(current, face, self.distance, **kw)
+        return current
+
+    def _tool(self, faces, direction):
+        tool = _extrude_faces_to_tool(faces, self.distance, direction,
+                                      self.start_offset, self.end_offset,
+                                      self.draft_angle)
+        if tool is None:
+            raise RuntimeError("ExtrudeOp: extrude produced no tool")
+        return tool
+
+    # -- replay ------------------------------------------------------------
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
-        """Replay via face_ref resolution + extrude."""
-        import numpy as np
-        from cad.operations.extrude import extrude_face, _do_extrude_solid
-        from build123d import Compound
-        direction = (np.array(self.direction, dtype=float)
-                     if self.direction is not None else None)
+        name = "ExtrudeOp"
+        if not self.profiles:
+            raise RuntimeError(f"{name}: no profiles")
+        entry = history._entries[entry_index]
+        mode = self._mode()
+        host = self.host_body_id(history)
+        glued, free = self._split_glued(host, mode)
+        faces = []
+        for p in free:
+            faces.extend(p.resolve(history, entry_index, name))
+        direction = self._direction(history)
 
-        # Merge-into-target case: the entry is tagged to merge_body_id, so the
-        # `shape` passed in by replay IS that target body's current shape. The
-        # faces being extruded live on the SOURCE body, not the target, so we
-        # resolve them on the source shape, build the tool, and fuse it into
-        # `shape`. Without this, replay would self-extrude faces off the target
-        # (which don't exist there) or drop the merge entirely.
-        if self.merge_body_id is not None and not self.force_new_body:
+        # Merge: the entry is tagged to merge_body_id, so `shape` IS the
+        # target's current shape — rebuild the tool and fuse it in, exactly
+        # as the commit did.
+        if mode == "merge":
             if shape is None:
-                raise RuntimeError(
-                    "FaceExtrudeOp: merge target has no shape on replay")
-            refs = self.face_refs if self.face_refs else []
-            faces = []
-            for i, (bid, fi) in enumerate(self.face_pairs):
-                src_shape = history._shape_for_body_at(bid, entry_index)
-                if src_shape is None:
-                    raise RuntimeError(
-                        f"FaceExtrudeOp (merge): no shape for source body '{bid}'")
-                if i < len(refs):
-                    _, face_obj = refs[i].find_in(src_shape)
-                    if face_obj is None:
-                        raise RuntimeError(
-                            f"FaceExtrudeOp: could not re-locate face on body '{bid}'")
-                else:
-                    all_f = list(src_shape.faces())
-                    if fi >= len(all_f):
-                        raise RuntimeError(f"FaceExtrudeOp: face_idx {fi} out of range")
-                    face_obj = all_f[fi]
-                faces.append(face_obj)
-            tool = _extrude_faces_to_tool(faces, self.distance, direction,
-                                          self.start_offset, self.end_offset,
-                                          self.draft_angle)
-            if tool is None:
-                raise RuntimeError("FaceExtrudeOp: extrude produced no tool")
-            return _fuse_tool_into_target(tool, shape.wrapped)
+                raise RuntimeError(f"{name}: merge target has no shape on replay")
+            return _fuse_tool_into_target(self._tool(faces, direction), shape.wrapped)
 
-        if self.force_new_body:
-            from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-            from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
+        if mode == "new":
+            result = self._tool(faces, direction)
+            own = _child_result(entry, history, entry_index, result, shape,
+                               self.sketch_style, name)
+            if own is not None:
+                return own
+            if not self.sketch_style:
+                return shape                    # legacy: source body unchanged
+            return _largest_solid_with_imports(entry, history, entry_index,
+                                               result, name)
 
-            result_solid = None
-            refs = self.face_refs if self.face_refs else []
-            for i, (bid, fi) in enumerate(self.face_pairs):
-                src_shape = history._shape_for_body_at(bid, entry_index)
-                if src_shape is None:
-                    raise RuntimeError(
-                        f"FaceExtrudeOp (force_new_body): no shape for body '{bid}'")
-                if i < len(refs):
-                    _, face_obj = refs[i].find_in(src_shape)
-                    if face_obj is None:
-                        raise RuntimeError(
-                            f"FaceExtrudeOp: could not re-locate face on body '{bid}'")
-                else:
-                    all_f = list(src_shape.faces())
-                    if fi >= len(all_f):
-                        raise RuntimeError(f"FaceExtrudeOp: face_idx {fi} out of range")
-                    face_obj = all_f[fi]
-                extruded = _do_extrude_solid(face_obj, self.distance, direction,
-                                             start_offset=self.start_offset,
-                                             end_offset=self.end_offset,
-                                             draft_angle=self.draft_angle)
-                if result_solid is None:
-                    result_solid = extruded.wrapped
-                else:
-                    lst_a = TopTools_ListOfShape(); lst_a.Append(result_solid)
-                    lst_b = TopTools_ListOfShape(); lst_b.Append(extruded.wrapped)
-                    fuse = BRepAlgoAPI_Fuse()
-                    fuse.SetArguments(lst_a); fuse.SetTools(lst_b)
-                    fuse.SetRunParallel(True); fuse.Build()
-                    if fuse.IsDone():
-                        result_solid = fuse.Shape()
+        if glued and shape is None:
+            raise RuntimeError(f"{name}: host body has no shape")
+        result = self._in_place(shape, glued, faces, direction)
+        if self.sketch_style:
+            return _largest_solid_with_imports(entry, history, entry_index,
+                                               result, name)
+        return result
 
-            result = Compound(result_solid)
-            entry = history._entries[entry_index]
-            child_body_ids = entry.params.get("child_body_ids", [])
-            if child_body_ids and history._workspace is not None:
-                from cad.solid_ref import (assign_solids_to_children,
-                                           solid_refs_from_dicts)
-                refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
-                assigned = assign_solids_to_children(result, child_body_ids, refs,
-                                                     history._workspace, history,
-                                                     entry_index)
-                from cad.op_revolve_thicken import _own_child_shape
-                return _own_child_shape(entry, child_body_ids, assigned, shape)
-            return shape  # source body (shape) is unchanged
-
-        current = shape
-        refs = list(self.face_refs) if self.face_refs else []
-        same_body_indices = [fi for _, fi in self.face_pairs]
-        n = len(refs) if refs else len(same_body_indices)
-        for i in range(n):
-            if refs:
-                fi, _ = refs[i].find_in(current)
-                if fi is None:
-                    raise RuntimeError(
-                        f"FaceExtrudeOp: could not re-locate face "
-                        f"(normal={refs[i].normal}, area={refs[i].area:.3f})")
-                if i + 1 < len(refs):
-                    refs = refs
-            else:
-                all_f = list(current.faces())
-                fi = same_body_indices[i]
-                if fi >= len(all_f):
-                    raise RuntimeError(f"FaceExtrudeOp: face_idx {fi} out of range")
-            current = extrude_face(current, fi, self.distance,
-                                   direction=direction,
-                                   start_offset=self.start_offset,
-                                   end_offset=self.end_offset,
-                                   draft_angle=self.draft_angle)
-        return current
+    # -- commit ------------------------------------------------------------
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
         try:
@@ -271,172 +465,92 @@ class FaceExtrudeOp(Op):
         return shape_after
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
-        import numpy as np
-        from cad.operations.extrude import extrude_face, _do_extrude_solid
-        from cad.face_ref import FaceRef
-        from build123d import Compound
+        from cad.profile_source import BodyFaceProfile
+        if not self.profiles:
+            raise RuntimeError("[Extrude] Nothing to extrude.")
+        ws = viewport.workspace
+        _apply_live_sketch_selection(self.profiles, viewport)
+        mode = self._mode()
+        host = self.host_body_id(viewport.history)
+        glued, free = self._split_glued(host, mode)
+        faces = []
+        for p in self.profiles:
+            got = p.resolve_live(viewport, "[Extrude]")
+            if isinstance(p, BodyFaceProfile) and not p.is_planar():
+                raise RuntimeError(
+                    f"[Extrude] Face {p.face_idx} on body '{p.body_id}' is not planar.")
+            if p in free:
+                faces.extend(got)
+        direction = self._direction(viewport.history)
+        face_ref  = _entry_face_ref(viewport, self.profiles)
+        op_str    = "cut" if self.distance < 0 else "extrude"
+        profiles  = list(self.profiles)
 
-        mesh = viewport._meshes.get(self.source_body_id)
-        if mesh is None:
-            raise RuntimeError(f"[Extrude] No mesh for body {self.source_body_id}")
-        shape_before = viewport.workspace.current_shape(self.source_body_id)
-        if shape_before is None:
-            raise RuntimeError(f"[Extrude] No shape for body {self.source_body_id}")
-
-        self.face_refs = []
-        face_objs = []
-        for bid, fi in self.face_pairs:
-            bshape = (shape_before if bid == self.source_body_id
-                      else viewport.workspace.current_shape(bid))
-            if bshape is None:
-                raise RuntimeError(f"[Extrude] No shape for body '{bid}'")
-            all_f = list(bshape.faces())
-            if fi >= len(all_f):
-                raise RuntimeError(f"[Extrude] face_idx {fi} out of range on body '{bid}'")
-            ref = FaceRef.from_b3d_face(all_f[fi])
-            if ref is None:
-                raise RuntimeError(f"[Extrude] Face {fi} on body '{bid}' is not planar.")
-            self.face_refs.append(ref)
-            face_objs.append(all_f[fi])
-        face_ref = self.face_refs[0]
-
-        direction    = (np.array(self.direction, dtype=float)
-                        if self.direction is not None else None)
-        op_str       = "cut" if self.distance < 0 else "extrude"
-        op_params    = self.to_params()
+        if mode == "merge":
+            self.merged_from = host
+        op_params = self.to_params()
         # Transient hint from the edit path; consumed below, never stored.
         preserved_body_ids = list((extra_params or {}).get("_preserved_body_ids", []))
         if extra_params:
             op_params.update(extra_params)
         op_params.pop("_preserved_body_ids", None)
-        original_solid_count = len(list(shape_before.solids()))
 
-        # Merge into another body: build the tool from the source face(s) and
-        # fuse it into the target. Tagged to merge_body_id so replay (which
-        # honors merge_body_id) reproduces the same fuse. Single-body picks
-        # only — multi-body picks are forced to new-body mode upstream.
-        if (self.merge_body_id is not None and not self.force_new_body
-                and len(self.face_pairs) <= 1):
-            target_shape = viewport.workspace.current_shape(self.merge_body_id)
+        if mode == "merge":
+            target_shape = ws.current_shape(self.merge_body_id)
             if target_shape is None:
                 raise RuntimeError("[Extrude] Merge target has no shape.")
-            target_occ   = target_shape.wrapped
-            merge_target = self.merge_body_id
-            orig_merge_count = len(list(target_shape.solids()))
-            distance     = self.distance
-            start_offset = self.start_offset
-            end_offset   = self.end_offset
-            draft_angle  = self.draft_angle
-            # merged_from records the source body for the reopen/edit UI.
-            op_params["merged_from"] = self.source_body_id
+            target_occ = target_shape.wrapped
+            count      = len(list(target_shape.solids()))
+            target     = self.merge_body_id
 
             def compute():
-                tool = _extrude_faces_to_tool(face_objs, distance, direction,
-                                              start_offset, end_offset, draft_angle)
-                if tool is None:
-                    raise RuntimeError("Extrude produced no tool.")
-                return _fuse_tool_into_target(tool, target_occ)
+                return _fuse_tool_into_target(self._tool(faces, direction), target_occ)
 
             def finalize(merged):
-                _push_result(viewport, op_str, op_params, merge_target,
-                             None, target_shape, merged, orig_merge_count)
+                _push_result(viewport, op_str, op_params, target,
+                             None, target_shape, merged, count)
+                _clear_sketch_selection(viewport, profiles)
 
             return compute, finalize
 
-        if self.force_new_body:
-            distance     = self.distance
-            body_id      = self.source_body_id
-            start_offset = self.start_offset
-            end_offset   = self.end_offset
-            draft_angle  = self.draft_angle
-
+        if mode == "new":
             def compute():
-                from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-                from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
-                result_occ = None
-                for fo in face_objs:
-                    extruded = _do_extrude_solid(fo, distance, direction,
-                                                 start_offset=start_offset,
-                                                 end_offset=end_offset,
-                                                 draft_angle=draft_angle)
-                    if result_occ is None:
-                        result_occ = extruded.wrapped
-                    else:
-                        lst_a = TopTools_ListOfShape(); lst_a.Append(result_occ)
-                        lst_b = TopTools_ListOfShape(); lst_b.Append(extruded.wrapped)
-                        fuse = BRepAlgoAPI_Fuse()
-                        fuse.SetArguments(lst_a); fuse.SetTools(lst_b)
-                        fuse.SetRunParallel(True); fuse.Build()
-                        if fuse.IsDone():
-                            result_occ = fuse.Shape()
-                return Compound(result_occ)
+                return self._tool(faces, direction)
 
             def finalize(shape_after):
-                from cad.units import format_op_label as _lbl
-                label     = _lbl(op_str, op_params)
-                from cad.solid_ref import solid_refs_to_dicts
-                solids    = list(shape_after.solids())
-                op_params["child_body_ids"] = []
-                # Per-child geometric fingerprint so replay re-locates each
-                # segment by shape, not by OCCT solid-iteration index.
-                op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
-                new_bodies = []
-                for i, solid in enumerate(solids):
-                    preserved = (preserved_body_ids[i]
-                                 if i < len(preserved_body_ids) else None)
-                    # force_new_body: each solid is a brand-new body → fresh
-                    # "Part N". On the edit/re-commit path a preserved id already
-                    # exists; keep its name so re-commits don't rename it or burn
-                    # counter numbers.
-                    existing = viewport.workspace.bodies.get(preserved) if preserved else None
-                    new_name = existing.name if existing else viewport.workspace.next_part_name()
-                    new_body = viewport.workspace.add_body(
-                        new_name, as_compound(solid), body_id=preserved)
-                    new_bodies.append(new_body)
-                    op_params["child_body_ids"].append(new_body.id)
-                    print(f"[Extrude] New body '{new_name}' ({len(list(solid.faces()))} faces)")
-                primary_body = new_bodies[0] if new_bodies else None
-                tag_body_id  = primary_body.id if primary_body else body_id
-                parent_entry = viewport.history.push(
-                    label=label, operation=op_str, params=op_params,
-                    body_id=tag_body_id, face_ref=face_ref,
-                    shape_before=None, shape_after=shape_after)
-                for new_body in new_bodies:
-                    new_body.created_at_entry_id = parent_entry.entry_id
-                viewport._rebuild_bodies({b.id for b in new_bodies})
-                viewport.history_changed.emit()
+                if shape_after is None:
+                    _push_result(viewport, op_str, op_params, host, face_ref,
+                                 None, None, 0)
+                else:
+                    _push_child_bodies(viewport, op_str, op_params, shape_after,
+                                       preserved_body_ids, host, face_ref)
+                _clear_sketch_selection(viewport, profiles)
 
             return compute, finalize
 
-        distance     = self.distance
-        start_offset = self.start_offset
-        end_offset   = self.end_offset
-        draft_angle  = self.draft_angle
-        face_refs_snap = list(self.face_refs)
+        shape_before = ws.current_shape(host) if host else None
+        if glued and shape_before is None:
+            raise RuntimeError(f"[Extrude] No shape for body {host}")
+        count = len(list(shape_before.solids())) if shape_before else 0
 
         def compute():
-            current = shape_before
-            for ref in face_refs_snap:
-                fi, _ = ref.find_in(current)
-                if fi is None:
-                    raise RuntimeError(
-                        f"FaceExtrudeOp compute: could not locate face "
-                        f"(normal={ref.normal}, area={ref.area:.3f})")
-                current = extrude_face(current, fi, distance, direction=direction,
-                                       start_offset=start_offset, end_offset=end_offset,
-                                       draft_angle=draft_angle)
-            if not list(current.solids()):
-                raise RuntimeError("Boolean result has no solids.")
-            return current
+            out = self._in_place(shape_before, glued, faces, direction)
+            if out is None or not list(out.solids()):
+                raise RuntimeError("Extrude produced no solids.")
+            return out
 
         def finalize(shape_after):
-            _push_result(viewport, op_str, op_params, self.source_body_id,
-                         face_ref, shape_before, shape_after, original_solid_count)
+            _push_result(viewport, op_str, op_params, host,
+                         face_ref, shape_before, shape_after, count)
+            _clear_sketch_selection(viewport, profiles)
 
         return compute, finalize
 
+    # -- edit --------------------------------------------------------------
+
     def reopen(self, viewport: Any, history_idx: int) -> None:
         import numpy as np
+        from cad.profile_source import sketch_profiles
         entry = viewport.history.entries[history_idx]
         vp = viewport
 
@@ -445,82 +559,49 @@ class FaceExtrudeOp(Op):
             vp._rebuild_all_meshes()
         vp.history_changed.emit()
 
-        vp._show_extrude_panel(
-            sketch_idx    = None,
-            body_id       = self.source_body_id,
-            face_idx      = self.face_indices[0] if self.face_indices else self.face_idx,
-            editing_entry = entry)
-
-        vp._extrude_face_pairs = list(self.face_pairs)
-
+        sk = sketch_profiles(self.profiles)
+        sketch_idx = vp.history.id_to_index(sk[0].sketch_id) if sk else None
+        pairs = vp._live_face_pairs(self.profiles)
+        if sk:
+            vp._selected_sketch_entry = sketch_idx
+            vp._selected_sketch_face = (list(sk[0].face_indices)
+                                        if sk[0].face_indices else None)
+        first_face = pairs[0] if pairs and not sk else (None, None)
+        vp._show_extrude_panel(sketch_idx=sketch_idx, body_id=first_face[0],
+                               face_idx=first_face[1], editing_entry=entry)
         panel = vp._extrude_panel
         if panel is None:
             return
-
-        if len(self.face_pairs) > 1:
-            panel.clear_face_entries()
-            for bid, fi in self.face_pairs:
-                body = vp.workspace.bodies.get(bid)
-                name = body.name if body else bid
-                panel.add_face_entry(bid, fi, f"{name}  ·  face {fi}")
-            vp._update_panel_mode_lock(panel, self.face_pairs)
+        vp._extrude_sketch_idx = sketch_idx
+        vp._extrude_face_pairs = list(pairs)
+        vp._refresh_extrude_rows()
 
         if self.distance < 0:
             panel._radio_cut.setChecked(True)
             panel._on_mode_changed(1)
 
-        # Restore the picked merge target so re-entering the panel keeps the
-        # user's body choice (only single-body picks can merge — multi-body is
-        # locked to new-body mode above).
-        if (self.merge_body_id and not self.force_new_body
-                and len(self.face_pairs) <= 1
-                and self.merge_body_id in vp.workspace.bodies):
-            panel.set_merge_body(
-                self.merge_body_id,
-                vp.workspace.bodies[self.merge_body_id].name)
-            panel._radio_merge.setChecked(True)
-            panel._on_op_changed(1)
+        # Restore the picked merge TARGET; merged_from is only a fallback for
+        # legacy sketch entries saved before merge_body_id was persisted.
+        if not self.force_new_body:
+            merge_target = (self.merge_body_id
+                            if self.merge_body_id in vp.workspace.bodies
+                            else (self.merged_from if self.sketch_style else None))
+            if merge_target and merge_target in vp.workspace.bodies:
+                panel.set_merge_body(merge_target,
+                                     vp.workspace.bodies[merge_target].name)
+                panel._radio_merge.setChecked(True)
+                panel._on_op_changed(1)
 
-        if self.direction is not None:
-            panel.set_direction(np.array(self.direction, dtype=float))
+        _restore_extrude_fields(panel, entry, self)
 
-        exprs = entry.params.get("exprs", {})
-        if self.start_offset or "start_offset" in exprs:
-            panel._start_offset.set_binding(exprs.get("start_offset"),
-                                            self.start_offset)
-        if self.end_offset or "end_offset" in exprs:
-            panel._end_offset.set_binding(exprs.get("end_offset"),
-                                          self.end_offset)
-
-        if self.draft_angle:
-            panel.set_draft(self.draft_angle)
-
-        if self.target_vertex is not None:
-            panel._radio_vertex.setChecked(True)
-            panel._on_target_mode_changed(1)
-            panel.set_vertex_target(np.array(self.target_vertex, dtype=float))
-        else:
-            panel._spinbox.set_binding(exprs.get("distance"), abs(self.distance))
-
-        panel._emit_preview()
+    # -- params ------------------------------------------------------------
 
     def to_params(self) -> dict:
-        p: dict[str, Any] = {
-            "distance":       abs(self.distance),
-            "face_idx":       self.face_idx,
-            "face_indices":   list(self.face_indices),
-            "face_pairs":     [[bid, fi] for bid, fi in self.face_pairs],
-            "source_body_id": self.source_body_id,
-        }
-        if self.face_refs:
-            p["face_refs"] = [
-                {"normal": list(r.normal), "area": r.area,
-                 "centroid_perp": list(r.centroid_perp),
-                 "centroid_along": r.centroid_along}
-                for r in self.face_refs
-            ]
+        from cad.profile_source import profiles_to_dicts
+        p: dict[str, Any] = {"distance": abs(self.distance),
+                             "profiles": profiles_to_dicts(self.profiles)}
         if self.direction is not None:
-            p["direction"] = self.direction
+            p["direction"] = list(self.direction)
         if self.target_vertex is not None:
             p["target_vertex"] = self.target_vertex
         if self.start_offset:
@@ -533,193 +614,177 @@ class FaceExtrudeOp(Op):
             p["force_new_body"] = True
         if self.merge_body_id is not None:
             p["merge_body_id"] = self.merge_body_id
+        if self.merged_from is not None:
+            p["merged_from"] = self.merged_from
+        if self.along_normal:
+            p["along_normal"] = self.along_normal
         return p
 
     @classmethod
-    def _from_params(cls, params: dict, sign: int = 1) -> "FaceExtrudeOp":
-        from cad.face_ref import FaceRef
-        dist     = float(params.get("distance", 0)) * sign
-        fi       = int(params.get("face_idx", 0))
-        src_body = params.get("source_body_id", "")
-        # "merged_from" is the legacy key the old face-merge commit path wrote;
-        # it stored the SOURCE body there and tagged the entry to the target,
-        # but never recorded the target id in params — so old entries can't be
-        # replayed as merges. New entries store "merge_body_id" (the target).
-        merge_body_id = params.get("merge_body_id")
-        raw_pairs   = params.get("face_pairs")
-        raw_indices = params.get("face_indices")
-        if raw_pairs:
-            face_pairs = [(str(p[0]), int(p[1])) for p in raw_pairs]
-        elif raw_indices:
-            face_pairs = [(src_body, int(i)) for i in raw_indices]
+    def _from_params(cls, params: dict, sign: int = 1) -> "ExtrudeOp":
+        """Current saves carry "profiles"; older ones the SketchExtrudeOp
+        keys (from_sketch_id + face_indices/centroids/boundaries) or the
+        FaceExtrudeOp keys (face_pairs / face_indices / face_idx +
+        source_body_id, face_refs aligned with them)."""
+        from cad.profile_source import (profiles_from_dicts, BodyFaceProfile,
+                                        face_ref_from_dict)
+        if "profiles" in params:
+            profiles = profiles_from_dicts(params["profiles"])
+        elif "from_sketch_id" in params:
+            profiles = [_legacy_sketch_profile(params["from_sketch_id"], params)]
         else:
-            face_pairs = [(src_body, fi)]
-        face_indices = [i for _, i in face_pairs if _ == src_body] or [fi]
-        raw_refs = params.get("face_refs", [])
-        face_refs = [
-            FaceRef(normal=tuple(r["normal"]), area=r["area"],
-                    centroid_perp=tuple(r["centroid_perp"]),
-                    centroid_along=r["centroid_along"])
-            for r in raw_refs
-        ]
+            src = params.get("source_body_id", "")
+            fi = int(params.get("face_idx", 0))
+            if params.get("face_pairs"):
+                pairs = [(str(q[0]), int(q[1])) for q in params["face_pairs"]]
+            elif params.get("face_indices"):
+                pairs = [(src, int(i)) for i in params["face_indices"]]
+            else:
+                pairs = [(src, fi)]
+            refs = [face_ref_from_dict(r) for r in params.get("face_refs") or []]
+            profiles = [BodyFaceProfile(body_id=b, face_idx=i,
+                                        face_ref=refs[k] if k < len(refs) else None)
+                        for k, (b, i) in enumerate(pairs)]
         return cls(
-            source_body_id = src_body,
-            face_idx       = fi,
-            face_indices   = face_indices,
-            face_pairs     = face_pairs,
-            face_refs      = face_refs if face_refs else None,
-            distance       = dist,
-            direction      = params.get("direction"),
-            target_vertex  = params.get("target_vertex"),
-            start_offset   = float(params.get("start_offset", 0.0)),
-            end_offset     = float(params.get("end_offset", 0.0)),
-            draft_angle    = float(params.get("draft_angle", 0.0)),
+            profiles       = profiles,
+            distance       = float(params.get("distance", 0)) * sign,
             force_new_body = bool(params.get("force_new_body", False)),
-            merge_body_id  = merge_body_id,
+            # Legacy face merges stored only "merged_from" (the source), never
+            # the target: they load with merge_body_id=None.
+            merge_body_id  = params.get("merge_body_id"),
+            merged_from    = params.get("merged_from"),
+            along_normal   = int(params.get("along_normal", 0)),
+            **_profile_common_kwargs(params),
         )
 
 
+def _restore_extrude_fields(panel, entry, op) -> None:
+    """Direction / offsets / draft / depth back into a reopened extrude panel."""
+    import numpy as np
+    if op.direction is not None:
+        panel.set_direction(np.array(op.direction, dtype=float))
+    exprs = entry.params.get("exprs", {})
+    if op.start_offset or "start_offset" in exprs:
+        panel._start_offset.set_binding(exprs.get("start_offset"), op.start_offset)
+    if op.end_offset or "end_offset" in exprs:
+        panel._end_offset.set_binding(exprs.get("end_offset"), op.end_offset)
+    if op.draft_angle:
+        panel.set_draft(op.draft_angle)
+    if op.target_vertex is not None:
+        panel._radio_vertex.setChecked(True)
+        panel._on_target_mode_changed(1)
+        panel.set_vertex_target(np.array(op.target_vertex, dtype=float))
+    else:
+        panel._spinbox.set_binding(exprs.get("distance"), abs(op.distance))
+    panel._emit_preview()
+
+
 # ---------------------------------------------------------------------------
-# CrossBodyCutOp  —  cut one body using a face from another body (or sketch)
+# CrossBodyCutOp  —  cut a target body with extruded profiles
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CrossBodyCutOp(Op):
     """
-    Use a face (or sketch profile) extruded as a tool solid to cut a target body.
+    Extrude profiles (sketch loops and/or body faces) into a tool solid and
+    cut it from *cut_body_id*.
 
-    cut_body_id      : body being cut
-    source_body_id   : body whose face defines the tool profile
-    source_face_idx  : face index on source_body (None if driven by sketch)
-    source_sketch_id: entry_id of the driving sketch entry (None if face-driven)
-    distance         : depth of the tool solid (always positive; direction encodes side)
-    direction        : unit vector the tool extends along (same convention
-                       as the preview: outward from the face the user picked,
-                       or whatever the user flipped to via the panel).  When
-                       None, the tool extrudes along the face's inward normal.
-    target_vertex    : world-space point the tool depth is measured to, or None
-    start_offset     : mm offset on near end
-    end_offset       : mm offset on far end
+    cut_body_id  : body being cut
+    profiles     : ProfileSource list (see ExtrudeOp)
+    distance     : depth of the tool solid (always positive; direction
+                   encodes side)
+    direction    : unit vector the tool extends along (same convention as the
+                   preview: outward from the picked face, or whatever the user
+                   flipped to).  None → each face's inward normal.
+    target_vertex, start_offset, end_offset, draft_angle : as ExtrudeOp
+    along_normal : ±1 → `direction` follows the first sketch's normal; see
+                   ExtrudeOp.along_normal / bind_along_normal().
     """
-    cut_body_id:      str
-    source_body_id:   str
-    source_face_idx:  int  | None = None
-    source_sketch_id: str  | None = None
-    distance:          float = 0.0
-    direction:         list[float] | None = None
-    target_vertex:     list[float] | None = None
-    start_offset:      float = 0.0
-    end_offset:        float = 0.0
-    draft_angle:       float = 0.0   # taper angle in degrees (signed)
-    # Baked selection of sketch-face indices the tool is built from (sketch-
-    # driven cuts only). None → use every closed loop the sketch produces.
-    # Baked at commit so replay reproduces the user's selection instead of
-    # reading mutable UI state (see op pick/selection pitfalls).
-    face_indices:      list[int] | None = None
-    # ±1 → `direction` is the sketch normal (signed) and follows it; see
-    # SketchExtrudeOp.along_normal / bind_along_normal().
-    along_normal:      int = 0
+    cut_body_id:   str
+    profiles:      list               = field(default_factory=list)
+    distance:      float              = 0.0
+    direction:     list[float] | None = None
+    target_vertex: list[float] | None = None
+    start_offset:  float = 0.0
+    end_offset:    float = 0.0
+    draft_angle:   float = 0.0
+    along_normal:  int   = 0
 
-    def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
+    def __post_init__(self):
+        from cad.profile_source import as_profile
+        self.profiles = [as_profile(p) for p in self.profiles]
+
+    @classmethod
+    def from_source(cls, cut_body_id: str, source_body_id: str | None = None,
+                    source_face_idx: int | None = None,
+                    source_sketch_id: str | None = None,
+                    face_indices=None, **kw) -> "CrossBodyCutOp":
+        """The pre-profile signature: a sketch (source_sketch_id + optional
+        loop indices) or one body face (source_body_id + source_face_idx)."""
+        from cad.profile_source import SketchProfile, BodyFaceProfile
+        if source_sketch_id is not None:
+            prof = SketchProfile(sketch_id=source_sketch_id,
+                                 face_indices=None if face_indices is None else list(face_indices))
+        else:
+            if source_face_idx is None:
+                raise ValueError("CrossBodyCutOp: give a sketch or a source face")
+            prof = BodyFaceProfile(body_id=source_body_id, face_idx=int(source_face_idx))
+        return cls(cut_body_id=cut_body_id, profiles=[prof], **kw)
+
+    @property
+    def from_sketch_ids(self) -> list[str]:
+        from cad.profile_source import sketch_profiles
+        return [p.sketch_id for p in sketch_profiles(self.profiles)]
+
+    @property
+    def source_sketch_id(self) -> str | None:
+        ids = self.from_sketch_ids
+        return ids[0] if ids else None
+
+    @property
+    def body_id(self) -> str:
+        return self.cut_body_id
+
+    def tool_solid(self, faces, history_or_none=None, normal=None):
+        """Fused tool solid for *faces* (direction resolved by the caller)."""
         import numpy as np
-        from build123d import Compound, Plane
+        from build123d import Plane
         from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
         from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
         from cad.operations.extrude import _do_extrude_solid
-
-        # stored direction IS the tool direction (matches preview convention).
-        # When None, the per-face fallback below extrudes along -face_normal
-        # (into the body the face is on) as a default for face-driven cuts.
-        direction = (np.array(self.direction, dtype=float)
-                     if self.direction is not None else None)
-        tool_dir = direction
-
-        if self.source_sketch_id is not None:
-            sketch_idx = history.id_to_index(self.source_sketch_id)
-            if sketch_idx is None:
-                raise RuntimeError(
-                    f"CrossBodyCutOp: sketch entry '{self.source_sketch_id}' not found")
-            sketch_rec = history._entries[sketch_idx]
-            if sketch_rec.error:
-                raise RuntimeError(
-                    "CrossBodyCutOp: source sketch entry is in an error state")
-            sketch_entry = sketch_rec.params.get("sketch_entry")
-            if sketch_entry is None:
-                raise RuntimeError(
-                    f"CrossBodyCutOp: no sketch_entry at id '{self.source_sketch_id}'")
-            # Reproject the sketch's plane + reference entities against the
-            # shape state as of *this* op's history position — not the sketch's
-            # own position.  The sketch's plane_source is the abstract identity
-            # (e.g. "body A's top face"); its geometric realisation must follow
-            # any intervening operations that moved that face.  Otherwise the
-            # tool solid lands at the sketch's original plane, producing
-            # garbage cuts (or wholesale deletion of the target).
-            if sketch_entry.plane_source is not None:
-                from cad.history import reproject_consumed_sketch
-                ok, err = reproject_consumed_sketch(sketch_entry, history,
-                                                    entry_index, sketch_rec)
-                if not ok:
-                    raise RuntimeError(
-                        f"CrossBodyCutOp: sketch reprojection failed: {err}")
-            if self.along_normal and tool_dir is not None:
-                tool_dir = self.along_normal * np.asarray(sketch_entry.plane_normal, dtype=float)
-            all_faces, _ = sketch_entry.build_faces()
-            if not all_faces:
-                raise RuntimeError("CrossBodyCutOp: sketch has no closed loops")
-            if self.face_indices is not None:
-                # Rebuild the tool from exactly the faces the user selected at
-                # commit. Guard against out-of-range indices from a sketch that
-                # changed shape on replay; fall back to all faces if the baked
-                # selection resolves to nothing.
-                sel = [all_faces[i] for i in self.face_indices
-                       if 0 <= i < len(all_faces)]
-                faces = sel if sel else all_faces
-            else:
-                faces = all_faces
-        else:
-            src_shape = history._shape_for_body_at(self.source_body_id, entry_index)
-            if src_shape is None:
-                raise RuntimeError(
-                    f"CrossBodyCutOp: no shape for source body '{self.source_body_id}'")
-            entry = history._entries[entry_index]
-            face_ref = getattr(entry, "face_ref", None)
-            if face_ref is not None:
-                _, face_obj = face_ref.find_in(src_shape)
-                if face_obj is None:
-                    raise RuntimeError(
-                        f"CrossBodyCutOp: could not locate source face "
-                        f"(normal={face_ref.normal}, area={face_ref.area:.3f})")
-                faces = [face_obj]
-            else:
-                if self.source_face_idx is None:
-                    raise RuntimeError("CrossBodyCutOp: no source_face_idx")
-                faces = [list(src_shape.faces())[self.source_face_idx]]
-
-        tool_dist = self.distance          # exact (see operations/extrude.py)
-
-        tool_solid = None
+        tool = None
         for face in faces:
-            if tool_dir is None:
+            if normal is None:
                 z = Plane(face).z_dir
                 fd = -np.array([z.X, z.Y, z.Z], dtype=float)
             else:
-                fd = tool_dir
-            s = _do_extrude_solid(face, tool_dist, fd,
-                                  start_offset=self.start_offset, end_offset=self.end_offset,
+                fd = normal
+            s = _do_extrude_solid(face, self.distance, fd,
+                                  start_offset=self.start_offset,
+                                  end_offset=self.end_offset,
                                   draft_angle=self.draft_angle)
-            if tool_solid is None:
-                tool_solid = s
+            if tool is None:
+                tool = s
             else:
-                lst_a = TopTools_ListOfShape(); lst_a.Append(tool_solid.wrapped)
+                lst_a = TopTools_ListOfShape(); lst_a.Append(tool.wrapped)
                 lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
-                fuse = BRepAlgoAPI_Fuse()
-                fuse.SetArguments(lst_a); fuse.SetTools(lst_b)
-                fuse.SetRunParallel(True); fuse.Build()
-                if fuse.IsDone():
-                    tool_solid = as_compound(fuse.Shape())
+                fu = BRepAlgoAPI_Fuse()
+                fu.SetArguments(lst_a); fu.SetTools(lst_b)
+                fu.SetRunParallel(True); fu.Build()
+                if fu.IsDone():
+                    tool = as_compound(fu.Shape())
+        return tool
 
+    def _direction(self, history):
+        return ExtrudeOp._direction(self, history)
+
+    def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
+        from cad.profile_source import faces_of
         from cad.operations.boolean import bool_op
-        result = bool_op("cut", [shape], [tool_solid])
+        _fill_legacy_face_refs(self.profiles, history._entries[entry_index])
+        faces = faces_of(self.profiles, history, entry_index, "CrossBodyCutOp")
+        tool = self.tool_solid(faces, normal=self._direction(history))
+        result = bool_op("cut", [shape], [tool])
         if result is None:
             raise RuntimeError("CrossBodyCutOp: boolean cut failed")
         return result
@@ -746,138 +811,71 @@ class CrossBodyCutOp(Op):
         return shape_after
 
     def _split_commit(self, viewport: Any, extra_params: dict | None = None):
-        import numpy as np
-        from build123d import Compound, Plane
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
-        from cad.operations.extrude import _do_extrude_solid
-
-        direction = (np.array(self.direction, dtype=float)
-                     if self.direction is not None else None)
-        # See note in execute(): stored direction is the tool direction.
-        tool_dir = direction
-
-        source_face_ref = None
-        if self.source_sketch_id is not None:
-            sketch_idx = viewport.history.id_to_index(self.source_sketch_id)
-            if sketch_idx is None:
-                raise RuntimeError(f"[Cut] Sketch entry '{self.source_sketch_id}' not found.")
-            entries = viewport.history.entries
-            se = entries[sketch_idx].params.get("sketch_entry")
-            if se is None:
-                raise RuntimeError("[Cut] No sketch_entry found.")
-            all_faces = viewport._sketch_faces.get(sketch_idx, [])
-            if not all_faces:
-                raise RuntimeError("[Cut] Sketch has no faces.")
-            # Prefer indices baked into the op over the mutable viewport
-            # selection — a fan-out commits this op once per body, and the
-            # first finalize clears the selection, which made body 2..N cut
-            # with EVERY loop (see op pick/selection pitfalls).
-            fidx = (self.face_indices if self.face_indices is not None
-                    else viewport._selected_sketch_face)
-            if fidx is not None:
-                faces = [all_faces[i][0] for i in fidx if 0 <= i < len(all_faces)]
-            else:
-                faces = [f[0] for f in all_faces]
-        else:
-            from cad.face_ref import FaceRef, AnyFaceRef
-            src_shape = viewport.workspace.current_shape(self.source_body_id)
-            if src_shape is None:
-                raise RuntimeError("[Cut] Source body has no shape.")
-            if self.source_face_idx is None:
-                raise RuntimeError("[Cut] No source_face_idx.")
-            src_faces_list = list(src_shape.faces())
-            if self.source_face_idx >= len(src_faces_list):
-                raise RuntimeError("[Cut] source_face_idx out of range.")
-            src_face = src_faces_list[self.source_face_idx]
-            source_face_ref = (FaceRef.from_occ_face(src_face.wrapped)
-                               or AnyFaceRef.from_occ_face(src_face.wrapped))
-            faces = [src_face]
+        from cad.profile_source import faces_live, BodyFaceProfile
+        from cad.operations.boolean import bool_op
+        if not self.profiles:
+            raise RuntimeError("[Cut] Nothing to cut with.")
+        # Baked indices win over the mutable viewport selection — a fan-out
+        # commits this op once per body and the first finalize clears it.
+        _apply_live_sketch_selection(self.profiles, viewport)
+        faces = faces_live(self.profiles, viewport, "[Cut]")
+        if not faces:
+            raise RuntimeError("[Cut] Sketch has no faces.")
+        normal = self._direction(viewport.history)
+        first = self.profiles[0]
+        source_face_ref = first.face_ref if isinstance(first, BodyFaceProfile) else None
 
         target_shape = viewport.workspace.current_shape(self.cut_body_id)
         if target_shape is None:
             raise RuntimeError("[Cut] Target body has no shape.")
-        original_solid_count = len(list(target_shape.solids()))
-        target_occ   = target_shape.wrapped
-        tool_dist    = self.distance       # exact (see operations/extrude.py)
-        start_offset = self.start_offset
-        end_offset   = self.end_offset
-        draft_angle  = self.draft_angle
+        count      = len(list(target_shape.solids()))
+        target_occ = target_shape.wrapped
+        profiles   = list(self.profiles)
 
         op_params = self.to_params()
         if extra_params:
             op_params.update(extra_params)
 
         def compute():
-            tool_solid = None
-            for face in faces:
-                if tool_dir is not None:
-                    fd = tool_dir
-                else:
-                    z  = Plane(face).z_dir
-                    fd = -np.array([z.X, z.Y, z.Z], dtype=float)
-                s = _do_extrude_solid(face, tool_dist, fd,
-                                      start_offset=start_offset, end_offset=end_offset,
-                                      draft_angle=draft_angle)
-                if tool_solid is None:
-                    tool_solid = s
-                else:
-                    lst_a = TopTools_ListOfShape(); lst_a.Append(tool_solid.wrapped)
-                    lst_b = TopTools_ListOfShape(); lst_b.Append(s.wrapped)
-                    fuse = BRepAlgoAPI_Fuse()
-                    fuse.SetArguments(lst_a); fuse.SetTools(lst_b)
-                    fuse.SetRunParallel(True); fuse.Build()
-                    if fuse.IsDone():
-                        tool_solid = as_compound(fuse.Shape())
-            from cad.operations.boolean import bool_op
-            result = bool_op("cut", [target_occ], [tool_solid])
+            result = bool_op("cut", [target_occ], [self.tool_solid(faces, normal=normal)])
             if result is None:
                 raise RuntimeError("Boolean cut failed")
             return result
 
         def finalize(result):
             _push_result(viewport, "cut", op_params, self.cut_body_id,
-                         source_face_ref, target_shape, result, original_solid_count,
+                         source_face_ref, target_shape, result, count,
                          split_key="split_from")
-            viewport._selected_sketch_entry = None
-            viewport._selected_sketch_face  = None
+            _clear_sketch_selection(viewport, profiles)
 
         return compute, finalize
 
     def reopen(self, viewport: Any, history_idx: int) -> None:
-        import numpy as np
-        entry      = viewport.history.entries[history_idx]
-        vp         = viewport
-        sketch_idx = (vp.history.id_to_index(self.source_sketch_id)
-                      if self.source_sketch_id is not None else None)
+        from cad.profile_source import sketch_profiles
+        entry = viewport.history.entries[history_idx]
+        vp = viewport
+        sk = sketch_profiles(self.profiles)
+        sketch_idx = vp.history.id_to_index(sk[0].sketch_id) if sk else None
 
         if history_idx > 0:
             vp.history.seek(history_idx - 1)
-            rebuild_id = (self.source_body_id if sketch_idx is None
-                          else entry.body_id)
-            vp._rebuild_body_mesh(rebuild_id)
+            vp._rebuild_all_meshes()
         vp.history_changed.emit()
 
-        face_indices = self.face_indices
-        if sketch_idx is not None:
+        pairs = vp._live_face_pairs(self.profiles)
+        if sk:
             vp._selected_sketch_entry = sketch_idx
-            vp._selected_sketch_face  = list(face_indices) if face_indices else None
-
-        vp._show_extrude_panel(
-            sketch_idx    = sketch_idx,
-            body_id       = self.source_body_id if sketch_idx is None else None,
-            face_idx      = self.source_face_idx if sketch_idx is None else None,
-            editing_entry = entry)
-
+            vp._selected_sketch_face = (list(sk[0].face_indices)
+                                        if sk[0].face_indices else None)
+        first_face = pairs[0] if pairs and not sk else (None, None)
+        vp._show_extrude_panel(sketch_idx=sketch_idx, body_id=first_face[0],
+                               face_idx=first_face[1], editing_entry=entry)
         panel = vp._extrude_panel
         if panel is None:
             return
-
-        # Replace generic "Sketch N" entry with one row per stored face index.
-        if sketch_idx is not None and face_indices:
-            panel.clear_face_entries()
-            for i in face_indices:
-                panel.add_face_entry(None, None, f"Sketch {sketch_idx}  ·  face {i}")
+        vp._extrude_sketch_idx = sketch_idx
+        vp._extrude_face_pairs = list(pairs)
+        vp._refresh_extrude_rows()
 
         panel._radio_cut.setChecked(True)
         panel._on_mode_changed(1)
@@ -886,45 +884,18 @@ class CrossBodyCutOp(Op):
         # leave the target empty so the edit re-fans (no-target cut).
         if (self.cut_body_id in vp.workspace.bodies
                 and "fanout_id" not in entry.params):
-            panel.set_merge_body(
-                self.cut_body_id,
-                vp.workspace.bodies[self.cut_body_id].name)
+            panel.set_merge_body(self.cut_body_id,
+                                 vp.workspace.bodies[self.cut_body_id].name)
 
-        if self.direction is not None:
-            panel.set_direction(np.array(self.direction, dtype=float))
-
-        exprs = entry.params.get("exprs", {})
-        if self.start_offset or "start_offset" in exprs:
-            panel._start_offset.set_binding(exprs.get("start_offset"),
-                                            self.start_offset)
-        if self.end_offset or "end_offset" in exprs:
-            panel._end_offset.set_binding(exprs.get("end_offset"),
-                                          self.end_offset)
-
-        if self.draft_angle:
-            panel.set_draft(self.draft_angle)
-
-        if self.target_vertex is not None:
-            panel._radio_vertex.setChecked(True)
-            panel._on_target_mode_changed(1)
-            panel.set_vertex_target(np.array(self.target_vertex, dtype=float))
-        else:
-            panel._spinbox.set_binding(exprs.get("distance"), abs(self.distance))
-
-        panel._emit_preview()
+        _restore_extrude_fields(panel, entry, self)
 
     def to_params(self) -> dict:
-        p: dict[str, Any] = {
-            "distance":       self.distance,
-            "cut_body_id":    self.cut_body_id,
-            "source_body_id": self.source_body_id,
-        }
-        if self.source_face_idx is not None:
-            p["source_face_idx"] = self.source_face_idx
-        if self.source_sketch_id is not None:
-            p["source_sketch_id"] = self.source_sketch_id
+        from cad.profile_source import profiles_to_dicts
+        p: dict[str, Any] = {"distance": self.distance,
+                             "cut_body_id": self.cut_body_id,
+                             "profiles": profiles_to_dicts(self.profiles)}
         if self.direction is not None:
-            p["direction"] = self.direction
+            p["direction"] = list(self.direction)
         if self.target_vertex is not None:
             p["target_vertex"] = self.target_vertex
         if self.start_offset:
@@ -933,517 +904,28 @@ class CrossBodyCutOp(Op):
             p["end_offset"] = self.end_offset
         if self.draft_angle:
             p["draft_angle"] = self.draft_angle
-        if self.face_indices is not None:
-            p["face_indices"] = list(self.face_indices)
         if self.along_normal:
             p["along_normal"] = self.along_normal
         return p
 
     @classmethod
     def _from_params(cls, params: dict, sign: int = 1) -> "CrossBodyCutOp":
-        fi = params.get("face_indices")
+        """Older saves: source_sketch_id (+ face_indices), or source_body_id +
+        source_face_idx with the face's FaceRef on the history entry."""
+        from cad.profile_source import profiles_from_dicts, BodyFaceProfile
+        if "profiles" in params:
+            profiles = profiles_from_dicts(params["profiles"])
+        elif params.get("source_sketch_id") is not None:
+            profiles = [_legacy_sketch_profile(params["source_sketch_id"], params)]
+        else:
+            profiles = [BodyFaceProfile(body_id=params.get("source_body_id", ""),
+                                        face_idx=int(params.get("source_face_idx") or 0))]
         return cls(
-            cut_body_id      = params.get("cut_body_id", ""),
-            source_body_id   = params.get("source_body_id", ""),
-            source_face_idx  = params.get("source_face_idx"),
-            source_sketch_id = params.get("source_sketch_id"),
-            distance         = float(params.get("distance", 0)),
-            direction        = params.get("direction"),
-            target_vertex    = params.get("target_vertex"),
-            start_offset     = float(params.get("start_offset", 0.0)),
-            end_offset       = float(params.get("end_offset", 0.0)),
-            draft_angle      = float(params.get("draft_angle", 0.0)),
-            face_indices     = list(fi) if fi is not None else None,
-            along_normal     = int(params.get("along_normal", 0)),
-        )
-
-
-# ---------------------------------------------------------------------------
-# SketchExtrudeOp  —  extrude or cut a sketch profile
-# ---------------------------------------------------------------------------
-
-@dataclass
-class SketchExtrudeOp(Op):
-    """
-    Extrude (or cut) a closed-loop profile built from a SketchEntry.
-
-    from_sketch_id  : entry_id of the sketch entry
-    distance        : signed mm — positive = extrude, negative = cut
-    merge_body_id   : body to fuse/cut into, or None for a new body
-    face_indices    : which faces of the sketch to extrude (None = all)
-    direction       : unit vector or None
-    target_vertex   : world-space depth target, or None
-    start_offset    : mm
-    end_offset      : mm
-    force_new_body  : True → always create a new body
-    merged_from     : source body id when fusing into another body (legacy key)
-    along_normal    : ±1 → `direction` is the sketch normal (signed) and must
-                      follow it when an upstream edit turns the sketch plane;
-                      0 → `direction` is a fixed custom world vector.  Bound
-                      once by bind_along_normal() while the normal is still
-                      the authored one.
-    """
-    from_sketch_id: str
-    distance:        float
-    merge_body_id:   str  | None       = None
-    face_indices:    list[int] | None  = None
-    face_centroids:  list[list[float]] | None = None
-    face_boundaries:  list[list[str]] | None = None
-    direction:       list[float] | None = None
-    target_vertex:   list[float] | None = None
-    start_offset:    float = 0.0
-    end_offset:      float = 0.0
-    draft_angle:     float = 0.0       # taper angle in degrees (signed)
-    force_new_body:  bool  = False
-    merged_from:     str   | None = None
-    along_normal:    int   = 0
-
-    def creates_body_from_nothing(self, history: "History", entry_index: int) -> bool:
-        """
-        True when this sketch extrude is rooted on a world plane and has no
-        prior shape on its body — i.e. it's creating the body from scratch.
-        extrude_face_direct() handles shape=None for exactly this case.
-        """
-        if self.force_new_body or self.merge_body_id is not None:
-            return True
-        sketch_idx = history.id_to_index(self.from_sketch_id)
-        if sketch_idx is None:
-            return False
-        se = history._entries[sketch_idx].params.get("sketch_entry")
-        if se is None:
-            return False
-        from cad.plane_ref import WorldPlaneSource
-        return isinstance(se.plane_source, WorldPlaneSource)
-
-    def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
-        from cad.operations.extrude import extrude_face_direct
-        from build123d import Compound
-
-        sketch_idx = history.id_to_index(self.from_sketch_id)
-        if sketch_idx is None:
-            raise RuntimeError(
-                f"SketchExtrudeOp: sketch entry '{self.from_sketch_id}' not found")
-        if sketch_idx >= entry_index:
-            raise RuntimeError(
-                f"SketchExtrudeOp: sketch entry is after this entry — invalid reorder")
-
-        sketch_entry_rec = history._entries[sketch_idx]
-        if sketch_entry_rec.error:
-            raise RuntimeError(f"SketchExtrudeOp: sketch entry is in an error state")
-
-        se = sketch_entry_rec.params.get("sketch_entry")
-        if se is None:
-            raise RuntimeError(
-                f"SketchExtrudeOp: no sketch_entry at id '{self.from_sketch_id}'")
-
-        if se.plane_source is not None:
-            from cad.history import reproject_consumed_sketch
-            # Reproject at *this* op's history position so the sketch's plane
-            # follows any intervening operations on its parent body.  Using
-            # sketch_idx would freeze the plane at the sketch's creation time
-            # and produce wrong geometry when something moved the parent face
-            # between the sketch and this extrude.  Falls back to the authored
-            # plane if an intervening op destroyed the anchor face.
-            ok, err = reproject_consumed_sketch(se, history, entry_index,
-                                                sketch_entry_rec)
-            if not ok:
-                # No trustworthy plane (sketch entry itself errored) — fail
-                # loudly instead of extruding against stale geometry.
-                raise RuntimeError(
-                    f"SketchExtrudeOp: sketch reprojection failed: {err}")
-
-        all_faces, all_regions = se.build_faces()
-        if not all_faces:
-            raise RuntimeError("SketchExtrudeOp: sketch has no closed loops")
-
-        if self.face_centroids:
-            import numpy as np
-            from cad.op_base import _match_sketch_faces
-            from cad.op_base import _lost_region_warning
-            lost = []
-            faces, matched = _match_sketch_faces(
-                se, all_faces, all_regions, self.face_centroids,
-                self.face_boundaries, "SketchExtrudeOp", lost)
-            _lost_region_warning(history, entry_index, lost)
-            if not self.face_boundaries:
-                self.face_boundaries = matched   # backfill (see History.replay_from)
-        elif self.face_indices is not None:
-            faces = [all_faces[i] for i in self.face_indices if i < len(all_faces)]
-            if not faces:
-                raise RuntimeError("SketchExtrudeOp: stored face indices out of range")
-        else:
-            faces = all_faces
-
-        signed_dist = -abs(self.distance) if self.distance < 0 else abs(self.distance)
-
-        import numpy as np
-        direction = (np.array(self.direction, dtype=float)
-                     if self.direction is not None else None)
-        if self.along_normal and direction is not None:
-            direction = self.along_normal * np.asarray(se.plane_normal, dtype=float)
-
-        # Merge-into-target case: the entry is tagged to merge_body_id, so the
-        # `shape` passed in by replay IS that target body's current shape. Build
-        # the tool from the sketch profile and fuse it in, reproducing the
-        # commit. Without this, replay would diverge — dropping disjoint solids
-        # (only solids[0] is returned below) or reordering them by volume so the
-        # split-import children no longer line up.
-        if self.merge_body_id is not None and not self.force_new_body:
-            if shape is None:
-                raise RuntimeError(
-                    "SketchExtrudeOp: merge target has no shape on replay")
-            tool = _extrude_faces_to_tool(faces, signed_dist, direction,
-                                          self.start_offset, self.end_offset,
-                                          self.draft_angle)
-            if tool is None:
-                raise RuntimeError("SketchExtrudeOp: extrude produced no tool")
-            return _fuse_tool_into_target(tool, shape.wrapped)
-
-        result = shape
-        for face in faces:
-            result = extrude_face_direct(result, face, signed_dist,
-                                         direction=direction,
-                                         start_offset=self.start_offset,
-                                         end_offset=self.end_offset,
-                                         draft_angle=self.draft_angle)
-
-        entry = history._entries[entry_index]
-        child_body_ids = entry.params.get("child_body_ids", [])
-
-        # force_new_body split: each disjoint profile becomes its own child
-        # body. The commit path (finalize() in _split_commit) creates those
-        # bodies; this branch is its replay mirror — without it, reload leaves
-        # the non-primary children with no shape. Assign by SolidRef so each
-        # child gets *its* segment regardless of OCCT solid-iteration order
-        # (positional index is not reproducible across rebuilds). The parent
-        # entry is tagged to the primary child, so we return that child's solid.
-        if self.force_new_body and child_body_ids:
-            from cad.solid_ref import assign_solids_to_children, solid_refs_from_dicts
-            if not list(result.solids()):
-                raise RuntimeError("SketchExtrudeOp: result contains no solids")
-            refs = solid_refs_from_dicts(entry.params.get("child_solid_refs"))
-            assigned = assign_solids_to_children(
-                result, child_body_ids, refs, history._workspace,
-                history, entry_index)
-            if assigned[0] is None:
-                raise RuntimeError(
-                    "SketchExtrudeOp: could not assign a solid to the primary "
-                    "child body")
-            return assigned[0]
-
-        solids = list(result.solids())
-        solids.sort(key=lambda s: s.volume, reverse=True)
-        if not solids:
-            raise RuntimeError("SketchExtrudeOp: result contains no solids")
-
-        this_id = entry.entry_id
-        for j in range(entry_index + 1, len(history._entries)):
-            e = history._entries[j]
-            if (e.operation == "import" and
-                    e.params.get("source_entry_id") == this_id):
-                solid_idx = e.params.get("solid_index", 1)
-                e.shape_after = solids[solid_idx] if solid_idx < len(solids) else None
-
-        return solids[0]
-
-    def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
-        try:
-            compute, finalize = self._split_commit(viewport, extra_params)
-        except Exception as ex:
-            print(f"[Op] FAILED: {ex}")
-            self._push_failed_entry(viewport, str(ex), extra_params)
-            return None
-        try:
-            shape_after = compute()
-        except Exception as ex:
-            print(f"[Op] FAILED: {ex}")
-            shape_after = None
-            viewport._pending_op_error = str(ex)
-        else:
-            viewport._pending_op_error = None
-        try:
-            finalize(shape_after)
-        finally:
-            viewport._pending_op_error = None
-        return shape_after
-
-    def _split_commit(self, viewport: Any, extra_params: dict | None = None):
-        import numpy as np
-        from cad.operations.extrude import extrude_face_direct, _do_extrude_solid
-        from build123d import Compound
-        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-        from OCP.collections import List_TopoDS_Shape as TopTools_ListOfShape
-        from cad.face_ref import FaceRef
-
-        entries    = viewport.history.entries
-        sketch_idx = viewport.history.id_to_index(self.from_sketch_id)
-        if sketch_idx is None:
-            raise RuntimeError(f"[Extrude] Sketch entry '{self.from_sketch_id}' not found.")
-        se = entries[sketch_idx].params.get("sketch_entry")
-        if se is None:
-            raise RuntimeError("[Extrude] No sketch entry.")
-        all_faces = viewport._sketch_faces.get(sketch_idx, [])
-        if not all_faces:
-            raise RuntimeError("[Extrude] Sketch has no closed loops.")
-
-        # Prefer indices baked into the op (edit path) over the mutable
-        # viewport selection (see op pick/selection pitfalls).
-        fidx = (self.face_indices if self.face_indices is not None
-                else viewport._selected_sketch_face)
-        if fidx is not None:
-            face_indices = [i for i in fidx if 0 <= i < len(all_faces)]
-        else:
-            face_indices = list(range(len(all_faces)))
-        faces = [all_faces[i][0] for i in face_indices]
-
-        def _uv_centroid(outer_uvs):
-            arr = np.array(outer_uvs)
-            return arr.mean(axis=0).tolist()
-        face_centroids = [_uv_centroid(all_faces[i][1]) for i in face_indices]
-        _bounds = se.build_face_boundaries()
-        face_boundaries = [sorted(_bounds[i]) for i in face_indices
-                           if i < len(_bounds)]
-
-        body_id      = se.body_id
-        shape_before = viewport.workspace.current_shape(body_id)
-        direction    = (np.array(self.direction, dtype=float)
-                        if self.direction is not None else None)
-        op_str    = "cut" if self.distance < 0 else "extrude"
-        op_params = {"distance": abs(self.distance),
-                     "from_sketch_id": self.from_sketch_id,
-                     "face_indices": face_indices,
-                     "face_centroids": face_centroids,
-                     "face_boundaries": face_boundaries}
-        if self.force_new_body:
-            op_params["force_new_body"] = True
-        if direction is not None:
-            op_params["direction"] = direction.tolist()
-        # Transient hint from the edit path; consumed below, never stored.
-        preserved_body_ids = list((extra_params or {}).get("_preserved_body_ids", []))
-        if extra_params:
-            op_params.update(extra_params)
-        op_params.pop("_preserved_body_ids", None)
-        mesh     = viewport._meshes.get(body_id)
-        face_ref = (FaceRef.from_b3d_face(mesh.occt_faces[se.face_idx]) if mesh else None)
-        distance     = self.distance
-        start_offset = self.start_offset
-        end_offset   = self.end_offset
-        draft_angle  = self.draft_angle
-
-        if self.merge_body_id is not None and not self.force_new_body:
-            target_shape = viewport.workspace.current_shape(self.merge_body_id)
-            if target_shape is None:
-                raise RuntimeError("[Extrude] Merge target has no shape.")
-            target_occ = target_shape.wrapped
-            original_solid_count = len(list(target_shape.solids()))
-            # Store merge_body_id (the target) so replay can reproduce the
-            # fuse. merged_from (the source) is kept for the reopen/edit UI.
-            merge_params = {"distance": abs(distance), "merged_from": body_id,
-                            "merge_body_id": self.merge_body_id,
-                            "from_sketch_id": self.from_sketch_id,
-                            "face_indices": face_indices,
-                            "face_centroids": face_centroids,
-                            "face_boundaries": face_boundaries}
-            if direction is not None:
-                merge_params["direction"] = direction.tolist()
-            if extra_params:
-                merge_params.update(extra_params)
-            merge_body_id = self.merge_body_id
-
-            def compute():
-                tool_solid = _extrude_faces_to_tool(
-                    faces, distance, direction,
-                    start_offset, end_offset, draft_angle)
-                if tool_solid is None:
-                    raise RuntimeError("Extrude produced no tool.")
-                return _fuse_tool_into_target(tool_solid, target_occ)
-
-            def finalize(merged):
-                _push_result(viewport, "extrude", merge_params, merge_body_id,
-                             None, target_shape, merged, original_solid_count)
-                viewport._selected_sketch_entry = None
-                viewport._selected_sketch_face  = None
-
-            return compute, finalize
-
-        original_solid_count = len(list(shape_before.solids())) if shape_before else 0
-        force_new = self.force_new_body
-
-        def compute():
-            result = None if force_new else shape_before
-            for face in faces:
-                result = extrude_face_direct(result, face, distance, direction=direction,
-                                             start_offset=start_offset, end_offset=end_offset,
-                                             draft_angle=draft_angle)
-            if not force_new and not list(result.solids()):
-                raise RuntimeError("Sketch extrude produced no solids.")
-            return result
-
-        def finalize(shape_after):
-            if force_new:
-                from cad.units import format_op_label as _lbl
-                from cad.solid_ref import solid_refs_to_dicts
-                solids     = list(shape_after.solids())
-                op_params["child_body_ids"] = []
-                # Geometric fingerprint per child, aligned with child_body_ids,
-                # so replay re-locates each segment by shape instead of by
-                # OCCT's (non-reproducible) solid-iteration index.
-                op_params["child_solid_refs"] = solid_refs_to_dicts(solids)
-                new_bodies = []
-                for i, solid in enumerate(solids):
-                    # Reuse the original body_id if the edit path supplied one
-                    # for this solid index — keeps downstream ops pointing at
-                    # the same body across parametric edits.
-                    preserved = (preserved_body_ids[i]
-                                 if i < len(preserved_body_ids) else None)
-                    # Fresh "Part N" for a genuinely new body; keep the existing
-                    # name (and counter) when re-committing an edit.
-                    existing = viewport.workspace.bodies.get(preserved) if preserved else None
-                    new_name = existing.name if existing else viewport.workspace.next_part_name()
-                    new_body = viewport.workspace.add_body(
-                        new_name, as_compound(solid), body_id=preserved)
-                    new_bodies.append(new_body)
-                    op_params["child_body_ids"].append(new_body.id)
-                    print(f"[Extrude] New body '{new_name}' ({len(list(solid.faces()))} faces)")
-                primary_body = new_bodies[0] if new_bodies else None
-                tag_body_id  = primary_body.id if primary_body else body_id
-                parent_entry = viewport.history.push(
-                    label=_lbl(op_str, op_params), operation=op_str,
-                    params=op_params, body_id=tag_body_id, face_ref=face_ref,
-                    shape_before=None, shape_after=shape_after)
-                for new_body in new_bodies:
-                    new_body.created_at_entry_id = parent_entry.entry_id
-                viewport._rebuild_bodies({b.id for b in new_bodies})
-                viewport.history_changed.emit()
-            else:
-                _push_result(viewport, op_str, op_params, body_id,
-                             face_ref, shape_before, shape_after, original_solid_count)
-            viewport._selected_sketch_entry = None
-            viewport._selected_sketch_face  = None
-
-        return compute, finalize
-
-    def reopen(self, viewport: Any, history_idx: int) -> None:
-        import numpy as np
-        entry      = viewport.history.entries[history_idx]
-        vp         = viewport
-        sketch_idx = vp.history.id_to_index(self.from_sketch_id)
-
-        if history_idx > 0:
-            vp.history.seek(history_idx - 1)
-            vp._rebuild_all_meshes()
-        vp.history_changed.emit()
-
-        vp._selected_sketch_entry = sketch_idx
-        face_indices = self.face_indices
-        vp._selected_sketch_face  = list(face_indices) if face_indices else None
-
-        vp._show_extrude_panel(
-            sketch_idx    = sketch_idx,
-            body_id       = None,
-            face_idx      = None,
-            editing_entry = entry)
-
-        panel = vp._extrude_panel
-        if panel is None:
-            return
-
-        # Replace generic "Sketch N" entry with one row per stored face index.
-        if face_indices:
-            panel.clear_face_entries()
-            for i in face_indices:
-                panel.add_face_entry(None, None, f"Sketch {sketch_idx}  ·  face {i}")
-
-        if self.distance < 0:
-            panel._radio_cut.setChecked(True)
-            panel._on_mode_changed(1)
-
-        # Restore the picked merge TARGET. merge_body_id is the body the user
-        # chose to merge into; merged_from is only a fallback for legacy entries
-        # saved before merge_body_id was persisted (it held the sketch's parent
-        # body, which is the target only when they happen to coincide).
-        merge_target = (self.merge_body_id
-                        if self.merge_body_id in vp.workspace.bodies
-                        else self.merged_from)
-        if merge_target and merge_target in vp.workspace.bodies:
-            panel.set_merge_body(
-                merge_target,
-                vp.workspace.bodies[merge_target].name)
-            panel._radio_merge.setChecked(True)
-            panel._on_op_changed(1)
-
-        if self.direction is not None:
-            panel.set_direction(np.array(self.direction, dtype=float))
-
-        exprs = entry.params.get("exprs", {})
-        if self.start_offset or "start_offset" in exprs:
-            panel._start_offset.set_binding(exprs.get("start_offset"),
-                                            self.start_offset)
-        if self.end_offset or "end_offset" in exprs:
-            panel._end_offset.set_binding(exprs.get("end_offset"),
-                                          self.end_offset)
-
-        if self.draft_angle:
-            panel.set_draft(self.draft_angle)
-
-        if self.target_vertex is not None:
-            panel._radio_vertex.setChecked(True)
-            panel._on_target_mode_changed(1)
-            panel.set_vertex_target(np.array(self.target_vertex, dtype=float))
-        else:
-            panel._spinbox.set_binding(exprs.get("distance"), abs(self.distance))
-
-        panel._emit_preview()
-
-    def to_params(self) -> dict:
-        p: dict[str, Any] = {
-            "distance":       abs(self.distance),
-            "from_sketch_id": self.from_sketch_id,
-        }
-        if self.merge_body_id is not None:
-            p["merge_body_id"] = self.merge_body_id
-        if self.merged_from is not None:
-            p["merged_from"] = self.merged_from
-        if self.face_indices is not None:
-            p["face_indices"] = self.face_indices
-        if self.face_centroids is not None:
-            p["face_centroids"] = self.face_centroids
-        if self.face_boundaries is not None:
-            p["face_boundaries"] = self.face_boundaries
-        if self.direction is not None:
-            p["direction"] = self.direction
-        if self.target_vertex is not None:
-            p["target_vertex"] = self.target_vertex
-        if self.start_offset:
-            p["start_offset"] = self.start_offset
-        if self.end_offset:
-            p["end_offset"] = self.end_offset
-        if self.draft_angle:
-            p["draft_angle"] = self.draft_angle
-        if self.force_new_body:
-            p["force_new_body"] = True
-        if self.along_normal:
-            p["along_normal"] = self.along_normal
-        return p
-
-    @classmethod
-    def _from_params(cls, params: dict, sign: int = 1) -> "SketchExtrudeOp":
-        dist = float(params.get("distance", 0)) * sign
-        return cls(
-            from_sketch_id = params["from_sketch_id"],
-            distance       = dist,
-            merge_body_id  = params.get("merge_body_id"),
-            face_indices   = params.get("face_indices"),
-            face_centroids = params.get("face_centroids"),
-            face_boundaries = params.get("face_boundaries"),
-            direction      = params.get("direction"),
-            target_vertex  = params.get("target_vertex"),
-            start_offset   = float(params.get("start_offset", 0.0)),
-            end_offset     = float(params.get("end_offset", 0.0)),
-            draft_angle    = float(params.get("draft_angle", 0.0)),
-            force_new_body = bool(params.get("force_new_body", False)),
-            merged_from    = params.get("merged_from"),
-            along_normal   = int(params.get("along_normal", 0)),
+            cut_body_id  = params.get("cut_body_id", ""),
+            profiles     = profiles,
+            distance     = float(params.get("distance", 0)),
+            along_normal = int(params.get("along_normal", 0)),
+            **_profile_common_kwargs(params),
         )
 
 
@@ -1527,28 +1009,25 @@ class ImportOp(Op):
 
 
 def bind_along_normal(history, entry) -> None:
-    """Record whether a sketch-driven extrude/cut's stored direction is just
-    its sketch's normal (the panel's default) — see SketchExtrudeOp.along_normal.
+    """Record whether an extrude/cut's stored direction is just its first
+    sketch's normal (the panel's default) — see ExtrudeOp.along_normal.
     Call while the sketch plane is still the one the op was authored
     against: at push, or on load before the first replay.  No-op once bound
-    (the "along_normal" key is present) or for other ops."""
+    (the "along_normal" key is present) or for ops without a sketch profile."""
     import numpy as np
+    from cad.profile_source import sketch_profiles
     op = entry.op
-    if isinstance(op, SketchExtrudeOp):
-        sketch_id = op.from_sketch_id
-    elif isinstance(op, CrossBodyCutOp) and op.source_sketch_id is not None:
-        sketch_id = op.source_sketch_id
-    else:
+    if not isinstance(op, (ExtrudeOp, CrossBodyCutOp)):
         return
-    if "along_normal" in entry.params:
+    sp = sketch_profiles(op.profiles)
+    if not sp or "along_normal" in entry.params:
         return
     sign = 0
     if op.direction is not None:
-        idx = history.id_to_index(sketch_id)
-        se = history._entries[idx].params.get("sketch_entry") if idx is not None else None
-        if se is not None and se.plane_normal is not None:
+        n = sp[0].plane_normal(history)
+        if n is not None:
             d = np.asarray(op.direction, dtype=float)
-            dot = float(np.dot(d / np.linalg.norm(d), np.asarray(se.plane_normal, dtype=float)))
+            dot = float(np.dot(d / np.linalg.norm(d), np.asarray(n, dtype=float)))
             if abs(abs(dot) - 1.0) < 1e-9:
                 sign = 1 if dot > 0 else -1
     op.along_normal = sign

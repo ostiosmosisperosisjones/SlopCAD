@@ -65,11 +65,11 @@ class EdgeRef:
 
     @classmethod
     def from_dict(cls, d: dict) -> "EdgeRef":
-        from cad.face_origin import EdgeOrigin
+        from cad.face_origin import edge_origin_from_dict
         return cls(midpoint=tuple(d["midpoint"]), length=float(d["length"]),
                    tangent=tuple(d["tangent"]),
                    face_sigs=list(d.get("face_sigs", [])),
-                   origin=EdgeOrigin.from_dict(d.get("origin")))
+                   origin=edge_origin_from_dict(d.get("origin")))
 
     def resolve(self, history, shape):
         """The TopoDS_Edge this names in shape now, or None. Provenance

@@ -476,8 +476,12 @@ class ThickenMixin:
             body = self.workspace.bodies.get(bid)
             if body is not None and body.created_at_entry_id in group_entry_ids:
                 removable_bodies.add(bid)
+        keep_id = (self.history.entries[min(group_indices)].entry_id, min(group_indices))
         for j in reversed(group_indices):
             self.history.delete(j)
+        # The re-commit keeps the entry id: downstream refs name it (revolve /
+        # extrude cap and chamfer face origins of planes and edge picks).
+        self.history.reuse_entry_id(*keep_id)
         for bid in removable_bodies:
             if bid in self.workspace.bodies:
                 self.workspace.remove_body(bid)
