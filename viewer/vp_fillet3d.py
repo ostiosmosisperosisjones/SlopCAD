@@ -595,6 +595,12 @@ class Fillet3DMixin:
         from gui.expr_spinbox import exprs_extra
         panel = getattr(self, '_fillet3d_panel', None)
         extra = exprs_extra(radius=panel._spinbox if panel else None)
+        # Per-edge overrides typed as expressions: "edge_radii.<row>" keys
+        # (cad.history._apply_bindings writes them into that list slot).
+        for pos, b in enumerate(panel.edge_radius_bindings() if panel else []):
+            if b and pos < len(edge_radii) and isinstance(edge_radii[pos], (int, float)):
+                extra = extra or {}
+                extra.setdefault("exprs", {})[f"edge_radii.{pos}"] = b
 
         if editing_idx is not None:
             self._editing_fillet3d_idx = None
@@ -647,13 +653,16 @@ class Fillet3DMixin:
             body = self.workspace.bodies.get(op.source_body_id)
             name = body.name if body else "Body"
             edge_radii = getattr(op, "edge_radii", []) or []
+            exprs = entry.params.get("exprs", {})
             for pos, ei in enumerate(edge_indices):
                 r = edge_radii[pos] if pos < len(edge_radii) else None
                 # Tapers ([r1,r2]) can't be shown in a single row spinbox; seed
                 # the row only when the override is a scalar.
                 seed = r if isinstance(r, (int, float)) else None
                 panel.add_edge_entry(op.source_body_id, ei,
-                                     f"{name}  ·  edge {ei}", radius=seed)
+                                     f"{name}  ·  edge {ei}", radius=seed,
+                                     binding=exprs.get(f"edge_radii.{pos}")
+                                     if seed is not None else None)
 
     def _commit_fillet3d_edit(self, body_id: str, face_indices: list,
                                edge_indices: list, radius: float,

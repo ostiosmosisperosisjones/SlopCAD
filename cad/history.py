@@ -599,6 +599,18 @@ class History:
             if v < 0:
                 raise ValueError(f"{key} = {b.get('expr')!r} evaluates to "
                                  f"{v:g} — must be positive")
+            field, _, slot = key.partition(".")
+            if slot:
+                # "edge_radii.2": a slot of a list field (fillet per-edge
+                # radius overrides).
+                lst = new.get(field, list(entry.params.get(field) or []))
+                pos = int(slot)
+                if pos >= len(lst):
+                    lst.extend([None] * (pos + 1 - len(lst)))
+                if lst[pos] != v:
+                    lst[pos] = v
+                    new[field] = lst
+                continue
             old = entry.params.get(key, 0)
             if isinstance(old, (int, float)) and old < 0:
                 v = -v

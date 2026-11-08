@@ -242,8 +242,8 @@ class Fillet3DPanel(QWidget):
         self._face_list.clear()
 
     def add_edge_entry(self, body_id: str | None, edge_idx: int | None, label: str,
-                       radius: float | None = None):
-        self._edge_list.add((body_id, edge_idx), label, value=radius)
+                       radius: float | None = None, binding: dict | None = None):
+        self._edge_list.add((body_id, edge_idx), label, value=radius, binding=binding)
 
     def remove_edge_entry(self, index: int):
         self._edge_list.remove_at(index)
@@ -279,6 +279,11 @@ class Fillet3DPanel(QWidget):
         """Per-edge radii aligned with the edge rows: each a float override or
         None (use the default radius)."""
         return list(self._edge_list.values)
+
+    def edge_radius_bindings(self) -> list:
+        """Per-edge parameter bindings aligned with the edge rows (None where a
+        row is a plain number or uses the default radius)."""
+        return list(self._edge_list.bindings)
 
     def _fire_preview(self):
         v = self._spinbox.mm_value()

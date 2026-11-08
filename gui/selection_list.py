@@ -65,6 +65,10 @@ class SelectionList(QWidget):
         # they survive _rebuild().
         self._per_row_value = per_row_value
         self._values: list[float | None] = []
+        # Parallel to _values: the row spinbox's parameter binding (an
+        # expression typed into the row) or None, so it survives _rebuild()
+        # and reaches the op's params["exprs"].
+        self._bindings: list[dict | None] = []
 
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -92,17 +96,24 @@ class SelectionList(QWidget):
         """Per-row mm values (per_row_value mode); None where unset."""
         return list(self._values)
 
+    @property
+    def bindings(self) -> list:
+        """Per-row parameter bindings (per_row_value mode); None where the
+        row holds a plain number or nothing."""
+        return list(self._bindings)
+
     def set_value(self, index: int, value: float | None):
         """Set a row's mm value without rebuilding the whole list."""
         if 0 <= index < len(self._values):
             self._values[index] = value
+            self._bindings[index] = None
             self._rebuild()
 
     def __len__(self) -> int:
         return len(self._entries)
 
     def add(self, key, label: str, *, valid: bool = True, tooltip: str = "",
-            value: float | None = None) -> bool:
+            value: float | None = None, binding: dict | None = None) -> bool:
         """Add an entry. Returns False (no-op) if key already present.
 
         value seeds the per-row spinbox (per_row_value mode); None leaves it
@@ -111,6 +122,7 @@ class SelectionList(QWidget):
             return False
         self._entries.append((key, label, valid, tooltip))
         self._values.append(value)
+        self._bindings.append(binding if value is not None else None)
         self._rebuild()
         return True
 
@@ -119,12 +131,14 @@ class SelectionList(QWidget):
             self._entries.pop(index)
             if index < len(self._values):
                 self._values.pop(index)
+                self._bindings.pop(index)
             self._rebuild()
             self.entry_removed.emit(index)
 
     def clear(self):
         self._entries.clear()
         self._values.clear()
+        self._bindings.clear()
         self._rebuild()
 
     def set_error(self, index: int, message: str):
@@ -161,6 +175,7 @@ class SelectionList(QWidget):
         self._entries.insert(dst, item)
         if src < len(self._values):
             self._values.insert(dst, self._values.pop(src))
+            self._bindings.insert(dst, self._bindings.pop(src))
         self._rebuild()
         self.order_changed.emit()
 
@@ -175,6 +190,7 @@ class SelectionList(QWidget):
             return
         v = sb.mm_value()
         self._values[index] = v
+        self._bindings[index] = sb.binding() if v is not None else None
         if v is not None:
             self.value_changed.emit(index, v)
 
@@ -213,7 +229,8 @@ class SelectionList(QWidget):
                 sb.setFixedWidth(prefs.scaled_px(78))
                 val = self._values[i] if i < len(self._values) else None
                 if val is not None:
-                    sb.set_mm(val)
+                    b = self._bindings[i] if i < len(self._bindings) else None
+                    sb.set_binding(b, val)
                 sb.value_changed.connect(
                     lambda _v, idx=i: self._on_row_value(idx))
                 self._row_spinboxes = getattr(self, "_row_spinboxes", {})
