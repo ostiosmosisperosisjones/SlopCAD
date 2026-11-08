@@ -171,7 +171,9 @@ class CoilMixin:
             return False
         body = self.workspace.bodies.get(body_id)
         d = format_value(2 * ax[3], prefs.default_unit, prefs.display_decimals)
-        panel.set_cylinder(body_id, AnyFaceRef.from_occ_face(faces[face_idx].wrapped),
+        h = self.history
+        panel.set_cylinder(body_id, AnyFaceRef.for_face(h, body_id, faces[face_idx].wrapped,
+                                                         h.cursor + 1),
                            f"{body.name if body else body_id}  ·  face {face_idx}  ⌀ {d}",
                            length=ax[4] if seed_height else None)
         return True

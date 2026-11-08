@@ -18,6 +18,7 @@ we've verified, and is robust to topology renumbering.
 
 from __future__ import annotations
 import numpy as np
+from cad import resolve_ledger
 from dataclasses import dataclass
 from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
@@ -262,6 +263,7 @@ class FaceRef:
 
         if best_idx is None:
             return self._find_moved_in(shape, normal_tol, area_cap)
+        resolve_ledger.note(resolve_ledger.REF, "FaceRef")
         return best_idx, best_face
 
     def _find_moved_in(self, shape, normal_tol: float, area_cap: float):
@@ -287,6 +289,8 @@ class FaceRef:
         scored.sort(key=lambda t: t[0])
         if not scored or (len(scored) > 1 and scored[1][0] < 2 * scored[0][0] + 0.1):
             return None, None
+        resolve_ledger.note(resolve_ledger.FUZZY, "FaceRef",
+                            f"moved face, {scored[0][0]:.3g} mm")
         return scored[0][1], scored[0][2]
 
     def find_coplanar_in(self, shape, normal_tol: float = 0.001,
@@ -313,6 +317,8 @@ class FaceRef:
             perp_dist = float(np.linalg.norm(centroid - along * n - ref_perp))
             if perp_dist < best[2]:
                 best = (idx, face, perp_dist)
+        if best[0] is not None:
+            resolve_ledger.note(resolve_ledger.FUZZY, "FaceRef", "coplanar face")
         return best[0], best[1]
 
     def explain_no_match(self, shape,
@@ -408,6 +414,48 @@ class AnyFaceRef:
     area:     float
     category: str = ""   # 'plane' | 'curved' | '' (legacy: unknown)
     normal:   tuple | None = None   # raw plane normal (legacy/curved: None)
+    # Face provenance (cad.face_origin), planar faces only: tried first by
+    # resolve(), so the face is followed rather than matched.
+    origin:   object = None
+
+    @classmethod
+    def for_face(cls, history, body_id, occ_face, before_index) -> "AnyFaceRef":
+        """from_occ_face plus provenance when the face has any."""
+        ref = cls.from_occ_face(occ_face)
+        if history is not None:
+            from cad.face_origin import any_origin_for_face, curved_origin_for_face
+            find = any_origin_for_face if ref.normal is not None else curved_origin_for_face
+            try:
+                ref.origin = find(history, body_id, occ_face, before_index)
+            except Exception as ex:
+                print(f"[AnyFaceRef] no provenance: {ex}")
+        return ref
+
+    def resolve(self, history, shape, at=None):
+        """(idx, face): by provenance when there is some, else find_in."""
+        if self.origin is not None and history is not None:
+            idx, face = self.origin.find_in(history, shape, at)
+            if face is not None:
+                resolve_ledger.note(resolve_ledger.EXACT, "AnyFaceRef")
+                return idx, face
+        return self.find_in(shape)
+
+    def to_dict(self) -> dict:
+        d = {"centroid": list(self.centroid), "area": self.area,
+             "category": self.category}
+        if self.normal:
+            d["normal"] = list(self.normal)
+        if self.origin is not None:
+            d["origin"] = self.origin.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AnyFaceRef":
+        from cad.face_origin import face_origin_from_dict
+        return cls(centroid=tuple(d["centroid"]), area=float(d["area"]),
+                   category=d.get("category", ""),
+                   normal=tuple(d["normal"]) if d.get("normal") else None,
+                   origin=face_origin_from_dict(d.get("origin")))
 
     @classmethod
     def from_occ_face(cls, occ_face) -> "AnyFaceRef":
@@ -452,12 +500,17 @@ class AnyFaceRef:
                 best_face  = face
 
         if best_idx is not None:
+            resolve_ledger.note(resolve_ledger.REF, "AnyFaceRef")
             return best_idx, best_face
 
         # Strict match missed — fall back to category-aware scoring if we
         # have a category recorded. Without one, behave as before (None).
         if self.category:
-            return _find_face_by_category_score(shape, self)
+            hit = _find_face_by_category_score(shape, self)
+            if hit[0] is not None:
+                resolve_ledger.note(resolve_ledger.FUZZY, "AnyFaceRef",
+                                    "category score")
+            return hit
 
         return None, None
 
@@ -500,3 +553,39 @@ def _find_face_by_category_score(shape, ref: "AnyFaceRef"):
     if best_score > _FACE_SCORE_CUTOFF:
         return None, None
     return best_idx, best_face
+
+
+# ---------------------------------------------------------------------------
+# Picked faces of a body op (fillet / chamfer "all edges of these faces")
+# ---------------------------------------------------------------------------
+
+def bake_face_picks(history, body_id, shape, face_indices, before_index) -> list:
+    """Commit-time AnyFaceRefs (with provenance) for picked face indices."""
+    faces = list(shape.faces())
+    return [AnyFaceRef.for_face(history, body_id, faces[i].wrapped, before_index)
+            for i in face_indices]
+
+
+def resolve_face_picks(op_name, body_id, face_refs, face_indices, history,
+                       shape, entry_index) -> list[int]:
+    """Current indices of a body op's picked faces on *shape*: by face_refs
+    (provenance first) when saved, else the raw indices (FUZZY).  A picked
+    face that's gone is an error, not some other face."""
+    n = len(list(shape.faces()))
+    if face_refs:
+        at = (body_id, entry_index) if entry_index is not None else None
+        out = []
+        for ref in face_refs:
+            idx, _face = ref.resolve(history, shape, at)
+            if idx is None:
+                raise RuntimeError(
+                    f"{op_name}: a picked face is gone (centroid={ref.centroid}, "
+                    f"area={ref.area:.3f}); edit the op and pick it again")
+            out.append(idx)
+        return out
+    for i in face_indices:
+        if not 0 <= i < n:
+            raise RuntimeError(f"{op_name}: face_idx {i} out of range")
+    if face_indices:
+        resolve_ledger.note(resolve_ledger.FUZZY, f"{op_name} face", "by index")
+    return list(face_indices)

@@ -30,13 +30,15 @@ class ShellOp(Op):
     outside:        bool = False
     face_refs:      list = field(default_factory=list)
 
-    def _resolve_faces(self, shape) -> list:
-        """[(idx, b3d_face)] — by face_refs when saved, else by index."""
+    def _resolve_faces(self, shape, history=None, entry_index=None) -> list:
+        """[(idx, b3d_face)] — by face_refs when saved (provenance first),
+        else by index."""
         all_faces = list(shape.faces())
         if self.face_refs:
             out = []
+            at = (self.source_body_id, entry_index) if entry_index is not None else None
             for ref in self.face_refs:
-                idx, face = ref.find_in(shape)
+                idx, face = ref.resolve(history, shape, at)
                 if idx is None:
                     raise RuntimeError(
                         f"ShellOp: could not re-locate face "
@@ -46,6 +48,9 @@ class ShellOp(Op):
         for idx in self.face_indices:
             if idx >= len(all_faces):
                 raise RuntimeError(f"ShellOp: face_idx {idx} out of range")
+        if self.face_indices:
+            from cad import resolve_ledger
+            resolve_ledger.note(resolve_ledger.FUZZY, "shell face", "by index")
         return [(idx, all_faces[idx]) for idx in self.face_indices]
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
@@ -55,7 +60,7 @@ class ShellOp(Op):
             if shape is None:
                 raise RuntimeError(
                     f"ShellOp: no shape for body '{self.source_body_id}'")
-        faces = [f.wrapped for _i, f in self._resolve_faces(shape)]
+        faces = [f.wrapped for _i, f in self._resolve_faces(shape, history, entry_index)]
         return shell_body(shape.wrapped, faces, self.thickness, self.outside)
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
@@ -86,7 +91,9 @@ class ShellOp(Op):
             if idx >= len(all_faces):
                 raise RuntimeError(f"[Shell] face_idx {idx} out of range")
         face_occs = [all_faces[i].wrapped for i in self.face_indices]
-        self.face_refs = [AnyFaceRef.from_occ_face(f) for f in face_occs]
+        h = viewport.history
+        self.face_refs = [AnyFaceRef.for_face(h, self.source_body_id, f, h.cursor + 1)
+                          for f in face_occs]
 
         op_params = self.to_params()
         if extra_params:
@@ -115,7 +122,8 @@ class ShellOp(Op):
         shape = vp.workspace.current_shape(self.source_body_id)
         if shape is not None and self.face_refs:
             try:
-                indices = [i for i, _f in self._resolve_faces(shape)]
+                indices = [i for i, _f in self._resolve_faces(shape, vp.history,
+                                                               history_idx)]
             except RuntimeError as ex:
                 print(f"[Shell] reopen: {ex}; using saved face indices")
         entry = vp.history.entries[history_idx]
@@ -136,22 +144,13 @@ class ShellOp(Op):
         if self.outside:
             p["outside"] = True
         if self.face_refs:
-            p["face_refs"] = [
-                {"centroid": list(r.centroid),
-                 "area":     r.area,
-                 "category": r.category,
-                 **({"normal": list(r.normal)} if r.normal else {})}
-                for r in self.face_refs
-            ]
+            p["face_refs"] = [r.to_dict() for r in self.face_refs]
         return p
 
     @classmethod
     def _from_params(cls, params: dict) -> "ShellOp":
         from cad.face_ref import AnyFaceRef
-        refs = [AnyFaceRef(centroid=tuple(r["centroid"]), area=r["area"],
-                           category=r.get("category", ""),
-                           normal=tuple(r["normal"]) if r.get("normal") else None)
-                for r in params.get("face_refs", [])]
+        refs = [AnyFaceRef.from_dict(r) for r in params.get("face_refs", [])]
         return cls(
             source_body_id = params.get("source_body_id", ""),
             face_indices   = list(params.get("face_indices", [])),

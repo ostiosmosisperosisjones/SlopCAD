@@ -61,6 +61,9 @@ class HistoryEntry:
     # Non-fatal: the result solid is damaged (inside-out, non-manifold,
     # self-intersecting).  Set by viewer/body_health.py, never saved.
     health_warning: str = ""
+    # How each reference this entry re-found resolved in its last replay
+    # (cad.resolve_ledger Notes).  Set by replay, never saved.
+    resolution:   list = field(default_factory=list, repr=False)
     editing:      bool = False   # True while the ExtrudePanel is open editing this entry
     # Typed operation object — mirrors params, set by history.push()
     op:           Any  = field(default=None, repr=False)
@@ -384,8 +387,14 @@ class History:
 
         self._replay_shape_cache = shape_cache
         self._param_cache = self.params.evaluate()
+        from cad import resolve_ledger
+        ledger_cm = resolve_ledger.recording()
+        ledger = ledger_cm.__enter__()
+        outer_entry = ledger.entry
         try:
             for i in range(index, len(self._entries)):
+                ledger.entry = i
+                ledger.by_entry.pop(i, None)
                 entry  = self._entries[i]
                 bid    = entry.body_id
                 op     = entry.op
@@ -455,6 +464,7 @@ class History:
                     # Datum plane — no shape change.  Resolve to surface
                     # parametric errors (e.g. parent face vanished).  body_id
                     # is None for offset planes, so no chain-broken cascade.
+                    entry.warning = ""
                     try:
                         op.execute(current_shape, self, i)
                     except Exception as ex:
@@ -539,7 +549,18 @@ class History:
                         current_shapes[cbid] = body.source_shape
                         shape_cache[cbid]    = (i, body.source_shape)
 
+            ledger.entry = outer_entry
+            for i in range(index, len(self._entries)):
+                entry = self._entries[i]
+                entry.resolution = ledger.by_entry.get(i, [])
+                if not entry.error and not entry.warning:
+                    entry.warning = resolve_ledger.warning_text(entry.resolution)
+                    if entry.warning:
+                        print(f"[Replay] Entry {i}: {entry.warning}")
+
         finally:
+            ledger.entry = outer_entry
+            ledger_cm.__exit__(None, None, None)
             self._replay_shape_cache = None
             self._param_cache = None
 
@@ -817,6 +838,7 @@ def _replay_sketch_entry(se, history: History, before_index: int,
     profile is built from the same UV points a reload would use.
     """
     from cad.sketch import ReferenceEntity
+    from cad import resolve_ledger
 
     # Check that the body this sketch plane depends on is not in an error state.
     # FacePlaneSource depends on a specific body; if that body's chain is broken
@@ -845,13 +867,23 @@ def _replay_sketch_entry(se, history: History, before_index: int,
     ref_updates = []
     stale = []
     for i, ent in enumerate(se.entities):
-        if not isinstance(ent, ReferenceEntity) or ent.source is None:
+        if not isinstance(ent, ReferenceEntity):
+            continue
+        if ent.source is None:
+            # A body edge / vertex included without a source never follows
+            # its geometry: say so rather than keep it silently.
+            if getattr(ent, "source_type", None) in ("edge", "vertex"):
+                resolve_ledger.note(resolve_ledger.STALE, "include",
+                                    f"entity {i}: included {ent.source_type} has no "
+                                    f"source, frozen where it was included")
             continue
         try:
             world_pts, occ_edges = ent.source.resolve(history, before_index)
         except Exception as ex:
             # Skip this reference — its cached UV remains in place.
             stale.append((i, str(ex)))
+            resolve_ledger.note(resolve_ledger.STALE, "include",
+                                f"entity {i}: {ex}")
             continue
         ref_updates.append((ent, world_pts, occ_edges))
     if own:
@@ -1057,6 +1089,10 @@ def _trim_to_retained_solids(shape, retained_dicts):
             # Fall back to the first unused solid so we still trim something
             # sane rather than dropping the body.
             idx = next((j for j in range(len(solids)) if j not in used), None)
+            if idx is not None and len(solids) - len(used) > 1:
+                from cad import resolve_ledger
+                resolve_ledger.note(resolve_ledger.FUZZY, "retained solid",
+                                    f"positional pick {idx}")
         if idx is not None:
             used.add(idx)
             chosen.append(solids[idx])
@@ -1103,6 +1139,10 @@ def _seed_split_import_children(entries, parent_idx, full_shape,
             si = int(e.params.get("solid_index", 0))
             idx = si if (0 <= si < len(solids) and si not in used) else \
                 next((k for k in range(len(solids)) if k not in used), None)
+            if idx is not None and len(solids) - len(used) > 1:
+                from cad import resolve_ledger
+                resolve_ledger.note(resolve_ledger.FUZZY, "split child solid",
+                                    f"positional pick {idx}")
         if idx is None:
             continue
         used.add(idx)

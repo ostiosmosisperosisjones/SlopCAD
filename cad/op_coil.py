@@ -101,7 +101,7 @@ class CoilOp(SketchLoftOp):
         shape = history._shape_for_body_at(self.body_id, entry_index)
         if shape is None:
             raise RuntimeError("CoilOp: the face's body has no shape here")
-        _i, face = self.face_ref.find_in(shape)
+        _i, face = self.face_ref.resolve(history, shape, (self.body_id, entry_index))
         if face is None:
             raise RuntimeError("CoilOp: the cylindrical face is gone")
         ax = cylinder_axis(face.wrapped)

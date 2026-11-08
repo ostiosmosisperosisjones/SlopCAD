@@ -6,6 +6,7 @@ Base Op class and shared _push_result() commit helper.
 
 from __future__ import annotations
 from cad.solid_ref import as_compound
+from cad import resolve_ledger
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -205,10 +206,14 @@ def _match_sketch_faces(se, all_faces: list, all_regions: list,
             if cands:
                 idx = min(cands, key=lambda i: _region_centroid_dist(
                     all_regions[i], target))
+                resolve_ledger.note(resolve_ledger.EXACT, "sketch region")
         if idx is None:
             if want and lost is not None:
                 lost.append(k)
             idx = _match_face_index_by_centroid(target, all_regions, op_name)
+            resolve_ledger.note(resolve_ledger.FUZZY, "sketch region",
+                                "boundary changed, nearest centroid" if want
+                                else "no stored boundary, nearest centroid")
         faces.append(all_faces[idx])
         bounds.append(sorted(current[idx]) if idx < len(current) else [])
     return faces, bounds

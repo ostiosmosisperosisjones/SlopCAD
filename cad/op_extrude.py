@@ -235,10 +235,73 @@ def edge_tangent(occ_edge):
     return None if norm < 1e-10 else vec / norm
 
 
+def refind_picked_edge(src, history, before, site):
+    """The occ edge a picked-edge BodyEdgeSource names, on its body as of
+    entry *before*; raises when it's gone.  With provenance it is found
+    exactly or not at all: the fuzzy fallback could hand back a neighbour
+    and turn the op silently."""
+    if src.origin is not None:
+        shape = history._shape_for_body_at(src.body_id, before)
+        if shape is None:
+            raise RuntimeError("its body has no shape")
+        # EdgeOrigin settles for one face when the other is missing.
+        at = (src.body_id, before)
+        if any(f.find_in(history, shape, at)[1] is None
+               for f in getattr(src.origin, "faces", [])):
+            raise RuntimeError("a face it lies on is gone")
+        found = src.origin.find_in(history, shape, at)
+        if found is None:
+            raise RuntimeError("its faces no longer meet")
+        from cad import resolve_ledger
+        resolve_ledger.note(resolve_ledger.EXACT, site)
+        return found
+    occ = src.resolve(history, before)[1]
+    return occ[0] if occ else None
+
+
+def oriented_tangent(src_dict, src, t, last, history, before):
+    """Turn a re-found edge's tangent t (which can run either way) to the
+    sense it was picked with; returns (t, sense).  With an origin that
+    predicts the edge's direction (tangent_now), sense (+1/-1, kept in the
+    source dict) is relative to that prediction, which turns with the
+    edge: "the side of the last direction" is a coin toss once an edit
+    swings the edge ~90° (a revolve angle 60° → 150°).  Without one, the
+    side of the last direction."""
+    import numpy as np
+    pred = None
+    tn = getattr(getattr(src, "origin", None), "tangent_now", None)
+    if tn is not None:
+        try:
+            pred = tn(history, (src.body_id, before))
+        except Exception:
+            pred = None
+    sense = (src_dict or {}).get("sense")
+    if pred is not None:
+        # The last direction decides whenever it's unambiguous (the edge
+        # turned little since, or the user flipped the op: then it's the
+        # new sense); the stored sense only when an edit swung the edge far.
+        c = (float(np.dot(last, pred)) / max(float(np.linalg.norm(last)), 1e-12)
+             if last is not None else 1.0)
+        if sense is None or abs(c) > 0.9:
+            sense = 1 if c >= 0 else -1
+        ref = sense * pred
+    else:
+        ref = last
+    if ref is not None and float(np.dot(t, np.asarray(ref, dtype=float))) < 0:
+        t = -t
+    return t, sense
+
+
+def _with_sense(d, sense):
+    if sense is not None:
+        d["sense"] = int(sense)
+    return d
+
+
 def _follow_direction_edge(op, history, entry_index) -> None:
     """A direction picked from an edge follows that edge: re-find it and take
-    its tangent, turned to the side of the last direction (a re-found edge can
-    run the other way).  A lost edge is an error, not the stale vector."""
+    its tangent, turned to the sense it was picked with (oriented_tangent; a
+    re-found edge can run the other way).  A lost edge is an error, not the stale vector."""
     import numpy as np
     from cad.serializer import _edge_source_from_dict, _edge_source_to_dict
     if not op.direction_source or op.direction is None:
@@ -246,32 +309,17 @@ def _follow_direction_edge(op, history, entry_index) -> None:
     before = history.fanout_members(entry_index)[0]
     src = _edge_source_from_dict(op.direction_source)
     try:
-        if src.origin is not None:
-            # Named by its faces: found exactly or not at all.  The fuzzy
-            # fallback could hand back a neighbour and turn the op silently.
-            shape = history._shape_for_body_at(src.body_id, before)
-            if shape is None:
-                raise RuntimeError("its body has no shape")
-            # EdgeOrigin settles for one face when the other is missing.
-            if any(f.find_in(history, shape)[1] is None
-                   for f in getattr(src.origin, "faces", [])):
-                raise RuntimeError("a face it lies on is gone")
-            found = src.origin.find_in(history, shape)
-            if found is None:
-                raise RuntimeError("its faces no longer meet")
-            occ = [found]
-        else:
-            occ = src.resolve(history, before)[1]
-        t = edge_tangent(occ[0]) if occ else None
+        occ = refind_picked_edge(src, history, before, "direction edge")
+        t = edge_tangent(occ) if occ is not None else None
     except Exception as ex:
         raise RuntimeError(f"direction edge is gone, edit the op and pick the "
                            f"direction edge again ({ex})") from ex
     if t is None:
         raise RuntimeError("direction edge has no tangent")
-    if float(np.dot(t, np.asarray(op.direction, dtype=float))) < 0:
-        t = -t
+    t, sense = oriented_tangent(op.direction_source, src, t,
+                                np.asarray(op.direction, dtype=float), history, before)
     op.direction = t.tolist()
-    op.direction_source = _edge_source_to_dict(src)
+    op.direction_source = _with_sense(_edge_source_to_dict(src), sense)
     entry = history._entries[entry_index]
     entry.params.update(direction=op.direction, direction_source=op.direction_source)
 
@@ -290,8 +338,14 @@ def _follow_target_vertex(op, history, entry_index, face) -> None:
     entry = history._entries[entry_index]
     # All of a fan-out measures on the part as it was before the first cut.
     before = history.fanout_members(entry_index)[0]
+    from cad import resolve_ledger
     src = (_edge_source_from_dict(op.vertex_source) if op.vertex_source
            else _find_vertex_source(history, op.target_vertex, before, entry))
+    if not op.vertex_source:
+        # Bound to the vertex sitting exactly at the saved point: right, and
+        # from now on followed by its source.  Not there: the depth is stale.
+        resolve_ledger.note(resolve_ledger.STALE if src is None else resolve_ledger.REF,
+                            "up-to-vertex", "no vertex source saved, matched by point")
     if src is None:
         entry.warning = ("Up-to-vertex target not found on the part; depth kept "
                          "as saved. Edit the op and pick the vertex again.")
@@ -506,7 +560,8 @@ class ExtrudeOp(Op):
                 free.append(p)
         return glued, free
 
-    def _in_place(self, shape, glued, free_faces, direction):
+    def _in_place(self, shape, glued, free_faces, direction,
+                  history=None, entry_index=None):
         """Glued host faces first (re-found after every step), then free
         faces fused / cut into the running shape."""
         from cad.operations.extrude import extrude_face, extrude_face_direct
@@ -514,7 +569,11 @@ class ExtrudeOp(Op):
                   end_offset=self.end_offset, draft_angle=self.draft_angle)
         current = shape
         for p in glued:
-            fi, _f = p.locate(current, "ExtrudeOp")
+            # Provenance only on the untouched shape: after a glued extrude
+            # the face can have merged into a bigger one.
+            prov = (dict(history=history, at=(p.body_id, entry_index))
+                    if current is shape and history is not None else {})
+            fi, _f = p.locate(current, "ExtrudeOp", **prov)
             current = extrude_face(current, fi, self.distance, **kw)
         for face in free_faces:
             current = extrude_face_direct(current, face, self.distance, **kw)
@@ -544,7 +603,8 @@ class ExtrudeOp(Op):
         _follow_direction_edge(self, history, entry_index)
         direction = self._direction(history)
         if self.target_vertex is not None:
-            first = faces[0] if faces else glued[0].locate(shape, name)[1]
+            first = (faces[0] if faces else glued[0].locate(
+                shape, name, history, (glued[0].body_id, entry_index))[1])
             _follow_target_vertex(self, history, entry_index, first)
 
         # Merge: the entry is tagged to merge_body_id, so `shape` IS the
@@ -568,7 +628,8 @@ class ExtrudeOp(Op):
 
         if glued and shape is None:
             raise RuntimeError(f"{name}: host body has no shape")
-        result = self._in_place(shape, glued, faces, direction)
+        result = self._in_place(shape, glued, faces, direction,
+                                history, entry_index)
         if self.sketch_style:
             return _largest_solid_with_imports(entry, history, entry_index,
                                                result, name)
@@ -1111,6 +1172,13 @@ class SketchOp(Op):
                     f"{len(stale)} included edge(s) couldn't be found after an upstream "
                     f"change and kept their last position (entity "
                     f"{', '.join(str(i) for i, _ in stale)}): {stale[0][1]}")
+                print(f"[Sketch] Entry {entry_index}: {entry.warning}")
+        if se is not None and entry is not None and not entry.warning:
+            # A constraint, snap or include midpoint that stopped holding, or
+            # a line crushed to nothing, says so instead of passing silently.
+            from cad.sketch_integrity import check_sketch, warning_text
+            entry.warning = warning_text(check_sketch(se))
+            if entry.warning:
                 print(f"[Sketch] Entry {entry_index}: {entry.warning}")
         return shape
 

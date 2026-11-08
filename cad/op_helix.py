@@ -70,7 +70,7 @@ class HelixOp(Op):
             shape = history._shape_for_body_at(self.body_id, entry_index)
             if shape is None:
                 raise RuntimeError("Helix: the face's body has no shape here")
-            _i, face = self.face_ref.find_in(shape)
+            _i, face = self.face_ref.resolve(history, shape, (self.body_id, entry_index))
             if face is None:
                 raise RuntimeError("Helix: the cylindrical face is gone")
             ax = cylinder_axis(face.wrapped)
@@ -154,11 +154,7 @@ class HelixOp(Op):
     def to_params(self) -> dict:
         p: dict = {"turns": self.turns}
         if self.face_ref is not None:
-            r = self.face_ref
-            p.update(body_id=self.body_id, face_ref={
-                "centroid": list(r.centroid), "area": r.area,
-                "category": r.category,
-                "normal": list(r.normal) if r.normal is not None else None})
+            p.update(body_id=self.body_id, face_ref=self.face_ref.to_dict())
         else:
             p.update(circle_sketch_id=self.circle_sketch_id,
                      circle_uid=self.circle_uid)
@@ -176,10 +172,7 @@ class HelixOp(Op):
     def _from_params(cls, params: dict) -> "HelixOp":
         from cad.face_ref import AnyFaceRef
         fr = params.get("face_ref")
-        ref = None if fr is None else AnyFaceRef(
-            centroid=tuple(fr["centroid"]), area=float(fr["area"]),
-            category=fr.get("category", ""),
-            normal=tuple(fr["normal"]) if fr.get("normal") else None)
+        ref = None if fr is None else AnyFaceRef.from_dict(fr)
         return cls(body_id=params.get("body_id"), face_ref=ref,
                    circle_sketch_id=params.get("circle_sketch_id", ""),
                    circle_uid=params.get("circle_uid", ""),

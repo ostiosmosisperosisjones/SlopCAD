@@ -85,6 +85,7 @@ class TransformMixin:
             return
         self._transform_body_id  = body_id
         self._transform_edge_ref = None
+        self._transform_edge_sense = None
         panel.set_body(body_id, body.name)
 
     # ------------------------------------------------------------------
@@ -111,6 +112,9 @@ class TransformMixin:
         panel.set_fields(op, entry.params.get("exprs", {}))
         if op.axis_edge_ref is not None:
             self._transform_edge_ref = op.axis_edge_ref
+            # The saved edge keeps its saved sense (re-derived from OCC's
+            # edge direction here, an upstream edit could reverse it).
+            self._transform_edge_sense = op.axis_sense
             panel.set_edge("edge (saved)")
 
     # ------------------------------------------------------------------
@@ -144,6 +148,7 @@ class TransformMixin:
             return True
         self._transform_edge_ref = EdgeRef.for_edge(
             self.history, body_id, occ, shape.wrapped, self.history.cursor + 1)
+        self._transform_edge_sense = None        # a new pick: as shown
         panel.set_edge(f"edge {edge_idx}")
         return True
 
@@ -156,6 +161,7 @@ class TransformMixin:
         f = dict(fields)
         if f.get("axis") == "edge":
             f["axis_edge_ref"] = self._transform_edge_ref
+            f["axis_sense"] = getattr(self, "_transform_edge_sense", None)
         return TransformOp(source_body_id=self._transform_body_id, **f)
 
     def _draw_transform_preview(self):

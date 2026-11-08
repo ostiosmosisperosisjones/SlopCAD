@@ -77,7 +77,8 @@ class HelixMixin:
             print("[Helix] Pick a cylindrical face (or a sketch circle).")
             return False
         self._helix_source = dict(
-            body_id=body_id, face_ref=AnyFaceRef.from_occ_face(faces[face_idx].wrapped))
+            body_id=body_id, face_ref=AnyFaceRef.for_face(
+                self.history, body_id, faces[face_idx].wrapped, self.history.cursor + 1))
         body = self.workspace.bodies.get(body_id)
         d = format_value(2 * ax[3], prefs.default_unit, prefs.display_decimals)
         panel.set_source("face", f"{body.name if body else body_id} · face "

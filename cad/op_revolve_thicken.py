@@ -44,14 +44,15 @@ class ThickenOp(Op):
     def face_idx(self) -> int:
         return self.face_indices[0] if self.face_indices else 0
 
-    def _resolve_faces(self, shape):
-        """Return list of (idx, b3d_face) using face_refs when available."""
-        from cad.face_ref import AnyFaceRef
+    def _resolve_faces(self, shape, history=None, entry_index=None):
+        """Return list of (idx, b3d_face) using face_refs when available
+        (provenance first)."""
         all_faces = list(shape.faces())
         resolved = []
         if self.face_refs:
+            at = (self.source_body_id, entry_index) if entry_index is not None else None
             for ref in self.face_refs:
-                idx, face = ref.find_in(shape)
+                idx, face = ref.resolve(history, shape, at)
                 if idx is None:
                     raise RuntimeError(
                         f"ThickenOp: could not re-locate face "
@@ -62,6 +63,9 @@ class ThickenOp(Op):
                 if idx >= len(all_faces):
                     raise RuntimeError(f"ThickenOp: face_idx {idx} out of range")
                 resolved.append((idx, all_faces[idx]))
+            if resolved:
+                from cad import resolve_ledger
+                resolve_ledger.note(resolve_ledger.FUZZY, "thicken face", "by index")
         return resolved
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
@@ -72,7 +76,7 @@ class ThickenOp(Op):
                 raise RuntimeError(
                     f"ThickenOp: no shape for source body '{self.source_body_id}'")
             shape = src
-        resolved = self._resolve_faces(shape)
+        resolved = self._resolve_faces(shape, history, entry_index)
         result = shape
         for _idx, face in resolved:
             result = thicken_face(result.wrapped, face.wrapped, self.thickness)
@@ -106,8 +110,10 @@ class ThickenOp(Op):
             if idx >= len(all_faces):
                 raise RuntimeError(f"[Thicken] face_idx {idx} out of range")
 
+        h = viewport.history
         self.face_refs = [
-            AnyFaceRef.from_occ_face(all_faces[idx].wrapped)
+            AnyFaceRef.for_face(h, self.source_body_id, all_faces[idx].wrapped,
+                                h.cursor + 1)
             for idx in self.face_indices
         ]
 
@@ -146,7 +152,8 @@ class ThickenOp(Op):
         shape = vp.workspace.current_shape(self.source_body_id)
         if shape is not None and self.face_refs:
             try:
-                indices = [i for i, _f in self._resolve_faces(shape)]
+                indices = [i for i, _f in self._resolve_faces(shape, vp.history,
+                                                               history_idx)]
             except RuntimeError as ex:
                 print(f"[Thicken] reopen: {ex}; using saved face indices")
         vp._thicken_face_indices = indices
@@ -165,13 +172,7 @@ class ThickenOp(Op):
             "thickness":      self.thickness,
         }
         if self.face_refs:
-            p["face_refs"] = [
-                {"centroid": list(r.centroid),
-                 "area":     r.area,
-                 "category": r.category,
-                 **({"normal": list(r.normal)} if r.normal else {})}
-                for r in self.face_refs
-            ]
+            p["face_refs"] = [r.to_dict() for r in self.face_refs]
         return p
 
     @classmethod
@@ -182,13 +183,7 @@ class ThickenOp(Op):
         else:
             indices = [int(params.get("face_idx", 0))]
         raw_refs = params.get("face_refs", [])
-        face_refs = [
-            AnyFaceRef(centroid=tuple(r["centroid"]),
-                       area=r["area"],
-                       category=r.get("category", ""),
-                       normal=tuple(r["normal"]) if r.get("normal") else None)
-            for r in raw_refs
-        ]
+        face_refs = [AnyFaceRef.from_dict(r) for r in raw_refs]
         return cls(
             source_body_id = params.get("source_body_id", ""),
             face_indices   = indices,
@@ -351,11 +346,57 @@ def _fuse_tool_into_target(tool, target_occ):
 
 
 
-def _revolve_axis(op, history):
-    """The op's world axis now.  With a sketch profile the stored
-    sketch-relative axis (axis_line_uid / axis_local, anchored to the first
-    sketch) follows that sketch; otherwise the world axis is used as stored.
-    Call after the profiles resolved (they reproject the sketch)."""
+def edge_axis(occ_edge):
+    """(point, unit direction) of the axis an edge pick gives: the edge's
+    parameter midpoint and its tangent there.  None for a degenerate edge."""
+    import numpy as np
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    adp = BRepAdaptor_Curve(occ_edge)
+    mid = (adp.FirstParameter() + adp.LastParameter()) * 0.5
+    pt, d = adp.Value(mid), adp.DN(mid, 1)
+    axis_dir = np.array([d.X(), d.Y(), d.Z()], dtype=float)
+    norm = float(np.linalg.norm(axis_dir))
+    if norm < 1e-10:
+        return None
+    return np.array([pt.X(), pt.Y(), pt.Z()], dtype=float), axis_dir / norm
+
+
+def _follow_axis_edge(op, history, entry_index):
+    """An axis picked from a body edge follows that edge: re-find it, take
+    its midpoint + tangent (turned to the sense it was picked with, see
+    oriented_tangent: a re-found edge can run the other way).  A lost edge is an error, not the stale
+    axis.  Updates op and entry params; returns (point, dir)."""
+    import numpy as np
+    from cad.serializer import _edge_source_from_dict, _edge_source_to_dict
+    from cad.op_extrude import refind_picked_edge, oriented_tangent, _with_sense
+    before = history.fanout_members(entry_index)[0]
+    src = _edge_source_from_dict(op.axis_source)
+    try:
+        occ = refind_picked_edge(src, history, before, "revolve axis edge")
+        ax = edge_axis(occ) if occ is not None else None
+    except Exception as ex:
+        raise RuntimeError(f"revolve axis edge is gone, edit the op and pick "
+                           f"the axis again ({ex})") from ex
+    if ax is None:
+        raise RuntimeError("revolve axis edge has no tangent")
+    pt, d = ax
+    last = np.asarray(op.axis_dir, dtype=float) if op.axis_dir is not None else None
+    d, sense = oriented_tangent(op.axis_source, src, d, last, history, before)
+    op.axis_point, op.axis_dir = pt.tolist(), d.tolist()
+    op.axis_source = _with_sense(_edge_source_to_dict(src), sense)
+    history._entries[entry_index].params.update(
+        axis_point=op.axis_point, axis_dir=op.axis_dir, axis_source=op.axis_source)
+    return pt, d
+
+
+def _revolve_axis(op, history, entry_index=None):
+    """The op's world axis now.  An axis picked from a body edge follows the
+    edge.  With a sketch profile the stored sketch-relative axis
+    (axis_line_uid / axis_local, anchored to the first sketch) follows that
+    sketch; otherwise the world axis is used as stored.  Call after the
+    profiles resolved (they reproject the sketch)."""
+    if op.axis_source and entry_index is not None:
+        return _follow_axis_edge(op, history, entry_index)
     from cad.profile_source import sketch_profiles
     sp = sketch_profiles(op.profiles)
     se = sp[0].sketch_entry(history) if sp else None
@@ -364,9 +405,19 @@ def _revolve_axis(op, history):
 
 
 def _bake_revolve_axis(op, viewport):
-    """Commit-time axis_local / axis_line_uid against the first sketch."""
+    """Commit-time axis_source (the body edge the axis was picked from, when
+    the panel's axis is still that pick) and axis_local / axis_line_uid
+    against the first sketch."""
     import numpy as np
     from cad.profile_source import sketch_profiles
+    op.axis_source = None
+    picked = getattr(viewport, "_revolve_axis_edge", None)
+    if picked is not None and op.axis_point is not None and op.axis_dir is not None:
+        src, ppt, pdir = picked
+        same = (np.linalg.norm(np.asarray(op.axis_point, dtype=float) - ppt) < 1e-6
+                and abs(abs(float(np.dot(op.axis_dir, pdir))) - 1.0) < 1e-9)
+        if same:
+            op.axis_source = src
     sp = sketch_profiles(op.profiles)
     if not sp:
         op.axis_local, op.axis_line_uid = None, None
@@ -382,6 +433,8 @@ def _revolve_axis_params(op, p: dict) -> dict:
         p["axis_local"] = op.axis_local
     if op.axis_line_uid is not None:
         p["axis_line_uid"] = op.axis_line_uid
+    if op.axis_source is not None:
+        p["axis_source"] = op.axis_source
     return p
 
 
@@ -405,12 +458,21 @@ def _restore_revolve_panel_profiles(vp, op, entry):
     vp._revolve_sketch_idx = sketch_idx
     vp._revolve_face_pairs = list(pairs)
     vp._refresh_revolve_rows()
+    vp._revolve_axis_edge = None
     if op.axis_point is not None and op.axis_dir is not None:
         se = sk[0].sketch_entry(vp.history) if sk else None
         if op.axis_line_uid and sk:
             vp._revolve_axis_ref = (sk[0].sketch_id, op.axis_line_uid)
-        panel.set_axis(*sketch_axis(se, op.axis_point, op.axis_dir,
-                                    op.axis_local, op.axis_line_uid))
+        if op.axis_source:
+            # Replay left the followed edge's axis in op.axis_point/dir.
+            import numpy as np
+            pt = np.array(op.axis_point, dtype=float)
+            d = np.array(op.axis_dir, dtype=float)
+            vp._revolve_axis_edge = (op.axis_source, pt, d)
+            panel.set_axis(pt, d)
+        else:
+            panel.set_axis(*sketch_axis(se, op.axis_point, op.axis_dir,
+                                        op.axis_local, op.axis_line_uid))
     panel._angle_spinbox.set_binding(
         entry.params.get("exprs", {}).get("angle_deg"), abs(op.angle_deg))
     return panel
@@ -443,6 +505,7 @@ class RevolveOp(Op):
     merge_body_id: str | None         = None
     axis_local:    list[float] | None = None
     axis_line_uid: str | None         = None
+    axis_source:   dict | None        = None
 
     def __post_init__(self):
         from cad.profile_source import as_profile
@@ -499,7 +562,7 @@ class RevolveOp(Op):
         faces = faces_of(self.profiles, history, entry_index, name)
         if not faces:
             raise RuntimeError(f"{name}: no profile faces")
-        axis_pt, axis_dir = _revolve_axis(self, history)
+        axis_pt, axis_dir = _revolve_axis(self, history, entry_index)
         tool = _revolve_faces_to_tool(faces, axis_pt, axis_dir, self.angle_deg)
         if tool is None:
             raise RuntimeError(f"{name}: revolve produced no tool")
@@ -657,6 +720,7 @@ class RevolveOp(Op):
             merge_body_id = params.get("merge_body_id"),
             axis_local    = params.get("axis_local"),
             axis_line_uid = params.get("axis_line_uid"),
+            axis_source   = params.get("axis_source"),
         )
 
 
@@ -681,6 +745,7 @@ class CrossBodyRevolveCutOp(Op):
     axis_dir:      list[float] | None = None
     axis_local:    list[float] | None = None
     axis_line_uid: str | None         = None
+    axis_source:   dict | None        = None
 
     # Used by Op._push_failed_entry to tag the failed history entry correctly
     # (the base class's fallback otherwise produces "crossbodyrevolvecut").
@@ -737,7 +802,7 @@ class CrossBodyRevolveCutOp(Op):
         from cad.op_extrude import _fill_legacy_face_refs
         _fill_legacy_face_refs(self.profiles, history._entries[entry_index])
         faces = faces_of(self.profiles, history, entry_index, "CrossBodyRevolveCutOp")
-        axis_pt, axis_dir = _revolve_axis(self, history)
+        axis_pt, axis_dir = _revolve_axis(self, history, entry_index)
         result = bool_op("cut", [shape], [self._tool(faces, axis_pt, axis_dir)])
         if result is None:
             raise RuntimeError("CrossBodyRevolveCutOp: boolean cut failed")
@@ -856,4 +921,5 @@ class CrossBodyRevolveCutOp(Op):
             axis_dir      = params.get("axis_dir"),
             axis_local    = params.get("axis_local"),
             axis_line_uid = params.get("axis_line_uid"),
+            axis_source   = params.get("axis_source"),
         )

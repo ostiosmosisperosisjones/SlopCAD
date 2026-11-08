@@ -36,6 +36,18 @@ class FaceFilletOp(Op):
     # global radius. Empty list → every edge uses the global radius. The
     # subprocess worker matches these to edges by midpoint (order-independent).
     edge_radii:     list  = field(default_factory=list)
+    # AnyFaceRefs (with provenance) of face_indices, baked at commit: replay
+    # re-finds the picked faces through them, then updates face_indices.
+    face_refs:      list  = field(default_factory=list)
+
+    def _faces_now(self, shape, history, entry_index) -> list:
+        from cad.face_ref import resolve_face_picks
+        idx = resolve_face_picks("FaceFilletOp", self.source_body_id, self.face_refs,
+                                 self.face_indices, history, shape, entry_index)
+        if self.face_refs and idx != list(self.face_indices):
+            self.face_indices = idx
+            history._entries[entry_index].params["face_indices"] = list(idx)
+        return idx
 
     def _resolve_edge_occs(self, viewport):
         """Look up TopoDS_Edge objects for stored edge_indices via the mesh."""
@@ -55,11 +67,15 @@ class FaceFilletOp(Op):
         if not self.edge_refs:
             return []
         out = []
+        at = None
+        if history is not None:
+            at = (self.source_body_id,
+                  entry_index if entry_index is not None else len(history._entries))
         for ref in self.edge_refs:
-            occ = ref.resolve(history, shape)
+            occ = ref.resolve(history, shape, at)
             if occ is None:
                 if history is not None and ref.origin is not None \
-                        and ref.origin.faces_apart(history, shape):
+                        and ref.origin.faces_apart(history, shape, at):
                     raise RuntimeError(
                         "FaceFilletOp: a selected edge no longer exists — an upstream "
                         "change removed it (e.g. an earlier fillet now runs over "
@@ -90,8 +106,9 @@ class FaceFilletOp(Op):
         # otherwise freeze replay (e.g. on file open). FilletTimeout surfaces as
         # a normal per-entry error the replay loop already handles. edge_radii
         # carries any per-edge overrides (aligned with edge_refs/edge_occs).
+        face_indices = self._faces_now(shape, history, entry_index)
         return fillet_edges_isolated(
-            shape, self.face_indices, edge_occs, self.radius,
+            shape, face_indices, edge_occs, self.radius,
             edge_radii=self.edge_radii or None)
 
     def commit(self, viewport: Any, extra_params: dict | None = None) -> Any:
@@ -136,6 +153,9 @@ class FaceFilletOp(Op):
                         for e in edge_occs)
             if r is not None
         ]
+        from cad.face_ref import bake_face_picks
+        self.face_refs = bake_face_picks(hist, self.source_body_id, shape_before,
+                                         self.face_indices, hist.cursor + 1)
 
         op_params = self.to_params()
         if extra_params:
@@ -187,6 +207,8 @@ class FaceFilletOp(Op):
         }
         if self.edge_refs:
             p["edge_refs"] = [r.to_dict() for r in self.edge_refs]
+        if self.face_refs:
+            p["face_refs"] = [r.to_dict() for r in self.face_refs]
         if self.edge_radii and any(r is not None for r in self.edge_radii):
             # Tapers are stored as [r1, r2] lists; constants as floats; None
             # means "use the global radius".
@@ -209,4 +231,10 @@ class FaceFilletOp(Op):
             radius         = float(params.get("radius", 1.0)),
             edge_refs      = edge_refs,
             edge_radii     = list(params.get("edge_radii", [])),
+            face_refs      = _face_refs_from(params),
         )
+
+
+def _face_refs_from(params: dict) -> list:
+    from cad.face_ref import AnyFaceRef
+    return [AnyFaceRef.from_dict(r) for r in params.get("face_refs", [])]

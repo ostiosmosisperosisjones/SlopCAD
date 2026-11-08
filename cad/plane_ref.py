@@ -14,6 +14,7 @@ OffsetPlaneSource  — plane offset along the normal of any other source
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from cad import resolve_ledger
 
 
 class SketchPlaneSource(ABC):
@@ -62,14 +63,9 @@ class FacePlaneSource(SketchPlaneSource):
             return None
         origin = None
         if history is not None:
-            from cad.face_origin import (origin_for_face, chamfer_origin_for_face,
-                                         revolve_origin_for_face)
+            from cad.face_origin import any_origin_for_face
             try:
-                origin = (origin_for_face(history, body_id, face.wrapped, before_index)
-                          or chamfer_origin_for_face(history, body_id, face.wrapped,
-                                                     before_index)
-                          or revolve_origin_for_face(history, body_id, face.wrapped,
-                                                     before_index))
+                origin = any_origin_for_face(history, body_id, face.wrapped, before_index)
             except Exception as ex:
                 print(f"[Sketch] face provenance skipped: {ex}")
         return cls(body_id, face_ref, origin)
@@ -85,7 +81,9 @@ class FacePlaneSource(SketchPlaneSource):
         if self.origin is not None:
             # Provenance first: follows a wall that rotated or resized,
             # which the geometric FaceRef can't.
-            _, face = self.origin.find_in(history, shape)
+            _, face = self.origin.find_in(history, shape, (self.body_id, before_index))
+            if face is not None:
+                resolve_ledger.note(resolve_ledger.EXACT, "FacePlaneSource")
         if face is None:
             face_idx, face = self.face_ref.find_in(shape)
         if face is None and self.face_ref is not None:
@@ -98,9 +96,11 @@ class FacePlaneSource(SketchPlaneSource):
             origin = revolve_origin_from_ref(history, self.body_id,
                                              self.face_ref, before_index)
             if origin is not None:
-                _, face = origin.find_in(history, shape)
+                _, face = origin.find_in(history, shape, (self.body_id, before_index))
                 if face is not None:
                     self.origin = origin
+                    resolve_ledger.note(resolve_ledger.FUZZY, "FacePlaneSource",
+                                        "revolve cap recognised by shape")
         if face is None:
             detail = ""
             if self.face_ref is not None:

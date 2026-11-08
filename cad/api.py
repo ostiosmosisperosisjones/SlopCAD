@@ -358,6 +358,9 @@ class Doc:
                                         "face_indices": face_idx})
         op.edge_refs = refs
         op.edge_indices = list(range(len(refs)))   # aligned with refs
+        from cad.face_ref import bake_face_picks
+        op.face_refs = bake_face_picks(self.history, body.id, shape, face_idx,
+                                       self.history.cursor + 1)
         params = self._bind(op.to_params(), **fields)
         entry = self.history.push(
             label=operation, operation=operation, params=params,
@@ -473,7 +476,8 @@ class Doc:
                 if face is None:
                     raise ApiError("body has no cylindrical face")
             op = CoilOp(body_id=on.id,
-                        face_ref=AnyFaceRef.from_occ_face(faces[face].wrapped),
+                        face_ref=AnyFaceRef.for_face(self.history, on.id, faces[face].wrapped,
+                                                     self.history.cursor + 1),
                         section=section, left_hand=left_hand, flip=flip)
         else:
             entry = self.commit_sketch(on)
@@ -501,7 +505,8 @@ class Doc:
                 if face is None:
                     raise ApiError("body has no cylindrical face")
             op = HelixOp(body_id=on.id,
-                         face_ref=AnyFaceRef.from_occ_face(faces[face].wrapped))
+                         face_ref=AnyFaceRef.for_face(self.history, on.id, faces[face].wrapped,
+                                                      self.history.cursor + 1))
         else:
             entry = self.commit_sketch(on)
             op = HelixOp(circle_sketch_id=entry.entry_id,
@@ -563,7 +568,9 @@ class Doc:
         faces = list(shape.faces())
         op = ShellOp(source_body_id=body.id, face_indices=idx, thickness=1.0,
                      outside=outside,
-                     face_refs=[AnyFaceRef.from_occ_face(faces[i].wrapped) for i in idx])
+                     face_refs=[AnyFaceRef.for_face(self.history, body.id, faces[i].wrapped,
+                                                    len(self.history._entries))
+                                for i in idx])
         params = self._bind(op.to_params(), thickness=t)
         entry = self.history.push(
             label="shell", operation="shell", params=params,

@@ -38,6 +38,18 @@ class ChamferOp(Op):
     angle_deg:           float = 45.0
     flip_reference_face: bool  = False
     edge_refs:           list  = field(default_factory=list)
+    # AnyFaceRefs (with provenance) of face_indices, baked at commit: replay
+    # re-finds the picked faces through them, then updates face_indices.
+    face_refs:           list  = field(default_factory=list)
+
+    def _faces_now(self, shape, history, entry_index) -> list:
+        from cad.face_ref import resolve_face_picks
+        idx = resolve_face_picks("ChamferOp", self.source_body_id, self.face_refs,
+                                 self.face_indices, history, shape, entry_index)
+        if self.face_refs and idx != list(self.face_indices):
+            self.face_indices = idx
+            history._entries[entry_index].params["face_indices"] = list(idx)
+        return idx
 
     def _resolve_edge_occs(self, viewport):
         """Look up TopoDS_Edge objects for stored edge_indices via the mesh."""
@@ -57,11 +69,15 @@ class ChamferOp(Op):
         if not self.edge_refs:
             return []
         out = []
+        at = None
+        if history is not None:
+            at = (self.source_body_id,
+                  entry_index if entry_index is not None else len(history._entries))
         for ref in self.edge_refs:
-            occ = ref.resolve(history, shape)
+            occ = ref.resolve(history, shape, at)
             if occ is None:
                 if history is not None and ref.origin is not None \
-                        and ref.origin.faces_apart(history, shape):
+                        and ref.origin.faces_apart(history, shape, at):
                     raise RuntimeError(
                         "ChamferOp: a selected edge no longer exists — an upstream "
                         "change removed it (e.g. an earlier fillet now runs over "
@@ -76,13 +92,13 @@ class ChamferOp(Op):
             out.append(occ)
         return out
 
-    def _collect_face_edges(self, shape) -> list:
+    def _collect_face_edges(self, shape, face_indices=None) -> list:
         """Return raw TopoDS_Edge objects from every face in face_indices."""
         from cad.operations.chamfer import _build_edge_to_faces_map, smooth_edges
         edge_face_map = _build_edge_to_faces_map(shape.wrapped)
         out = []
         all_faces = list(shape.faces())
-        for fi in self.face_indices:
+        for fi in (self.face_indices if face_indices is None else face_indices):
             if fi >= len(all_faces):
                 raise RuntimeError(f"Chamfer: face_idx {fi} out of range")
             face_edges = [edge.wrapped for edge in all_faces[fi].edges()]
@@ -101,7 +117,8 @@ class ChamferOp(Op):
                     f"ChamferOp: no shape for body '{self.source_body_id}'")
             shape = src
         # Combine face-derived edges with EdgeRef-resolved edges (dedup by id).
-        face_edges = self._collect_face_edges(shape)
+        face_edges = self._collect_face_edges(
+            shape, self._faces_now(shape, history, entry_index))
         ref_edges  = self._resolve_edge_refs(shape, history, entry_index)
         edges = _unique_edges(face_edges + ref_edges)
         if not edges:
@@ -151,6 +168,9 @@ class ChamferOp(Op):
                         for e in direct_edges)
             if r is not None
         ]
+        from cad.face_ref import bake_face_picks
+        self.face_refs = bake_face_picks(hist, self.source_body_id, shape_before,
+                                         self.face_indices, hist.cursor + 1)
 
         op_params = self.to_params()
         if extra_params:
@@ -185,11 +205,14 @@ class ChamferOp(Op):
             p["flip_reference_face"] = True
         if self.edge_refs:
             p["edge_refs"] = [r.to_dict() for r in self.edge_refs]
+        if self.face_refs:
+            p["face_refs"] = [r.to_dict() for r in self.face_refs]
         return p
 
     @classmethod
     def _from_params(cls, params: dict) -> "ChamferOp":
         from cad.edge_ref import EdgeRef
+        from cad.face_ref import AnyFaceRef
         edge_refs = [EdgeRef.from_dict(r) for r in params.get("edge_refs", [])]
         return cls(
             source_body_id      = params.get("source_body_id", ""),
@@ -199,6 +222,8 @@ class ChamferOp(Op):
             angle_deg           = float(params.get("angle_deg", 45.0)),
             flip_reference_face = bool(params.get("flip_reference_face", False)),
             edge_refs           = edge_refs,
+            face_refs           = [AnyFaceRef.from_dict(r)
+                                   for r in params.get("face_refs", [])],
         )
 
 

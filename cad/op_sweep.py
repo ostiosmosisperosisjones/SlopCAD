@@ -43,6 +43,7 @@ class SketchSweepOp(SketchLoftOp):
         from cad.operations.sweep import sweep_task
         if len(faces) != 1:
             raise RuntimeError("SketchSweepOp: sweep takes one profile")
+        self._last_profile = faces[0]      # for face provenance (SweepFaceOrigin)
         return sweep_task(faces, self._path_edges, self.frenet, target, mode,
                           binormal=getattr(self, "_binormal", None))
 

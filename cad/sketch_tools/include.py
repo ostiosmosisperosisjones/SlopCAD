@@ -218,6 +218,9 @@ class IncludeTool:
                 sketch.plane.project_point, sketch.plane.normal)
             if len(uv_pts) < 2 or (whole_face and _covered(sketch, uv_pts)):
                 return
+            if source is None:
+                print(f"[Include] edge {edge_idx} of body {body_id} has no "
+                      f"parametric source: it won't follow edits")
             ref = _new(uv_pts, source_type='edge',
                        occ_edges=occ_edges, source=source)
             if not (whole_face and _same_circle(sketch, ref)):
@@ -323,6 +326,9 @@ class IncludeTool:
                                          mesh.topo_edges_occ[k], history)
                        for k in _vertex_edges(mesh, world_pt)]
             sources = [s for s in sources if s is not None]
+            if not sources:
+                print(f"[Include] vertex {vs.vertex_idx} of body {vs.body_id} has "
+                      f"no edges to follow: it won't follow edits")
             _add(_new([uv_pt], source_type='vertex',
                       source=BodyVertexSource(sources, world_pt) if sources else None))
 

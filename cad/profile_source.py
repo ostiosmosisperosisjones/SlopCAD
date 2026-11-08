@@ -154,6 +154,8 @@ class SketchProfile(ProfileSource):
                      if 0 <= i < len(all_faces)]
             if not faces:
                 raise RuntimeError(f"{op_name}: stored sketch face indices out of range")
+            from cad import resolve_ledger
+            resolve_ledger.note(resolve_ledger.FUZZY, "sketch region", "by index")
             return faces
         return list(all_faces)
 
@@ -235,18 +237,30 @@ class BodyFaceProfile(ProfileSource):
     body_id  : body the face belongs to
     face_idx : face index at commit time (fallback when there is no ref)
     face_ref : FaceRef (planar) or AnyFaceRef (curved), baked at commit
+    origin   : the face's provenance (cad.face_origin, planar faces), baked
+               at commit.  Tried first, so the face is followed through
+               parameter edits rather than matched by centroid and area.
     """
     kind = "face"
 
     body_id:  str
     face_idx: int
     face_ref: Any = None
+    origin:   Any = None
 
     def owner_body_id(self, history: "History") -> str | None:
         return self.body_id
 
-    def locate(self, shape, op_name: str = "Op"):
-        """(index, Face) of this face on *shape*; raises when it's gone."""
+    def locate(self, shape, op_name: str = "Op", history=None, at=None):
+        """(index, Face) of this face on *shape*; raises when it's gone.
+        With *history* (and *at* = (body_id, before_index) of *shape*) the
+        provenance is tried first."""
+        if self.origin is not None and history is not None:
+            idx, face = self.origin.find_in(history, shape, at)
+            if face is not None:
+                from cad import resolve_ledger
+                resolve_ledger.note(resolve_ledger.EXACT, "body face profile")
+                return idx, face
         if self.face_ref is not None:
             idx, face = self.face_ref.find_in(shape)
             if face is None:
@@ -266,6 +280,8 @@ class BodyFaceProfile(ProfileSource):
             raise RuntimeError(
                 f"{op_name}: face_idx {self.face_idx} out of range on body "
                 f"'{self.body_id}'")
+        from cad import resolve_ledger
+        resolve_ledger.note(resolve_ledger.FUZZY, "body face profile", "by index")
         return self.face_idx, all_f[self.face_idx]
 
     def resolve(self, history: "History", entry_index: int, op_name: str = "Op",
@@ -274,7 +290,8 @@ class BodyFaceProfile(ProfileSource):
             shape = history._shape_for_body_at(self.body_id, entry_index)
         if shape is None:
             raise RuntimeError(f"{op_name}: no shape for body '{self.body_id}'")
-        return [self.locate(shape, op_name)[1]]
+        return [self.locate(shape, op_name, history,
+                            (self.body_id, entry_index))[1]]
 
     def resolve_live(self, viewport: Any, op_name: str = "Op") -> list:
         shape = viewport.workspace.current_shape(self.body_id)
@@ -287,17 +304,25 @@ class BodyFaceProfile(ProfileSource):
                 f"'{self.body_id}'")
         face = all_f[self.face_idx]
         self.face_ref = make_face_ref(face)
+        h = viewport.history
+        self.origin = _face_origin(h, self.body_id, face, h.cursor + 1)
         return [face]
 
     def bake(self, history: "History", entry_index: int) -> None:
-        if self.face_ref is not None:
+        """Commit-time: ref + provenance of face_idx on the body as of
+        *entry_index* (face_idx is the face just picked)."""
+        if self.face_ref is not None and self.origin is not None:
             return
         shape = history._shape_for_body_at(self.body_id, entry_index)
         if shape is None:
             return
         all_f = list(shape.faces())
         if 0 <= self.face_idx < len(all_f):
-            self.face_ref = make_face_ref(all_f[self.face_idx])
+            face = all_f[self.face_idx]
+            if self.face_ref is None:
+                self.face_ref = make_face_ref(face)
+            if self.origin is None:
+                self.origin = _face_origin(history, self.body_id, face, entry_index)
 
     def is_planar(self) -> bool:
         from cad.face_ref import FaceRef
@@ -307,9 +332,25 @@ class BodyFaceProfile(ProfileSource):
         return ("face", self.body_id, self.face_idx)
 
     def to_dict(self) -> dict:
-        return {"kind": "face", "body_id": self.body_id,
-                "face_idx": int(self.face_idx),
-                "ref": face_ref_to_dict(self.face_ref)}
+        d = {"kind": "face", "body_id": self.body_id,
+             "face_idx": int(self.face_idx),
+             "ref": face_ref_to_dict(self.face_ref)}
+        if self.origin is not None:
+            d["origin"] = self.origin.to_dict()
+        return d
+
+
+def _face_origin(history, body_id, face, before_index):
+    """Provenance of a planar profile face, or None."""
+    from cad.face_ref import FaceRef
+    if FaceRef.from_occ_face(face.wrapped) is None:
+        return None
+    from cad.face_origin import any_origin_for_face
+    try:
+        return any_origin_for_face(history, body_id, face.wrapped, before_index)
+    except Exception as ex:
+        print(f"[Profile] face has no provenance: {ex}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -330,9 +371,9 @@ def face_ref_to_dict(ref) -> dict | None:
                 "centroid_perp": list(ref.centroid_perp),
                 "centroid_along": ref.centroid_along}
     if isinstance(ref, AnyFaceRef):
-        return {"type": "any", "centroid": list(ref.centroid), "area": ref.area,
-                "category": ref.category,
-                "normal": None if ref.normal is None else list(ref.normal)}
+        d = {"type": "any", "normal": None}
+        d.update(ref.to_dict())
+        return d
     return None
 
 
@@ -341,10 +382,7 @@ def face_ref_from_dict(d: dict | None):
     if not d:
         return None
     if d.get("type") == "any" or "centroid" in d:
-        n = d.get("normal")
-        return AnyFaceRef(centroid=tuple(d["centroid"]), area=float(d["area"]),
-                          category=d.get("category", ""),
-                          normal=None if n is None else tuple(n))
+        return AnyFaceRef.from_dict(d)
     return FaceRef(normal=tuple(d["normal"]), area=float(d["area"]),
                    centroid_perp=tuple(d["centroid_perp"]),
                    centroid_along=float(d["centroid_along"]))
@@ -356,8 +394,10 @@ def face_ref_from_dict(d: dict | None):
 
 def profile_from_dict(d: dict) -> ProfileSource:
     if d.get("kind") == "face":
+        from cad.face_origin import face_origin_from_dict
         return BodyFaceProfile(body_id=d["body_id"], face_idx=int(d.get("face_idx", 0)),
-                               face_ref=face_ref_from_dict(d.get("ref")))
+                               face_ref=face_ref_from_dict(d.get("ref")),
+                               origin=face_origin_from_dict(d.get("origin")))
     if d.get("kind") == "sketch":
         fi = d.get("face_indices")
         return SketchProfile(

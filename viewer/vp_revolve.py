@@ -60,6 +60,7 @@ class RevolveMixin:
         self._revolve_panel          = panel
         self._revolve_axis_active    = False
         self._revolve_axis_ref       = None   # (sketch entry_id, line uid) of a sketch-line axis
+        self._revolve_axis_edge      = None   # (edge source dict, pt, dir) of a body-edge axis
         self._revolve_face_active    = False
         self._revolve_body_active    = False
         self._revolve_preview_mesh   = None
@@ -426,22 +427,24 @@ class RevolveMixin:
         mesh = self._meshes.get(body_id)
         if mesh is None or edge_idx >= len(mesh.topo_edges_occ):
             return False
+        from cad.op_revolve_thicken import edge_axis
+        occ_edge = mesh.topo_edges_occ[edge_idx]
         try:
-            from OCP.BRepAdaptor import BRepAdaptor_Curve
-            adp = BRepAdaptor_Curve(mesh.topo_edges_occ[edge_idx])
-            mid = (adp.FirstParameter() + adp.LastParameter()) * 0.5
-            pt  = adp.Value(mid)
-            d   = adp.DN(mid, 1)
-            axis_pt  = np.array([pt.X(), pt.Y(), pt.Z()], dtype=float)
-            axis_dir = np.array([d.X(),  d.Y(),  d.Z()],  dtype=float)
-            norm = np.linalg.norm(axis_dir)
-            if norm < 1e-10:
+            ax = edge_axis(occ_edge)
+            if ax is None:
                 return False
-            axis_dir /= norm
+            axis_pt, axis_dir = ax
         except Exception as ex:
             print(f"[Revolve] Edge axis failed: {ex}")
             return False
 
+        # The picked edge, so replay can follow it (kept by the commit only
+        # while the panel's axis is still this one).
+        from viewer.vp_extrude import _picked_edge_source
+        src = _picked_edge_source(self.history, body_id,
+                                  self.workspace.current_shape(body_id), occ_edge)
+        self._revolve_axis_edge = (None if src is None
+                                   else (src, axis_pt.copy(), axis_dir.copy()))
         self._revolve_axis_ref = None
         panel.set_axis(axis_pt, axis_dir)
         return True

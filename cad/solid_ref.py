@@ -191,6 +191,10 @@ def assign_solids_to_children(result, child_body_ids, child_solid_refs,
             else:
                 chosen = next((j for j in range(len(solids)) if j not in used),
                               None)
+            if chosen is not None and len(solids) - len(used) > 1:
+                from cad import resolve_ledger
+                resolve_ledger.note(resolve_ledger.FUZZY, "split child solid",
+                                    f"positional pick {chosen}")
         if chosen is not None:
             used.add(chosen)
             assigned[i] = as_compound(solids[chosen])

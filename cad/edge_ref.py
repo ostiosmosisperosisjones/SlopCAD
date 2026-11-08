@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from itertools import combinations
 
 import numpy as np
+from cad import resolve_ledger
 
 
 # ---------------------------------------------------------------------------
@@ -74,15 +75,17 @@ class EdgeRef:
                    face_sigs=list(d.get("face_sigs", [])),
                    origin=edge_origin_from_dict(d.get("origin")))
 
-    def resolve(self, history, shape):
+    def resolve(self, history, shape, at=None):
         """The TopoDS_Edge this names in shape now, or None. Provenance
         first; with provenance the fuzzy face_sigs fallback is skipped — it
         matches centroids/areas, not direction, and after an edit picked a
         3mm edge 5mm away for a 1.9mm one (walker seed 14). No edge beats
-        the wrong edge."""
+        the wrong edge.  at = (body_id, before_index) of shape, so a body
+        moved since the edge was made is followed (cad.body_motion)."""
         if self.origin is not None and history is not None:
-            occ = self.origin.find_in(history, shape)
+            occ = self.origin.find_in(history, shape, at)
             if occ is not None:
+                resolve_ledger.note(resolve_ledger.EXACT, "EdgeRef")
                 return occ
             if _origin_is_final(self.origin, history):
                 return None
@@ -203,6 +206,7 @@ class EdgeRef:
 
         strict = [c for c in cands if c[0] <= mid_tol and c[1] <= len_tol]
         if strict:
+            resolve_ledger.note(resolve_ledger.REF, "EdgeRef")
             return _hit(min(strict, key=lambda c: c[0]))
 
         # Geometric match missed — fall back to face-pair adjacency if we have
@@ -211,6 +215,7 @@ class EdgeRef:
         if use_face_sigs and len(self.face_sigs) >= 2:
             hit = _find_edge_via_face_sigs(shape, self.face_sigs[0], self.face_sigs[1])
             if hit[0] is not None:
+                resolve_ledger.note(resolve_ledger.FUZZY, "EdgeRef", "adjacent-face match")
                 return hit
 
         # An upstream edit moved the edge (a body slid when the sketch under
@@ -221,6 +226,8 @@ class EdgeRef:
                         and c[0] <= 0.5 * self.length),
                        key=lambda c: c[0])
         if moved and (len(moved) == 1 or moved[1][0] >= 2 * moved[0][0] + 0.1):
+            resolve_ledger.note(resolve_ledger.FUZZY, "EdgeRef",
+                                f"moved edge, {moved[0][0]:.3g} mm")
             return _hit(moved[0])
         return None, None, None
 
@@ -401,8 +408,9 @@ class BodyEdgeSource(EdgeSource):
                 f"before history index {before_index}")
         from cad.face_origin import upgrade_to_rim
         if self.origin is not None:
-            occ = self.origin.find_in(history, shape)
+            occ = self.origin.find_in(history, shape, (self.body_id, before_index))
             if occ is not None:
+                resolve_ledger.note(resolve_ledger.EXACT, "BodyEdgeSource")
                 self.origin = upgrade_to_rim(history, self.body_id, occ, self.edge_ref,
                                              self.origin, before_index)
                 return sample_occ_edge(occ), [occ]
@@ -449,6 +457,9 @@ class BodyVertexSource(EdgeSource):
             ends.append(((pts[0], pts[-1]), occ[0] if occ else None))
         if not ends or (len(self.edges) >= 2 and len(ends) < 2):
             raise lost or RuntimeError("BodyVertexSource: it has no edges")
+        if len(ends) < len(self.edges):
+            resolve_ledger.note(resolve_ledger.FUZZY, "BodyVertexSource",
+                                f"{len(self.edges) - len(ends)} of its edges lost")
         if len(ends) >= 2:
             # Two sources landing on one edge meet nowhere: a matcher guessed.
             spots = [a for (e0, x), (e1, y) in combinations(ends, 2)
