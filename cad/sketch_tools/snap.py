@@ -227,6 +227,12 @@ class SnapEngine:
                 gt = a.GetType()
                 if gt == GeomAbs_Circle:
                     circ = a.Circle()
+                    ax = circ.Axis().Direction()
+                    facing = float(np.dot([ax.X(), ax.Y(), ax.Z()], plane.normal))
+                    if abs(facing) < 1.0 - 1e-6:
+                        # tilted to the sketch: projects to an ellipse (or a
+                        # segment), not this circle — no proxy beats a wrong one
+                        continue
                     loc  = circ.Location()
                     c_world = np.array([loc.X(), loc.Y(), loc.Z()], dtype=np.float64)
                     c_uv    = self._world_to_uv(c_world, plane)
@@ -245,6 +251,10 @@ class SnapEngine:
                         return math.atan2(float(d[1]), float(d[0]))
                     sa = _angle(u0)
                     ea = _angle(u1)
+                    if facing < 0:
+                        # axis against the sketch normal: the parameter runs
+                        # clockwise in UV, so the CCW arc is end → start
+                        sa, ea = ea, sa
                     if abs(u1 - u0 - 2 * math.pi) < 1e-9:
                         ea = sa + 2 * math.pi
                     elif ea <= sa:
@@ -334,11 +344,15 @@ class SnapEngine:
 
             for occ_edge in (ref.occ_edges or []):
                 a = self._occ_adaptor(occ_edge)
+                # a.Curve().Curve() is the curve WITHOUT the edge's location
+                # (a moved body's edges carry one): query in its frame
+                trsf = a.Trsf()
                 geom_curve = a.Curve().Curve()
                 u0, u1 = a.FirstParameter(), a.LastParameter()
-                proj = GeomAPI_ProjectPointOnCurve(query, geom_curve, u0, u1)
+                proj = GeomAPI_ProjectPointOnCurve(
+                    query.Transformed(trsf.Inverted()), geom_curve, u0, u1)
                 if proj.NbPoints() > 0:
-                    nearest = proj.NearestPoint()
+                    nearest = proj.NearestPoint().Transformed(trsf)
                     w = np.array([nearest.X(), nearest.Y(), nearest.Z()],
                                  dtype=np.float64)
                     uv = self._world_to_uv(w, plane)
