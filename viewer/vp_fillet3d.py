@@ -13,6 +13,43 @@ from __future__ import annotations
 from PyQt6.QtCore import pyqtSlot, QMetaObject, Qt, Q_ARG
 
 
+def reopen_picks(vp, op, history_idx: int, tag: str):
+    """(face_indices, edge_indices) of an edge op's picks on the body as it is
+    now (history seeked to just before the op, mesh rebuilt).  The saved
+    indices are commit-time handles (the API saves edge_indices 0..n-1,
+    aligned with edge_refs): upstream edits renumber faces and edges, and an
+    edit commits from these indices — so re-find them by face_refs /
+    edge_refs, as replay does.  Falls back to the saved indices if a ref is
+    lost (the edit then shows what it can, and the user re-picks)."""
+    faces, edges = list(op.face_indices), list(op.edge_indices)
+    body_id = op.source_body_id
+    shape = vp.workspace.current_shape(body_id)
+    if shape is None:
+        return faces, edges
+    if op.face_refs:
+        from cad.face_ref import resolve_face_picks
+        try:
+            faces = resolve_face_picks(tag, body_id, op.face_refs, op.face_indices,
+                                       vp.history, shape, history_idx)
+        except RuntimeError as ex:
+            print(f"[{tag}] reopen: {ex}; using saved face indices")
+    mesh = getattr(vp, "_meshes", {}).get(body_id)
+    if op.edge_refs and mesh is not None:
+        found = []
+        for ref in op.edge_refs:
+            occ = ref.resolve(vp.history, shape, (body_id, history_idx))
+            j = None if occ is None else next(
+                (k for k, o in enumerate(mesh.topo_edges_occ) if o.IsSame(occ)), None)
+            if j is None:
+                print(f"[{tag}] reopen: a picked edge wasn't found; using saved edge indices")
+                found = None
+                break
+            found.append(j)
+        if found is not None:
+            edges = found
+    return faces, edges
+
+
 def _fillet_cache_key(shape, face_indices, edge_occs, radius, edge_radii=None):
     """Identity for a fillet computation: shape + faces + edges + radius +
     per-edge radii.
@@ -597,19 +634,20 @@ class Fillet3DMixin:
             self.history.seek(history_idx - 1)
             self._rebuild_body_mesh(op.source_body_id)
         self.history_changed.emit()
+        face_indices, edge_indices = reopen_picks(self, op, history_idx, "Fillet")
 
         self._show_fillet3d_panel(
-            op.source_body_id, list(op.face_indices),
+            op.source_body_id, face_indices,
             editing_entry=entry, radius=op.radius)
 
         # Restore edge picks (panel already open)
         panel = getattr(self, '_fillet3d_panel', None)
-        if panel is not None and op.edge_indices:
-            self._fillet3d_edge_indices = list(op.edge_indices)
+        if panel is not None and edge_indices:
+            self._fillet3d_edge_indices = list(edge_indices)
             body = self.workspace.bodies.get(op.source_body_id)
             name = body.name if body else "Body"
             edge_radii = getattr(op, "edge_radii", []) or []
-            for pos, ei in enumerate(op.edge_indices):
+            for pos, ei in enumerate(edge_indices):
                 r = edge_radii[pos] if pos < len(edge_radii) else None
                 # Tapers ([r1,r2]) can't be shown in a single row spinbox; seed
                 # the row only when the override is a scalar.

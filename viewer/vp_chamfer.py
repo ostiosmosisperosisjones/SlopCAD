@@ -412,19 +412,21 @@ class ChamferMixin:
             self.history.seek(history_idx - 1)
             self._rebuild_body_mesh(op.source_body_id)
         self.history_changed.emit()
+        from viewer.vp_fillet3d import reopen_picks
+        face_indices, edge_indices = reopen_picks(self, op, history_idx, "Chamfer")
 
         self._show_chamfer_panel(
-            op.source_body_id, list(op.face_indices),
+            op.source_body_id, face_indices,
             editing_entry=entry,
             distance=op.distance, angle_deg=op.angle_deg,
             flip=op.flip_reference_face)
 
         panel = getattr(self, '_chamfer_panel', None)
-        if panel is not None and op.edge_indices:
-            self._chamfer_edge_indices = list(op.edge_indices)
+        if panel is not None and edge_indices:
+            self._chamfer_edge_indices = list(edge_indices)
             body = self.workspace.bodies.get(op.source_body_id)
             name = body.name if body else "Body"
-            for ei in op.edge_indices:
+            for ei in edge_indices:
                 panel.add_edge_entry(op.source_body_id, ei,
                                       f"{name}  ·  edge {ei}")
 
