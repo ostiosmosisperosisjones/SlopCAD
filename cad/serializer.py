@@ -76,6 +76,8 @@ def _plane_source_to_dict(ps) -> dict | None:
              "face_ref": _face_ref_to_dict(ps.face_ref)}
         if getattr(ps, "origin", None) is not None:
             d["origin"] = ps.origin.to_dict()
+        if getattr(ps, "anchor", None) is not None:
+            d["anchor"] = list(ps.anchor)
         return d
     if isinstance(ps, OffsetPlaneSource):
         return {"type": "offset",
@@ -99,6 +101,7 @@ def _plane_source_from_dict(d: dict | None):
             body_id  = d["body_id"],
             face_ref = _face_ref_from_dict(d.get("face_ref")),
             origin   = face_origin_from_dict(d.get("origin")),
+            anchor   = d.get("anchor"),
         )
     if t == "offset":
         from cad.plane_ref import OffsetPlaneSource

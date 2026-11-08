@@ -45,12 +45,56 @@ class FacePlaneSource(SketchPlaneSource):
     """
     Plane derived from a named body face, located via FaceRef each time
     it is resolved so it follows the face as upstream operations change.
+
+    anchor : (u, v) of the plane origin, in the face plane's axes, from the
+             body origin's projection onto the face (the world origin moved
+             by the TransformOps on the body before the resolve position).
+             Baked once — when the face is picked (its centroid then), or on
+             the first resolve of a file saved before anchors — and fixed
+             after.  The frame used to be Plane(face), whose origin is the
+             face CENTROID: any edit to the face's outline (a hole on it
+             growing, a pocket from another loop) dragged every sketch on the
+             face across it.  The anchor follows the face along its normal
+             and with the body's motion, never with its outline.
     """
 
-    def __init__(self, body_id: str, face_ref, origin=None):
+    def __init__(self, body_id: str, face_ref, origin=None, anchor=None):
         self.body_id  = body_id
         self.face_ref = face_ref          # cad.face_ref.FaceRef
         self.origin   = origin            # cad.face_origin.FaceOrigin | ChamferFaceOrigin | None
+        self.anchor   = None if anchor is None else tuple(map(float, anchor))
+
+    def _body_origin(self, history, before_index):
+        """The world origin carried by the body's TransformOps before
+        *before_index* (cad.body_motion)."""
+        import numpy as np
+        from cad import body_motion as BM
+        if history is None:
+            return np.zeros(3)
+        _, T = BM.motion(history, self.body_id, before_index, -1)
+        return BM.pt(T, (0.0, 0.0, 0.0))
+
+    def plane_for(self, history, face, before_index):
+        """The sketch plane on *face* (a build123d Face of this body as of
+        before_index): Plane(face)'s axes, origin at the anchor (baked here
+        from the face's centroid if it has none yet)."""
+        import numpy as np
+        from build123d import Plane
+        pl = Plane(face)
+        v = lambda d: np.array([d.X, d.Y, d.Z], dtype=float)
+        c, x, y, n = v(pl.origin), v(pl.x_dir), v(pl.y_dir), v(pl.z_dir)
+        b = self._body_origin(history, before_index)
+        base = b + float((c - b) @ n) * n
+        if self.anchor is None:
+            # A file saved before anchors: its points are relative to the
+            # plane origin it was saved with (seed_origin, set by the sketch's
+            # replay) — not necessarily today's centroid.
+            seed = getattr(self, "seed_origin", None)
+            d = (np.asarray(seed, dtype=float) if seed is not None else c) - base
+            self.anchor = (float(d @ x), float(d @ y))
+            self.seed_origin = None
+        o = base + self.anchor[0] * x + self.anchor[1] * y
+        return Plane(origin=tuple(o.tolist()), x_dir=tuple(x.tolist()), z_dir=tuple(n.tolist()))
 
     @classmethod
     def for_face(cls, history, body_id: str, face, before_index: int):
@@ -68,7 +112,13 @@ class FacePlaneSource(SketchPlaneSource):
                 origin = any_origin_for_face(history, body_id, face.wrapped, before_index)
             except Exception as ex:
                 print(f"[Sketch] face provenance skipped: {ex}")
-        return cls(body_id, face_ref, origin)
+        src = cls(body_id, face_ref, origin)
+        if history is not None:
+            try:
+                src.plane_for(history, face, before_index)     # bakes the anchor
+            except Exception as ex:
+                print(f"[Sketch] face plane anchor skipped: {ex}")
+        return src
 
     def resolve(self, history, before_index: int):
         from build123d import Plane
@@ -123,7 +173,7 @@ class FacePlaneSource(SketchPlaneSource):
             raise RuntimeError(
                 f"FacePlaneSource: could not relocate face in body "
                 f"'{self.body_id}'{detail}")
-        return Plane(face)   # face is a build123d Face object
+        return self.plane_for(history, face, before_index)
 
     def _on_last_plane(self, face, tol: float = 1e-4) -> bool:
         """face is where the sketch last stood: its centroid is the saved

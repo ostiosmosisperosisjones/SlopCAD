@@ -858,6 +858,14 @@ def _replay_sketch_entry(se, history: History, before_index: int,
         # so FacePlaneSource can recognise that face and bake an origin.
         se.plane_source.last_plane = (tuple(map(float, se.plane_origin)),
                                       tuple(map(float, se.plane_normal)))
+    if se.plane_origin is not None:
+        # Saved before face planes had an anchor: bake it from the origin the
+        # sketch's points were saved against (FacePlaneSource.plane_for).
+        ps = se.plane_source
+        while ps is not None and hasattr(ps, "parent"):
+            ps = ps.parent
+        if ps is not None and hasattr(ps, "anchor") and ps.anchor is None:
+            ps.seed_origin = tuple(map(float, se.plane_origin))
     try:
         b3d_plane = se.plane_source.resolve(history, before_index)
     except Exception as ex:
