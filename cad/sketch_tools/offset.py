@@ -103,30 +103,6 @@ def _point_side_of_arc(pt: np.ndarray, arc) -> float:
     return float(np.linalg.norm(pt - arc.center)) - arc.radius
 
 
-def _loop_contains(pt: np.ndarray, loop_entities: list, tol: float = 1e-3) -> bool:
-    """Ray-casting test against a tessellated loop polygon."""
-    from cad.sketch import LineEntity, ArcEntity
-    pts = []
-    for e in loop_entities:
-        if isinstance(e, LineEntity):
-            pts.append(e.p0)
-        elif isinstance(e, ArcEntity):
-            pts.extend(e.tessellate(32)[:-1])
-    if not pts:
-        return False
-    x, y = float(pt[0]), float(pt[1])
-    n = len(pts)
-    inside = False
-    j = n - 1
-    for i in range(n):
-        xi, yi = float(pts[i][0]), float(pts[i][1])
-        xj, yj = float(pts[j][0]), float(pts[j][1])
-        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
-            inside = not inside
-        j = i
-    return inside
-
-
 # ---------------------------------------------------------------------------
 # Offset geometry
 # ---------------------------------------------------------------------------
@@ -157,21 +133,29 @@ def offset_arc(arc, dist: float):
 def offset_entities(entities: list, dist: float, click_pt: np.ndarray,
                     is_loop: bool, sign_override: float | None = None) -> list:
     """
-    Offset a list of entities by dist.  The sign of dist is determined by
-    the click position relative to the geometry, unless sign_override (±1) is
-    given (used by the Flip-direction toggle / select-first flow).
-    Returns a list of new offset entities (may be empty on failure).
+    Offset a list of entities by dist.  The side comes from the click
+    position relative to the geometry, unless sign_override (±1) is given
+    (the Flip toggle / select-first flow): +1 is left of a line, outward
+    of an arc, and INTO a closed loop.
+    Returns a list of new offset entities (empty on failure, e.g. a loop
+    offset inward past its own width).
     """
     from cad.sketch import LineEntity, ArcEntity
 
     if not entities:
         return []
 
+    if is_loop:
+        oriented = _orient_loop(entities)
+        if oriented is not None:
+            if sign_override is not None:
+                sign = float(sign_override)
+            else:
+                sign = 1.0 if _poly_contains(click_pt, _loop_polygon(oriented)) else -1.0
+            return _offset_loop(oriented, sign * dist)
+
     if sign_override is not None:
         sign = float(sign_override)
-    elif is_loop:
-        inside = _loop_contains(click_pt, entities)
-        sign = 1.0 if inside else -1.0
     else:
         e = entities[0]
         if isinstance(e, LineEntity):
@@ -179,7 +163,6 @@ def offset_entities(entities: list, dist: float, click_pt: np.ndarray,
         else:
             sign = 1.0 if _point_side_of_arc(click_pt, e) >= 0 else -1.0
 
-    # Offset each entity individually
     offset = []
     for e in entities:
         if isinstance(e, LineEntity):
@@ -191,12 +174,7 @@ def offset_entities(entities: list, dist: float, click_pt: np.ndarray,
         if o is None:
             return []
         offset.append(o)
-
-    if not is_loop or len(offset) < 2:
-        return [o for o in offset if o is not None]
-
-    # For a closed loop, reconnect corners by intersecting adjacent offset entities
-    return _reconnect_loop(offset)
+    return offset
 
 
 # ---------------------------------------------------------------------------
@@ -243,43 +221,137 @@ def _project_onto_line_infinite(pt: np.ndarray, line) -> np.ndarray:
     return line.p0 + t * d
 
 
-def _reconnect_loop(offset: list) -> list:
-    """
-    Fix up the corners of an offset loop by intersecting adjacent entity pairs
-    and trimming/extending each entity to the intersection point.
-    """
+# ---------------------------------------------------------------------------
+# Closed loops
+# ---------------------------------------------------------------------------
+#
+# A loop's entities each have their own direction (a line drawn either way,
+# an arc always CCW), so "left of the entity" isn't one side of the loop.
+# The loop is ordered and each entity given the direction it is TRAVERSED
+# in (rev), the loop's orientation taken from its signed area, and every
+# entity offset to the same side of its travel: inward = left of travel
+# on a CCW loop.  (It used to offset each entity to its own left and each
+# arc outward: a CW loop clicked inside grew, a rounded rectangle's lines
+# and corners went opposite ways, a circle clicked inside grew.)
+
+def _ends(e, rev):
+    return (e.p1, e.p0) if rev else (e.p0, e.p1)
+
+
+def _orient_loop(entities: list, tol: float = 1e-3):
+    """[(entity, rev)] in traversal order, or None if the entities aren't
+    exactly one closed chain."""
     from cad.sketch import LineEntity, ArcEntity
-    n = len(offset)
-    # Compute corner intersection points
+    ents = [e for e in entities if isinstance(e, (LineEntity, ArcEntity))]
+    if not ents:
+        return None
+    if len(ents) == 1:
+        e = ents[0]
+        return [(e, False)] if np.linalg.norm(e.p1 - e.p0) < tol else None
+    loop = _find_loop_for_entity(ents[0], ents, tol=tol)
+    if loop is None or len(loop) != len(ents):
+        return None
+    b = loop[1]
+    touches = lambda p: min(np.linalg.norm(p - b.p0), np.linalg.norm(p - b.p1)) < tol
+    out = [(loop[0], not touches(loop[0].p1))]
+    for e in loop[1:]:
+        tail = _ends(*out[-1])[1]
+        out.append((e, np.linalg.norm(e.p0 - tail) >= tol))
+    return out
+
+
+def _loop_polygon(oriented) -> np.ndarray:
+    from cad.sketch import LineEntity
+    pts = []
+    for e, rev in oriented:
+        if isinstance(e, LineEntity):
+            pts.append(_ends(e, rev)[0])
+        else:
+            t = e.tessellate(32)
+            pts.extend((t[::-1] if rev else t)[:-1])
+    return np.array(pts, dtype=float)
+
+
+def _signed_area(poly) -> float:
+    x, y = poly[:, 0], poly[:, 1]
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _poly_contains(pt, poly) -> bool:
+    if pt is None or len(poly) < 3:
+        return False
+    x, y = float(pt[0]), float(pt[1])
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _offset_loop(oriented, inward: float) -> list:
+    """Each entity moved *inward* mm into the loop (negative: out), corners
+    reconnected.  [] if an entity would vanish or turn inside out."""
+    from cad.sketch import LineEntity, ArcEntity
+    ccw = _signed_area(_loop_polygon(oriented)) > 0
+    s = inward if ccw else -inward          # offset to the LEFT of travel
+    moved = []
+    for e, rev in oriented:
+        if isinstance(e, LineEntity):
+            a, b = _ends(e, rev)
+            t = b - a
+            L = float(np.linalg.norm(t))
+            if L < 1e-10:
+                return []
+            n = np.array([-t[1], t[0]]) / L * s
+            moved.append((LineEntity(a + n, b + n), False))
+        else:
+            # Travelling CCW (forward) the centre is on the left.
+            r = e.radius - s if not rev else e.radius + s
+            if r <= 1e-6:
+                return []
+            moved.append((ArcEntity(e.center.copy(), r, e.start_angle, e.end_angle), rev))
+    if len(moved) == 1:
+        return [moved[0][0]]
+    n = len(moved)
     corners = []
     for i in range(n):
-        a = offset[i]
-        b = offset[(i + 1) % n]
-        pt = _intersect_offset_pair(a, b)
-        if pt is None:
-            # Fallback: midpoint of the gap
-            pt = (a.p1 + b.p0) * 0.5
-        corners.append(pt)
-
-    # Rebuild entities with corrected endpoints
-    result = []
-    for i in range(n):
-        e = offset[i]
-        new_p0 = corners[(i - 1) % n]
-        new_p1 = corners[i]
+        (a, ra), (b, rb) = moved[i], moved[(i + 1) % n]
+        pt = _corner(a, ra, b, rb)
+        corners.append(pt if pt is not None else (_ends(a, ra)[1] + _ends(b, rb)[0]) * 0.5)
+    out = []
+    for i, (e, rev) in enumerate(moved):
+        sp, ep = corners[(i - 1) % n], corners[i]
         if isinstance(e, LineEntity):
-            if np.linalg.norm(new_p1 - new_p0) > 1e-6:
-                result.append(LineEntity(new_p0, new_p1))
-        elif isinstance(e, ArcEntity):
-            # Recompute start/end angles from the new corner points
-            a0 = math.atan2(float(new_p0[1] - e.center[1]),
-                            float(new_p0[0] - e.center[0]))
-            a1 = math.atan2(float(new_p1[1] - e.center[1]),
-                            float(new_p1[0] - e.center[0]))
+            d0 = e.p1 - e.p0
+            if np.linalg.norm(ep - sp) <= 1e-6 or float(np.dot(ep - sp, d0)) <= 0:
+                return []                    # offset past this edge: it turned over
+            out.append(LineEntity(sp, ep))
+        else:
+            p, q = (ep, sp) if rev else (sp, ep)
+            a0 = math.atan2(float(p[1] - e.center[1]), float(p[0] - e.center[0]))
+            a1 = math.atan2(float(q[1] - e.center[1]), float(q[0] - e.center[0]))
             span = (a1 - a0) % (2 * math.pi)
             if span > 1e-6:
-                result.append(ArcEntity(e.center.copy(), e.radius, a0, a0 + span))
-    return result
+                out.append(ArcEntity(e.center.copy(), e.radius, a0, a0 + span))
+    return out
+
+
+def _corner(a, ra, b, rb):
+    """Where travelled entity a meets the next one, b: line/line at their
+    (infinite) intersection, line/arc at the arc's end projected onto the
+    line (exact for a tangent corner)."""
+    from cad.sketch import LineEntity
+    if isinstance(a, LineEntity) and isinstance(b, LineEntity):
+        return _intersect_offset_pair(a, b)
+    if isinstance(b, LineEntity):
+        return _project_onto_line_infinite(_ends(a, ra)[1], b)
+    if isinstance(a, LineEntity):
+        return _project_onto_line_infinite(_ends(b, rb)[0], a)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -343,8 +415,10 @@ class OffsetTool(BaseTool):
             e = self.selected_entities[0]
             from cad.sketch import LineEntity
             if self.selected_is_loop:
-                return 1.0 if _loop_contains(self.selected_click_pt,
-                                             self.selected_entities) else -1.0
+                oriented = _orient_loop(self.selected_entities)
+                if oriented is not None:
+                    return 1.0 if _poly_contains(self.selected_click_pt,
+                                                 _loop_polygon(oriented)) else -1.0
             if isinstance(e, LineEntity):
                 return (1.0 if _point_side_of_line(self.selected_click_pt,
                                                    e.p0, e.p1) >= 0 else -1.0)
