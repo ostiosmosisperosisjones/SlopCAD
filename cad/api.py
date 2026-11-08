@@ -126,6 +126,75 @@ class Sketch:
         return self
 
 
+class _Signal:
+    def emit(self, *a, **k):
+        pass
+
+
+class _SketchFaces:
+    """viewport._sketch_faces built on demand: {history index: [(face,
+    outer_uvs, hole_uvs), ...]} as viewer/sketch_pick.py builds it."""
+
+    def __init__(self, history):
+        self._h = history
+
+    def get(self, i, default=None):
+        es = self._h.entries
+        se = es[i].params.get("sketch_entry") if 0 <= i < len(es) else None
+        if se is None:
+            return default
+        faces, regions = se.build_faces()
+        return [(f, r[0], r[1]) for f, r in zip(faces, regions)] or default
+
+
+class _Mesh:
+    def __init__(self, shape):
+        self.occt_faces = list(shape.faces())
+
+
+class _Meshes:
+    def __init__(self, workspace):
+        self._ws = workspace
+
+    def get(self, body_id, default=None):
+        shape = self._ws.current_shape(body_id) if body_id else None
+        return _Mesh(shape) if shape is not None else default
+
+
+class _CommitHost:
+    """Just enough viewport for an op's commit() — the GUI's own commit
+    path, run headless (no meshes, nothing selected)."""
+
+    def __init__(self, doc: "Doc"):
+        self.workspace = doc.workspace
+        self.history = doc.history
+        self.history_changed = _Signal()
+        self._pending_op_error = None
+        self._selected_sketch_entry = None
+        self._selected_sketch_face = None
+        self._sketch_faces = _SketchFaces(doc.history)
+        self._meshes = _Meshes(doc.workspace)
+
+    def _post_push_cascade(self, body_id=None):
+        if self.history.is_mid_history:
+            ok, err, _ = self.history.replay_from(self.history.cursor)
+            if not ok:
+                print(f"[Cascade] Replay after insert: {err}")
+            self.history.seek(len(self.history.entries) - 1)
+
+    def _rebuild_bodies(self, body_ids):
+        pass
+
+    def _rebuild_body_mesh(self, body_id):
+        pass
+
+    def _rebuild_all_meshes(self):
+        pass
+
+    def update(self):
+        pass
+
+
 class Doc:
     def __init__(self, workspace, history):
         self.workspace, self.history = workspace, history
@@ -311,36 +380,65 @@ class Doc:
 
     def extrude(self, sk: Sketch, distance, cut: bool = False,
                 into: Body | None = None, regions: list[int] | None = None) -> Body:
-        """Extrude the sketch's closed regions (all, or *regions* indices).
-        Sketch on a body face → adds to (or cuts, cut=True) that body.
-        World-plane sketch → new body, or fused into / cut from *into*."""
-        from cad.op_types import ExtrudeOp
+        """Extrude the sketch's closed regions (all, or *regions* indices),
+        committed exactly as the GUI's extrude panel commits it
+        (cad.extrude_commit, through the op's own commit path):
+
+          face sketch, no into   "Merge with" the sketch's body (ExtrudeOp)
+          world sketch, no into  "New Body" (ExtrudeOp force_new_body)
+          into=B                 "Merge with" B
+          cut=True, into=B       Cut with B picked (CrossBodyCutOp)
+          cut=True, no into      Cut with no target: one CrossBodyCutOp per
+                                 body the tool hits (the sketch's body, if
+                                 any, is the one returned)
+
+        The direction is the sketch normal, reversed for a cut (the panel
+        flips it when Cut is picked).  *distance* is a number or a parameter
+        expression; a negative number extrudes the other way (the panel's
+        ⇅, a positive distance along -normal)."""
+        from cad.extrude_commit import extrude_op, cut_all_intersecting, NEW_BODY
+        from cad.params import make_binding
+        from cad.profile_source import SketchProfile
         se = sk.se
         sk_entry = self.commit_sketch(sk)
-        faces, regions_uv = se.build_faces()
+        faces, _ = se.build_faces()
         if not faces:
             raise ApiError("sketch has no closed regions")
-        idx = list(range(len(faces))) if regions is None else list(regions)
-        bounds = se.build_face_boundaries()
-        op = ExtrudeOp.from_sketch(
-            sk_entry.entry_id, distance=1.0, face_indices=idx,
-            face_centroids=[np.array(regions_uv[i][0]).mean(axis=0).tolist() for i in idx],
-            face_boundaries=[sorted(bounds[i]) for i in idx])
-        if into is not None and not se.body_id and not cut:
-            op.merge_body_id = into.id
-        params = self._bind(op.to_params(), distance=distance)   # sign = operation
-        target = se.body_id or (into.id if into is not None else None)
-        if target is None:
-            if cut:
-                raise ApiError("cut from a world-plane sketch needs into=body")
-            target = self.workspace.add_body(self.workspace.next_part_name(), None).id
-            sk_entry.body_id = se.body_id = target
-        entry = self.history.push(
-            label="cut" if cut else "extrude",
-            operation="cut" if cut else "extrude", params=params,
-            body_id=target, face_ref=None,
-            shape_before=self.workspace.current_shape(target), shape_after=None)
-        self._commit(entry)
+        dist = self.eval(distance) if isinstance(distance, str) else float(distance)
+        flip = not cut and not isinstance(distance, str) and dist < 0
+        dist = abs(dist) if flip else dist       # the panel's ⇅
+        if dist <= 0:
+            raise ApiError(f"extrude distance must be positive, got {dist:g}")
+        extra = ({"exprs": {"distance": make_binding(distance, "mm")}}
+                 if isinstance(distance, str) else {})
+        n = np.cross(np.asarray(se.plane_x_axis, float), np.asarray(se.plane_y_axis, float))
+        n = n / np.linalg.norm(n)
+        direction = -n if cut != flip else n
+        profiles = [SketchProfile(sketch_id=sk_entry.entry_id,
+                                  face_indices=None if regions is None else list(regions))]
+        host = _CommitHost(self)
+        before = {e.entry_id for e in self.history.entries}
+        if cut and into is None:
+            if not cut_all_intersecting(host, -dist, direction, profiles, extra):
+                raise ApiError("cut: the tool doesn't cut any body")
+        else:
+            merge = into.id if into is not None else (se.body_id or NEW_BODY)
+            op = extrude_op(profiles, -dist if cut else dist, direction, merge, extra)
+            op.commit(host, extra or None)
+        new = [e for e in self.history.entries if e.entry_id not in before]
+        if not new:
+            raise ApiError("extrude pushed no entry")
+        bad = [e for e in new if e.error]
+        if bad:
+            raise ApiError(bad[0].error_msg or f"{bad[0].label} failed")
+        self._commit(new[0])
+        main = new[0]
+        if cut:
+            target = into.id if into is not None else (se.body_id or main.body_id)
+        elif merge == NEW_BODY:
+            target = (main.params.get("child_body_ids") or [main.body_id])[0]
+        else:
+            target = merge
         return Body(self, target)
 
     def _edge_op(self, operation, body: Body, edges, faces, **fields):

@@ -906,17 +906,15 @@ def _replay_sketch_entry(se, history: History, before_index: int,
     before = {id(ent): [p.copy() for p in ent.points] for ent, _, _ in ref_updates}
 
     # All resolved successfully — now commit.
-    o = b3d_plane.origin
-    x = b3d_plane.x_dir
-    y = b3d_plane.y_dir
-    z = b3d_plane.z_dir
-    plane_origin = np.array([o.X, o.Y, o.Z], dtype=np.float64)
-    plane_x_axis = np.array([x.X, x.Y, x.Z], dtype=np.float64)
-    plane_y_axis = np.array([y.X, y.Y, y.Z], dtype=np.float64)
+    v = lambda d: np.array([d.X, d.Y, d.Z], dtype=np.float64)
+    frame = (v(b3d_plane.origin), v(b3d_plane.x_dir), v(b3d_plane.y_dir), v(b3d_plane.z_dir))
+    if not own:
+        frame = _sketch_frame_for_consumer(se, history, before_index, frame)
+    plane_origin, plane_x_axis, plane_y_axis, plane_normal = frame
     se.plane_origin = plane_origin
     se.plane_x_axis = plane_x_axis
     se.plane_y_axis = plane_y_axis
-    se.plane_normal = np.array([z.X, z.Y, z.Z], dtype=np.float64)
+    se.plane_normal = plane_normal
 
     def _to_uv(wp):
         delta = np.array(wp, dtype=np.float64) - plane_origin
@@ -1020,6 +1018,45 @@ def _resolve_bound_dimensions(se, history: History, pins: dict | None = None,
                            "the constraint solver failed")
         return False, "Sketch constraints can't be solved with the new parameter values"
     return True, ""
+
+
+def _sketch_frame_for_consumer(se, history: History, before_index: int, found):
+    """The plane a consumer (a cut / extrude / sweep … reprojecting the
+    sketch at its own position) puts the sketch on.
+
+    A face plane's origin is the face's centroid (build123d Plane(face)), so
+    an op between the sketch and its consumer that only changes the face's
+    outline (a sibling cut of a no-target fan-out, a pocket from another
+    loop, a boss merged onto it) moved the centroid and dragged the profile
+    across the face with it: replay cut somewhere the commit didn't.
+
+    The sketch's frame is the one at its own position.  Moved by any
+    TransformOps on the face's body since (cad.body_motion), and while the
+    face found here is still parallel (same sense) to it, the consumer keeps
+    that frame, only moved along the normal onto the face (so a face pushed
+    out by a later op still carries the sketch).  A face that turned uses
+    the face plane, as before.  *found* = (origin, x, y, normal)."""
+    import numpy as np
+    idx = next((i for i, e in enumerate(history._entries)
+                if e.params.get("sketch_entry") is se), None)
+    if idx is None or idx >= before_index or se.plane_source is None:
+        return found
+    try:
+        own = se.plane_source.resolve(history, idx)
+    except Exception:
+        return found
+    v = lambda d: np.array([d.X, d.Y, d.Z], dtype=np.float64)
+    o, x, y, n = v(own.origin), v(own.x_dir), v(own.y_dir), v(own.z_dir)
+    body = getattr(se.plane_source, "body_id", None)
+    if body:
+        from cad import body_motion as BM
+        _, T = BM.motion(history, body, before_index, idx)
+        if T is not None:
+            o, x, y, n = BM.pt(T, o), BM.vec(T, x), BM.vec(T, y), BM.vec(T, n)
+    fo, _, _, fn = found
+    if abs(float(n @ fn) - 1.0) > 1e-9:
+        return found
+    return o + float((fo - o) @ n) * n, x, y, n
 
 
 def reproject_consumed_sketch(se, history: History, before_index: int,
