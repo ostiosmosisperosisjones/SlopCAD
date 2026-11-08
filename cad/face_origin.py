@@ -757,7 +757,8 @@ def curved_origin_for_face(history, body_id: str, occ_face, before_index: int):
     whichever op made it last."""
     best = None
     for finder in (arc_wall_origin_for_face, fillet_origin_for_face,
-                   revolve_wall_origin_for_face, import_origin_for_face):
+                   revolve_wall_origin_for_face, import_origin_for_face,
+                   _curved_boolean_origin):
         try:
             o = finder(history, body_id, occ_face, before_index)
         except Exception as ex:
@@ -905,7 +906,7 @@ def any_origin_for_face(history, body_id: str, occ_face, before_index: int):
                    chamfer_origin_for_face, revolve_origin_for_face,
                    revolve_wall_origin_for_face, import_origin_for_face,
                    shell_origin_for_face, sweep_origin_for_face, loft_origin_for_face,
-                   coil_origin_for_face):
+                   coil_origin_for_face, boolean_origin_for_face):
         try:
             o = finder(history, body_id, occ_face, before_index)
         except Exception as ex:
@@ -918,6 +919,104 @@ def any_origin_for_face(history, body_id: str, occ_face, before_index: int):
         if best is None or k > best[0]:
             best = (k, o)
     return best[1] if best else None
+
+
+# ---------------------------------------------------------------------------
+# boolean faces: "face X of input body B, carried through boolean K"
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BooleanFaceOrigin:
+    """A face a boolean carried over from one of its inputs (a union /
+    intersect result body has no other history, a subtract's pocket comes
+    from the tool).  `base` names the face on input `input_id` as of the
+    boolean; resolving finds it on the result with base.find_in, after
+    moving the result back over any TransformOps since the boolean."""
+    boolean_of: str      # entry_id of the BooleanOp
+    input_id:   str      # the input body the face came from
+    base:       object   # that face's origin on the input
+
+    def to_dict(self) -> dict:
+        return {"boolean_of": self.boolean_of, "input": self.input_id,
+                "base": self.base.to_dict()}
+
+    def made_at(self, history):
+        return history.id_to_index(self.boolean_of)
+
+    def frame(self, history):
+        """The base face's frame, carried over the input's moves up to the
+        boolean: the frame of this origin's made_at."""
+        k = self.made_at(history)
+        fr = self.base.frame(history)
+        if k is None or fr is None:
+            return None
+        _, T = BM.made_since(history, (self.input_id, k), self.base.made_at(history))
+        return _moved_frame(fr, T)
+
+    def find_in(self, history, shape, at=None):
+        k = self.made_at(history)
+        if k is None:
+            return None, None
+        return BM.in_frame(history, shape, at, k,
+                           lambda s: self.base.find_in(history, s, (self.input_id, k)))
+
+
+def _moved_frame(fr, T):
+    if T is None:
+        return fr
+    A, L, t, w, n, dh = fr
+    return (BM.pt(T, A), L, BM.vec(T, t), BM.vec(T, w), BM.vec(T, n), dh)
+
+
+def _boolean_result_id(op):
+    return op.source_body_id if op.operation == "subtract" else op.result_body_id
+
+
+def boolean_origin_for_face(history, body_id: str, occ_face, before_index: int,
+                            curved: bool = False):
+    """The input face the newest boolean that wrote this body carried this
+    face over from (by a point of the face lying on it), named by that
+    input face's own origin."""
+    for k in range(min(before_index, len(history._entries)) - 1, -1, -1):
+        e = history._entries[k]
+        op = e.op
+        if type(op).__name__ != "BooleanOp" or e.error:
+            continue
+        b, T = BM.motion(history, body_id, before_index, k)
+        if b != _boolean_result_id(op):
+            continue
+        face0 = BM.moved(occ_face, T.Inverted() if T is not None else None)
+        c, _ = _occ_face_props(face0)
+        P = _point_on_face(c, face0)
+        if P is None:
+            return None
+        N = None if curved else _occ_face_normal(face0)
+        for iid in op.body_ids:
+            src = history._shape_for_body_at(iid, k)
+            if src is None:
+                continue
+            best = None
+            for f in src.faces():
+                if N is not None:
+                    fn = _occ_face_normal(f.wrapped)
+                    if fn is None or abs(float(fn @ N)) < 1 - 1e-6:
+                        continue
+                d = _dist_to_face(P, f.wrapped)
+                if d is not None and d < _CAP_ON_PLANE and (best is None or d < best[0]):
+                    best = (d, f)
+            if best is None:
+                continue
+            find = curved_origin_for_face if curved else any_origin_for_face
+            base = find(history, iid, best[1].wrapped, k)
+            if base is not None:
+                return BooleanFaceOrigin(e.entry_id, iid, base)
+        return None
+    return None
+
+
+def _curved_boolean_origin(history, body_id, occ_face, before_index):
+    return boolean_origin_for_face(history, body_id, occ_face, before_index, curved=True)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1494,6 +1593,8 @@ def face_origin_from_dict(d: dict | None):
         return LoftFaceOrigin(d["loft_of"], d["key"])
     if d and "coil_of" in d:
         return CoilFaceOrigin(d["coil_of"], int(d["end"]))
+    if d and "boolean_of" in d:
+        return BooleanFaceOrigin(d["boolean_of"], d["input"], face_origin_from_dict(d["base"]))
     if d and "shell_of" in d:
         return ShellFaceOrigin(d["shell_of"], face_origin_from_dict(d["base"]))
     if d and "chamfer_of" in d:
@@ -1768,7 +1869,125 @@ class EdgeOrigin:
 def edge_origin(history, body_id: str, shape_occ, occ_edge,
                 before_index: int):
     """Provenance for an edge of body_id, or None if neither it nor its
-    faces have any."""
+    faces have any.  An edge of a boolean's result that the plain path
+    can only half name is named through the boolean's inputs."""
+    o = _edge_origin(history, body_id, shape_occ, occ_edge, before_index)
+    if o is None or (isinstance(o, EdgeOrigin) and len(o.faces) < 2):
+        try:
+            b = boolean_edge_origin(history, body_id, shape_occ, occ_edge, before_index)
+        except Exception as ex:
+            print(f"[FaceOrigin] boolean_edge_origin: {ex}")
+            b = None
+        if b is not None:
+            return b
+    return o
+
+
+@dataclass
+class BooleanEdgeOrigin:
+    """An edge a boolean carried over from one of its inputs: `base` names
+    it on input `input_id` as of the boolean (see BooleanFaceOrigin)."""
+    boolean_of: str
+    input_id:   str
+    base:       object
+
+    def to_dict(self) -> dict:
+        return {"edge_boolean_of": self.boolean_of, "input": self.input_id,
+                "base": self.base.to_dict()}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d["edge_boolean_of"], d["input"], edge_origin_from_dict(d["base"]))
+
+    def made_at(self, history):
+        return history.id_to_index(self.boolean_of)
+
+    def _at(self, history):
+        k = self.made_at(history)
+        return None if k is None else (self.input_id, k)
+
+    def find_in(self, history, shape, at=None):
+        a = self._at(history)
+        if a is None:
+            return None
+        return BM.in_frame(history, shape, at, a[1],
+                           lambda s: self.base.find_in(history, s, a))
+
+    def faces_apart(self, history, shape, at=None) -> bool:
+        a = self._at(history)
+        fa = getattr(self.base, "faces_apart", None)
+        if a is None or fa is None:
+            return False
+        _, T = BM.made_since(history, at, a[1])
+        back = shape if T is None else BM._b3d(shape, BM.moved(shape.wrapped, T.Inverted()))
+        return fa(history, back, a)
+
+    def tangent_now(self, history, at=None):
+        a = self._at(history)
+        tn = getattr(self.base, "tangent_now", None)
+        v = tn(history, a) if (a is not None and tn is not None) else None
+        if v is None:
+            return None
+        _, T = BM.made_since(history, at, a[1])
+        return BM.vec(T, v)
+
+
+def boolean_edge_origin(history, body_id: str, shape_occ, occ_edge, before_index: int):
+    """For the newest boolean that wrote body_id: the input edge this edge
+    lies along, named on that input; or, for an edge the boolean made
+    (where an input's face met another's), an EdgeOrigin over its two
+    faces' origins (BooleanFaceOrigins through the inputs)."""
+    from build123d import Edge, Vector
+    for k in range(min(before_index, len(history._entries)) - 1, -1, -1):
+        e = history._entries[k]
+        op = e.op
+        if type(op).__name__ != "BooleanOp" or e.error:
+            continue
+        b, T = BM.motion(history, body_id, before_index, k)
+        if b != _boolean_result_id(op):
+            continue
+        Ti = T.Inverted() if T is not None else None
+        e0 = Edge(BM.moved(occ_edge, Ti))
+        mid, tan = np.array(tuple(e0.position_at(0.5))), np.array(tuple(e0.tangent_at(0.5)))
+        for iid in op.body_ids:
+            src = history._shape_for_body_at(iid, k)
+            if src is None:
+                continue
+            for ed in src.edges():
+                if not _edge_dir_ok(ed, tan) or ed.distance_to(Vector(*mid)) > _CAP_ON_PLANE:
+                    continue
+                inner = _edge_origin(history, iid, src.wrapped, ed.wrapped, k)
+                if inner is not None and not (isinstance(inner, EdgeOrigin) and len(inner.faces) < 2):
+                    return BooleanEdgeOrigin(e.entry_id, iid, inner)
+        faces = _adjacent_faces(shape_occ, occ_edge)
+        if len(faces) != 2:
+            return None
+        origins = []
+        for f in faces:
+            o = (any_origin_for_face(history, body_id, f, before_index)
+                 or curved_origin_for_face(history, body_id, f, before_index))
+            if o is None:
+                return None
+            origins.append(o)
+        frame = origins[0].frame(history)
+        if frame is None:
+            return None
+        e1 = Edge(occ_edge)
+        mid, tan = np.array(tuple(e1.position_at(0.5))), np.array(tuple(e1.tangent_at(0.5)))
+        _, T0 = BM.made_since(history, (body_id, before_index), origins[0].made_at(history))
+        if T0 is not None:
+            T0i = T0.Inverted()
+            mid, tan = BM.pt(T0i, mid), BM.vec(T0i, tan)
+        return EdgeOrigin(
+            faces = origins,
+            mid   = tuple(round(x, 9) for x in FaceOrigin.local(frame, p=mid)),
+            tan   = tuple(round(x, 9) for x in FaceOrigin.local(frame, v=tan)),
+            anchor = None)
+    return None
+
+
+def _edge_origin(history, body_id: str, shape_occ, occ_edge,
+                 before_index: int):
     from build123d import Edge
     rim = rim_origin(history, body_id, occ_edge, before_index)
     if rim is not None:
@@ -2602,6 +2821,8 @@ def edge_origin_from_dict(d: dict | None):
         return RimOrigin.from_dict(d)
     if "blend_of" in d:
         return BlendRimOrigin.from_dict(d)
+    if "edge_boolean_of" in d:
+        return BooleanEdgeOrigin.from_dict(d)
     return EdgeOrigin.from_dict(d)
 
 

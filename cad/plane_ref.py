@@ -66,12 +66,24 @@ class FacePlaneSource(SketchPlaneSource):
 
     def _body_origin(self, history, before_index):
         """The world origin carried by the body's TransformOps before
-        *before_index* (cad.body_motion)."""
+        *before_index* (cad.body_motion).  A face a boolean carried over from
+        an input (BooleanFaceOrigin) rides that input's moves before the
+        boolean too: a sketch on a moved tool's face moves with the tool."""
         import numpy as np
         from cad import body_motion as BM
+        from cad.face_origin import BooleanFaceOrigin
         if history is None:
             return np.zeros(3)
-        _, T = BM.motion(history, self.body_id, before_index, -1)
+        b, at, o, T = self.body_id, before_index, self.origin, None
+        while isinstance(o, BooleanFaceOrigin):
+            k = o.made_at(history)
+            if k is None or k >= at:
+                break
+            _, Tk = BM.motion(history, b, at, k)
+            T = Tk if T is None else (T if Tk is None else T.Multiplied(Tk))
+            b, at, o = o.input_id, k, o.base
+        _, Tk = BM.motion(history, b, at, -1)
+        T = Tk if T is None else (T if Tk is None else T.Multiplied(Tk))
         return BM.pt(T, (0.0, 0.0, 0.0))
 
     def plane_for(self, history, face, before_index):

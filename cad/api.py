@@ -160,6 +160,9 @@ class _Meshes:
         shape = self._ws.current_shape(body_id) if body_id else None
         return _Mesh(shape) if shape is not None else default
 
+    def pop(self, body_id, default=None):
+        return default
+
 
 class _CommitHost:
     """Just enough viewport for an op's commit() — the GUI's own commit
@@ -440,6 +443,31 @@ class Doc:
         else:
             target = merge
         return Body(self, target)
+
+    def boolean(self, operation: str, target: Body, *tools: Body,
+                keep_inputs: bool = False) -> Body:
+        """Boolean of bodies, committed as the GUI's boolean panel commits it
+        (BooleanOp through its own commit path).  operation: "union" |
+        "subtract" | "intersect".  Union / intersect make a new body (the
+        one returned; the inputs are consumed unless keep_inputs); subtract
+        cuts *tools* from *target* and returns *target*."""
+        from cad.op_types import BooleanOp
+        if operation not in ("union", "subtract", "intersect"):
+            raise ApiError(f"boolean: unknown operation {operation!r}")
+        if not tools:
+            raise ApiError("boolean: give at least one tool body")
+        op = BooleanOp(body_ids=[target.id] + [t.id for t in tools],
+                       operation=operation, keep_inputs=keep_inputs)
+        before = {e.entry_id for e in self.history.entries}
+        op.commit(_CommitHost(self), None)
+        new = [e for e in self.history.entries if e.entry_id not in before]
+        if not new:
+            raise ApiError("boolean pushed no entry")
+        bad = [e for e in new if e.error]
+        if bad:
+            raise ApiError(bad[0].error_msg or f"{operation} failed")
+        self._commit(new[0])
+        return Body(self, op.result_body_id if operation != "subtract" else target.id)
 
     def _edge_op(self, operation, body: Body, edges, faces, **fields):
         from cad.edge_ref import EdgeRef
