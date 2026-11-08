@@ -329,8 +329,11 @@ class SketchModalMixin:
         self.camera.snap_to_normal(n.X, n.Y, n.Z, origin=(wo.X, wo.Y, wo.Z),
                                    x_dir=(xd.X, xd.Y, xd.Z),
                                    y_dir=(yd.X, yd.Y, yd.Z))
+        from cad.plane_ref import PlaneEntrySource
+        # By entry id, not the op's source object: the link survives save /
+        # load and an edit that replaces the source.
         self._sketch = SketchMode(b3d_plane, None, -1,
-                                  plane_source=op.plane_source)
+                                  plane_source=PlaneEntrySource(entry.entry_id))
         self._selected_sketch_entry = None
         self._selected_sketch_face  = None
         self._selected_plane_idx    = None

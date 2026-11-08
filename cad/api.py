@@ -59,6 +59,21 @@ class Body:
         return f"<Body {name} vol={self.volume:.3f}>"
 
 
+class DatumPlane:
+    """Handle to an offset-plane history entry (Doc.offset_plane)."""
+    def __init__(self, doc: "Doc", entry_id: str):
+        self.doc, self.entry_id = doc, entry_id
+
+    @property
+    def index(self) -> int:
+        return self.doc.history.id_to_index(self.entry_id)
+
+    def resolve(self):
+        """The build123d Plane it makes now."""
+        i = self.index
+        return self.doc.history.entries[i].op.plane_source.resolve(self.doc.history, i + 1)
+
+
 class Sketch:
     """A sketch being drawn.  Coordinates are plane UV in mm — world
     coordinates on a world plane, centred on the face for a face sketch.
@@ -352,7 +367,12 @@ class Doc:
         from cad.sketch import SketchEntry
         from cad.plane_ref import WorldPlaneSource, FacePlaneSource
         from cad.face_ref import FaceRef
-        if isinstance(on, Body):
+        if isinstance(on, DatumPlane):
+            # What sketch mode on a datum plane makes (viewer/sketch_modal).
+            from cad.plane_ref import PlaneEntrySource
+            p = on.resolve()
+            body_id, src, fi = "", PlaneEntrySource(on.entry_id), -1
+        elif isinstance(on, Body):
             fi = self.face_index(on, face if face is not None else ">Z")
             f = list(on.shape.faces())[fi]
             p = Plane(f)
@@ -367,6 +387,33 @@ class Doc:
                          entities=[], body_id=body_id, face_idx=fi,
                          plane_source=src)
         return Sketch(self, se)
+
+    def offset_plane(self, on="XY", distance=0.0, face=None, name: str = "") -> DatumPlane:
+        """A datum plane *distance* mm from a world plane ('XY'|'XZ'|'YZ'),
+        a planar face of a body (on=body, face='>Z'), or another DatumPlane;
+        what the offset-plane panel commits."""
+        from cad.op_offset_plane import OffsetPlaneOp
+        from cad.plane_ref import (OffsetPlaneSource, WorldPlaneSource,
+                                   FacePlaneSource, PlaneEntrySource)
+        h = self.history
+        if isinstance(on, DatumPlane):
+            parent = PlaneEntrySource(on.entry_id)
+        elif isinstance(on, Body):
+            fi = self.face_index(on, face if face is not None else ">Z")
+            parent = FacePlaneSource.for_face(h, on.id, list(on.shape.faces())[fi],
+                                              h.cursor + 1)
+        else:
+            parent = WorldPlaneSource(on.upper())
+        if not name:
+            name = f"Plane {sum(1 for e in h.entries if e.operation == 'offset_plane') + 1}"
+        op = OffsetPlaneOp(plane_source=OffsetPlaneSource(parent, float(distance)), name=name)
+        n0 = len(h.entries)
+        op.commit(_CommitHost(self), None)
+        entry = h.entries[n0]
+        if entry.error:
+            raise ApiError(entry.error_msg)
+        self._commit(entry)
+        return DatumPlane(self, entry.entry_id)
 
     def commit_sketch(self, sk: Sketch):
         if sk.entry is None:

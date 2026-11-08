@@ -103,6 +103,9 @@ def _plane_source_from_dict(d: dict | None):
             origin   = face_origin_from_dict(d.get("origin")),
             anchor   = d.get("anchor"),
         )
+    if t == "plane_entry":
+        from cad.plane_ref import PlaneEntrySource
+        return PlaneEntrySource(d["entry_id"])
     if t == "offset":
         from cad.plane_ref import OffsetPlaneSource
         return OffsetPlaneSource(
@@ -564,6 +567,11 @@ def load(data: bytes):
     # history_idx.  Convert any deferred-legacy sources to their entry_id
     # now that all entries (with their UUIDs) are loaded.
     _migrate_legacy_sketch_edge_sources(history)
+
+    # Saved before PlaneEntrySource: sketches on a datum plane held a copy
+    # of its source; point them at the plane entry (cad.plane_ref).
+    from cad.plane_ref import link_plane_entries
+    link_plane_entries(history)
 
     # Saved before ExtrudeOp.along_normal: the file's sketch planes are
     # the ones its extrudes were authored against, so bind now, pre-replay.

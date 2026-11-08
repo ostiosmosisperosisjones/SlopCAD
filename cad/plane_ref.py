@@ -289,3 +289,71 @@ class OffsetPlaneSource(SketchPlaneSource):
             "distance": self.distance,
             "parent":   self.parent.to_dict(),
         }
+
+
+# ---------------------------------------------------------------------------
+# PlaneEntrySource
+# ---------------------------------------------------------------------------
+
+class PlaneEntrySource(SketchPlaneSource):
+    """
+    The plane an offset-plane history entry makes, named by its entry id.
+    A sketch on a datum plane (or an offset of one) resolves through the
+    entry's CURRENT plane source, so it follows edits to the plane's
+    distance or parent.  It used to hold the entry's source OBJECT: the
+    link held within a session but a saved file stored two independent
+    copies, and after reopening, editing the plane left its sketches where
+    they were.
+    """
+
+    def __init__(self, entry_id: str):
+        self.entry_id = entry_id
+
+    def source(self, history):
+        i = history.id_to_index(self.entry_id) if history is not None else None
+        e = history._entries[i] if i is not None else None
+        if e is None or e.operation != "offset_plane" or e.op is None:
+            raise RuntimeError(f"PlaneEntrySource: plane entry {self.entry_id} is gone")
+        return e.op.plane_source
+
+    def resolve(self, history, before_index: int):
+        return self.source(history).resolve(history, before_index)
+
+    def to_dict(self) -> dict:
+        return {"type": "plane_entry", "entry_id": self.entry_id}
+
+
+def link_plane_entries(history) -> int:
+    """Files saved before PlaneEntrySource: a sketch's (or an offset plane's
+    parent) plane source that is a copy of an earlier offset-plane entry's
+    becomes a PlaneEntrySource to the nearest such entry.  Returns how
+    many were linked."""
+    from cad.serializer import _plane_source_to_dict
+    seen: list[tuple[str, dict]] = []
+    n = [0]
+
+    def relink(ps):
+        if ps is None or isinstance(ps, PlaneEntrySource):
+            return ps
+        d = _plane_source_to_dict(ps)
+        for eid, sd in reversed(seen):
+            if sd == d:
+                n[0] += 1
+                return PlaneEntrySource(eid)
+        if isinstance(ps, OffsetPlaneSource):
+            ps.parent = relink(ps.parent)
+        return ps
+
+    for e in history._entries:
+        se = e.params.get("sketch_entry") if e.operation == "sketch" else None
+        if se is not None and getattr(se, "plane_source", None) is not None:
+            se.plane_source = relink(se.plane_source)
+        elif e.operation == "offset_plane" and e.op is not None:
+            ps = e.op.plane_source
+            if isinstance(ps, OffsetPlaneSource):
+                k = n[0]
+                ps.parent = relink(ps.parent)
+                if n[0] != k:
+                    e.params["plane_source"] = _plane_source_to_dict(ps)
+            seen.append((e.entry_id, _plane_source_to_dict(ps)))
+    return n[0]
