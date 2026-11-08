@@ -389,7 +389,8 @@ class Doc:
         return Sketch(self, se)
 
     def offset_plane(self, on="XY", distance=0.0, face=None, name: str = "") -> DatumPlane:
-        """A datum plane *distance* mm from a world plane ('XY'|'XZ'|'YZ'),
+        """A datum plane *distance* mm (or a parameter expression) from a
+        world plane ('XY'|'XZ'|'YZ'),
         a planar face of a body (on=body, face='>Z'), or another DatumPlane;
         what the offset-plane panel commits."""
         from cad.op_offset_plane import OffsetPlaneOp
@@ -406,9 +407,15 @@ class Doc:
             parent = WorldPlaneSource(on.upper())
         if not name:
             name = f"Plane {sum(1 for e in h.entries if e.operation == 'offset_plane') + 1}"
+        extra = None
+        if isinstance(distance, str):
+            # What the panel's ExprSpinBox commits: a magnitude binding.
+            from cad.params import make_binding
+            extra = {"exprs": {"distance": make_binding(distance, "mm")}}
+            distance = self.eval(distance)
         op = OffsetPlaneOp(plane_source=OffsetPlaneSource(parent, float(distance)), name=name)
         n0 = len(h.entries)
-        op.commit(_CommitHost(self), None)
+        op.commit(_CommitHost(self), extra)
         entry = h.entries[n0]
         if entry.error:
             raise ApiError(entry.error_msg)

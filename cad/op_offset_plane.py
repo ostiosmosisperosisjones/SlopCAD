@@ -64,9 +64,14 @@ class OffsetPlaneOp(Op):
 
     def to_params(self) -> dict:
         from cad.serializer import _plane_source_to_dict
+        from cad.plane_ref import OffsetPlaneSource
         p: dict[str, Any] = {
             "plane_source": _plane_source_to_dict(self.plane_source),
         }
+        if isinstance(self.plane_source, OffsetPlaneSource):
+            # Top-level so a params["exprs"]["distance"] binding can drive it
+            # (History._apply_bindings; signed: a flipped plane stays flipped).
+            p["distance"] = self.plane_source.distance
         if self.name:
             p["name"] = self.name
         return p
@@ -74,7 +79,9 @@ class OffsetPlaneOp(Op):
     @classmethod
     def _from_params(cls, params: dict, sign: int = 1) -> "OffsetPlaneOp":
         from cad.serializer import _plane_source_from_dict
-        return cls(
-            plane_source = _plane_source_from_dict(params.get("plane_source")),
-            name         = params.get("name", ""),
-        )
+        from cad.plane_ref import OffsetPlaneSource
+        ps = _plane_source_from_dict(params.get("plane_source"))
+        if isinstance(ps, OffsetPlaneSource) and params.get("distance") is not None:
+            ps.distance = float(params["distance"])
+            params["plane_source"]["distance"] = ps.distance
+        return cls(plane_source=ps, name=params.get("name", ""))

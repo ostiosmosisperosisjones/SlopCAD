@@ -77,6 +77,9 @@ class OffsetPlaneMixin:
 
         # Restore widgets from the stored op.
         panel.load_from_op(entry.op, parent_label=self._infer_parent_label(entry.op))
+        b = entry.params.get("exprs", {}).get("distance")
+        if b:
+            panel._spinbox.set_binding(b, abs(float(entry.op.plane_source.distance)))
         self.history_changed.emit()
 
     def _infer_parent_label(self, op) -> str | None:
@@ -266,8 +269,9 @@ class OffsetPlaneMixin:
             count = sum(1 for e in self.history.entries
                         if e.operation == "offset_plane")
             name = f"Plane {count + 1}"
+        from gui.expr_spinbox import exprs_extra
         op = OffsetPlaneOp(plane_source=plane_source, name=name)
-        op.commit(self, None)
+        op.commit(self, exprs_extra(distance=panel._spinbox))
         self._close_offset_plane_panel()
         self.update()
 
@@ -311,8 +315,12 @@ class OffsetPlaneMixin:
             if name:
                 old_op.name = name
 
-        # Refresh params and label
+        # Refresh params and label; the distance's binding is the panel's.
         entry.params = old_op.to_params()
+        panel = getattr(self, '_offset_plane_panel', None)
+        b = panel._spinbox.binding() if panel is not None else None
+        if b:
+            entry.params["exprs"] = {"distance": b}
         from cad.units import format_op_label as _lbl
         entry.label = _lbl("offset_plane", entry.params)
         entry.editing = False
