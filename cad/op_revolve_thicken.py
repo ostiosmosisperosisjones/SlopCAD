@@ -389,12 +389,65 @@ def _follow_axis_edge(op, history, entry_index):
     return pt, d
 
 
+_ADOPT_AXIS_TOL = 1e-6    # mm: an edge pick's axis is that edge's midpoint
+
+
+def _adopt_axis_edge(op, history, entry_index):
+    """A revolve saved before edge axes were followed (or by a build that
+    dropped the pick) has only a frozen world axis.  When that axis is
+    exactly an edge pick's axis (the edge's midpoint, to 1e-6 mm, and its
+    line) on a body as it stood before the revolve, it was picked from that
+    edge: bake the edge as axis_source so the axis follows it from now on.
+    Only ever while the geometry is still the one it was picked on (a moved
+    edge no longer matches, and nothing is guessed)."""
+    import numpy as np
+    from cad.edge_ref import EdgeRef, BodyEdgeSource
+    from cad.serializer import _edge_source_to_dict
+    try:
+        before = history.fanout_members(entry_index)[0]
+        P = np.asarray(op.axis_point, dtype=float)
+        D = np.asarray(op.axis_dir, dtype=float)
+        D = D / np.linalg.norm(D)
+        bids = []
+        for e in history._entries[:before]:
+            for b in [e.body_id] + list(e.params.get("child_body_ids") or []):
+                if b and b not in bids:
+                    bids.append(b)
+        hits = []
+        for bid in bids:
+            shape = history._shape_for_body_at(bid, before)
+            if shape is None:
+                continue
+            occ = getattr(shape, "wrapped", shape)
+            for ed in shape.edges():
+                ax = edge_axis(ed.wrapped)
+                if ax is None:
+                    continue
+                if (np.linalg.norm(ax[0] - P) <= _ADOPT_AXIS_TOL
+                        and abs(abs(float(ax[1] @ D)) - 1.0) < 1e-9):
+                    hits.append((bid, ed.wrapped, occ))
+        if len(hits) != 1:                     # none, or ambiguous (coincident edges)
+            return
+        bid, occ_edge, occ = hits[0]
+        ref = EdgeRef.for_edge(history, bid, occ_edge, occ, before)
+        if ref is None:
+            return
+        op.axis_source = _edge_source_to_dict(BodyEdgeSource(bid, ref, ref.origin))
+        history._entries[entry_index].params["axis_source"] = op.axis_source
+        print("[Revolve] axis recognised as a body edge pick; it follows that edge now")
+    except Exception as ex:
+        print(f"[Revolve] axis edge adoption skipped: {ex}")
+
+
 def _revolve_axis(op, history, entry_index=None):
     """The op's world axis now.  An axis picked from a body edge follows the
     edge.  With a sketch profile the stored sketch-relative axis
     (axis_line_uid / axis_local, anchored to the first sketch) follows that
     sketch; otherwise the world axis is used as stored.  Call after the
     profiles resolved (they reproject the sketch)."""
+    if (not op.axis_source and entry_index is not None and not op.axis_local
+            and not op.axis_line_uid and op.axis_point is not None and op.axis_dir is not None):
+        _adopt_axis_edge(op, history, entry_index)
     if op.axis_source and entry_index is not None:
         return _follow_axis_edge(op, history, entry_index)
     from cad.profile_source import sketch_profiles

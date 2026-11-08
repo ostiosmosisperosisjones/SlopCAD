@@ -129,6 +129,7 @@ class SketchLoftOp(Op):
 
     def execute(self, shape: Any, history: "History", entry_index: int) -> Any:
         faces = self._resolve_profile_faces(history, entry_index)
+        self._last_faces = faces   # loft face / edge origins (cad.face_origin)
 
         # ---- Cut path ----
         if self.cut_body_id is not None:

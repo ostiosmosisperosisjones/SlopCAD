@@ -410,16 +410,25 @@ class RevolveWallOrigin:
     Resolving re-reads the entity from the CURRENT sketch and the revolve's
     current axis and angle, rotates the point, and takes the face through
     it, so a cylinder / cone / torus / annulus follows profile and angle
-    edits.  Sketch profiles only."""
+    edits.  The profile is a sketch, or a body face that is an extrude's
+    cap / base over a sketch (lift_of = that extrude, lift_end 1 = cap,
+    0 = base): the entity is then read lifted by the extrude's CURRENT
+    span, so the wall follows that extrude's depth too."""
     revolve_of: str
     sketch_id:  str
     uid:        str
     s:          float
     frac:       float
+    lift_of:    str | None = None
+    lift_end:   int = 1
 
     def to_dict(self) -> dict:
-        return {"revolve_wall": self.revolve_of, "sketch_id": self.sketch_id,
-                "uid": self.uid, "s": self.s, "frac": self.frac}
+        d = {"revolve_wall": self.revolve_of, "sketch_id": self.sketch_id,
+             "uid": self.uid, "s": self.s, "frac": self.frac}
+        if self.lift_of:
+            d["lift_of"] = self.lift_of
+            d["lift_end"] = self.lift_end
+        return d
 
     def made_at(self, history):
         return history.id_to_index(self.revolve_of)
@@ -442,8 +451,15 @@ class RevolveWallOrigin:
         Q = _ent_point(se, ent, self.s)
         if Q is None:
             return None
+        if self.lift_of:
+            L = _profile_lift(history, self.lift_of, self.lift_end, se,
+                              history.id_to_index(self.revolve_of))
+            if L is None:
+                return None
+            Q = L[0](Q)
         pt, d, angle = ax
         return _rotate(Q, d, self.frac * angle, pt), pt
+
 
     def _find(self, history, shape):
         got = self.point(history)
@@ -456,6 +472,50 @@ class RevolveWallOrigin:
             if d is not None and d < best[2]:
                 best = (fi, face, d)
         return best[0], best[1]
+
+
+def _profile_lift(history, lift_of, end, se, at):
+    """(lift, unlift): sketch-plane point ↔ the extrude's cap (end 1) / base
+    (end 0) as the body stood at entry *at* (its motion between the two
+    applied), or None when the extrude is gone."""
+    k = history.id_to_index(lift_of)
+    if k is None or at is None:
+        return None
+    e = history._entries[k]
+    op = e.op
+    if not hasattr(op, "distance"):
+        return None
+    span = op.start_offset + (abs(op.distance) if end else 0.0)
+    v = span * _extrude_dir(op, se)
+    _, T = BM.motion(history, e.body_id, at, k) if e.body_id else (None, None)
+
+    def _t(P, Tx):
+        if Tx is None:
+            return P
+        from OCP.gp import gp_Pnt
+        q = gp_Pnt(*map(float, P)).Transformed(Tx)
+        return np.array([q.X(), q.Y(), q.Z()])
+    Tinv = T.Inverted() if T is not None else None
+    return (lambda Q: _t(np.asarray(Q, dtype=float) + v, T),
+            lambda Q: _t(np.asarray(Q, dtype=float), Tinv) - v)
+
+
+def _revolve_profiles(history, e):
+    """(sketch_id, lift_of, lift_end) of the revolve's profile: its sketch,
+    or the sketch under a body-face profile that is an extrude cap / base."""
+    from cad.profile_source import first_sketch_id
+    sid = first_sketch_id(e.op.profiles)
+    if sid:
+        return sid, None, 1
+    for pr in e.op.profiles or ():
+        o = getattr(pr, "origin", None)
+        if not isinstance(o, FaceOrigin):
+            continue
+        if o.cap_of:
+            return o.sketch_id, o.cap_of, 1
+        if o.made_by and abs(float(o.normal[2])) > 0.999:
+            return o.sketch_id, o.made_by, 0
+    return None, None, 1
 
 
 def _ent_uv(ent, s):
@@ -508,21 +568,60 @@ def _ent_param(se, ent, Q):
     return s, float(np.linalg.norm(_ent_uv(ent, s) - uv)) + off
 
 
+def _revolve_wall_forward(se, lift, pt, d, angle, face0):
+    """(uid, s, frac) of the profile entity whose swept midpoints lie on
+    face0: mid-entity, mid-swing first (inside the face, unlike a planar
+    face's uv centre, which can sit in an annulus's hole)."""
+    if abs(angle) < 1e-9:
+        return None
+    best = None
+    for ent in se.entities:
+        if not getattr(ent, "uid", None) or getattr(ent, "construction", False):
+            continue
+        for s_ in (0.5, 0.3, 0.7):
+            Q = _ent_point(se, ent, s_)
+            if Q is None:
+                break
+            if lift is not None:
+                Q = lift[0](Q)
+            for fr in (0.5, 0.3, 0.7):
+                P = _rotate(Q, d, fr * angle, pt)
+                r = (P - pt) - float((P - pt) @ d) * d
+                tol = max(1e-4, 1e-6 * float(np.linalg.norm(r)))
+                dist = _dist_to_face(P, face0)
+                if dist is not None and dist < tol and (best is None or dist < best[0]):
+                    best = (dist, ent.uid, s_, fr)
+            if best is not None and best[1] == ent.uid:
+                break
+    return None if best is None else best[1:]
+
+
 def revolve_wall_origin_for_face(history, body_id: str, occ_face, before_index: int):
     """Which revolve, and which entity of its sketch profile, swept this
     face, if any.  The most recent revolve on the body wins."""
     from build123d import Face
-    from cad.profile_source import first_sketch_id
     for e, Ti in _revolves_on(history, body_id, before_index):
-        sid = first_sketch_id(e.op.profiles)
+        sid, lift_of, lift_end = _revolve_profiles(history, e)
         si = history.id_to_index(sid) if sid else None
         se = history._entries[si].params.get("sketch_entry") if si is not None else None
         ax = _revolve_axis_now(history, e.entry_id)
         if se is None or ax is None:
             continue
+        lift = None
+        if lift_of:
+            lift = _profile_lift(history, lift_of, lift_end, se, history.id_to_index(e.entry_id))
+            if lift is None:
+                continue
         pt, d, angle = ax
         face0 = BM.moved(occ_face, Ti)
-        P = np.array(tuple(Face(face0).position_at(0.5, 0.5)))
+        got = _revolve_wall_forward(se, lift, pt, d, angle, face0)
+        if got is not None:
+            return RevolveWallOrigin(e.entry_id, sid, got[0], got[1], got[2],
+                                     lift_of, lift_end)
+        c, _ = _occ_face_props(face0)
+        P = _point_on_face(c, face0)
+        if P is None:
+            continue
         r = (P - pt) - float((P - pt) @ d) * d
         if np.linalg.norm(r) < 1e-9:
             continue
@@ -540,6 +639,8 @@ def revolve_wall_origin_for_face(history, body_id: str, occ_face, before_index: 
             if not (lo - 1e-6 <= phi <= hi + 1e-6) or abs(angle) < 1e-9:
                 continue
             Q = _rotate(P, d, -phi, pt)
+            if lift is not None:          # back down to the sketch plane
+                Q = lift[1](Q)
             for ent in se.entities:
                 if not getattr(ent, "uid", None) or getattr(ent, "construction", False):
                     continue
@@ -548,7 +649,101 @@ def revolve_wall_origin_for_face(history, body_id: str, occ_face, before_index: 
                     best = (sp[1], ent.uid, sp[0], phi / angle)
         if best is not None:
             return RevolveWallOrigin(e.entry_id, sid, best[1],
-                                     round(best[2], 9), round(best[3], 9))
+                                     round(best[2], 9), round(best[3], 9),
+                                     lift_of, lift_end)
+    return None
+
+
+@dataclass
+class ImportFaceOrigin:
+    """A face of an imported (STEP) solid: fixed geometry, so it is named by
+    a point on it (and its normal, when planar) as imported.  Resolving
+    takes the body face through that point (coplanar with it, when planar;
+    a later cut that took the point away leaves the nearest coplanar
+    piece).  Body motion is applied like every origin (made_at = the
+    import)."""
+    import_of: str
+    p:         tuple
+    n:         tuple | None = None
+
+    def to_dict(self) -> dict:
+        d = {"import_of": self.import_of, "p": list(self.p)}
+        if self.n is not None:
+            d["n"] = list(self.n)
+        return d
+
+    def made_at(self, history):
+        return history.id_to_index(self.import_of)
+
+    def frame(self, history):
+        return _WORLD_FRAME
+
+    def find_in(self, history, shape, at=None):
+        return BM.in_frame(history, shape, at, self.made_at(history),
+                           lambda s: self._find(s))
+
+    def _find(self, shape):
+        P = np.asarray(self.p, dtype=float)
+        N = np.asarray(self.n, dtype=float) if self.n is not None else None
+        best = (None, None, np.inf if N is not None else _IMPORT_ON)
+        for fi, face in enumerate(shape.faces()):
+            fn = _occ_face_normal(face.wrapped)
+            if N is not None:
+                if fn is None or abs(float(fn @ N)) < _CAP_NORMAL:
+                    continue
+                c, _ = _occ_face_props(face.wrapped)
+                if abs(float((P - c) @ fn)) > _CAP_ON_PLANE:
+                    continue
+            elif fn is not None:
+                continue
+            d = _dist_to_face(P, face.wrapped)
+            if d is not None and d < best[2]:
+                best = (fi, face, d)
+        return best[0], best[1]
+
+
+_IMPORT_ON = 1e-4    # mm — a curved imported face passes through its point
+
+
+def _import_entries(history, body_id, before_index):
+    """(import entry, inverse body motion since) for body_id, newest first:
+    STEP imports only (split children are ImportOps too, without a path)."""
+    for k in range(min(before_index, len(history._entries)) - 1, -1, -1):
+        e = history._entries[k]
+        if e.operation != "import" or e.error or not (e.params.get("path") or e.params.get("embed")):
+            continue
+        b, T = BM.motion(history, body_id, before_index, k)
+        if b == e.body_id:
+            yield e, (T.Inverted() if T is not None else None)
+
+
+def import_origin_for_face(history, body_id: str, occ_face, before_index: int):
+    """The imported face this face is (or is a piece of), if any."""
+    from build123d import Face
+    for e, Ti in _import_entries(history, body_id, before_index):
+        src = e.shape_after
+        if src is None:
+            continue
+        face0 = BM.moved(occ_face, Ti)
+        N = _occ_face_normal(face0)
+        if N is not None:
+            c, _ = _occ_face_props(face0)
+            P = _point_on_face(c, face0)
+        else:
+            P = np.array(tuple(Face(face0).position_at(0.5, 0.5)))
+        if P is None:
+            continue
+        for f in src.faces():
+            fn = _occ_face_normal(f.wrapped)
+            if (fn is None) != (N is None):
+                continue
+            if N is not None and abs(float(fn @ N)) < _CAP_NORMAL:
+                continue
+            d = _dist_to_face(P, f.wrapped)
+            if d is not None and d < _IMPORT_ON:
+                return ImportFaceOrigin(e.entry_id, tuple(round(float(x), 9) for x in P),
+                                        tuple(round(float(x), 9) for x in N)
+                                        if N is not None else None)
     return None
 
 
@@ -557,7 +752,7 @@ def curved_origin_for_face(history, body_id: str, occ_face, before_index: int):
     whichever op made it last."""
     best = None
     for finder in (arc_wall_origin_for_face, fillet_origin_for_face,
-                   revolve_wall_origin_for_face):
+                   revolve_wall_origin_for_face, import_origin_for_face):
         try:
             o = finder(history, body_id, occ_face, before_index)
         except Exception as ex:
@@ -683,7 +878,10 @@ def shell_origin_for_face(history, body_id: str, occ_face,
 
 
 def _offset_origin(history, body_id, occ_face, before_index):
-    for finder in (shell_origin_for_face, sweep_origin_for_face):
+    """Origin of a face no sketch line made: shell / sweep offset, or an
+    imported face (edge_origin names an edge through these too)."""
+    for finder in (shell_origin_for_face, sweep_origin_for_face, loft_origin_for_face,
+                   coil_origin_for_face, import_origin_for_face):
         try:
             o = finder(history, body_id, occ_face, before_index)
         except Exception as ex:
@@ -700,8 +898,9 @@ def any_origin_for_face(history, body_id: str, occ_face, before_index: int):
     best = None
     for finder in (origin_for_face, arc_cap_origin_for_face,
                    chamfer_origin_for_face, revolve_origin_for_face,
-                   revolve_wall_origin_for_face,
-                   shell_origin_for_face, sweep_origin_for_face):
+                   revolve_wall_origin_for_face, import_origin_for_face,
+                   shell_origin_for_face, sweep_origin_for_face, loft_origin_for_face,
+                   coil_origin_for_face):
         try:
             o = finder(history, body_id, occ_face, before_index)
         except Exception as ex:
@@ -771,8 +970,12 @@ def _sweep_faces(history, k):
             prof = op._resolve_profile_faces(history, k)[0]
         except Exception:
             return None
+    # Keyed on the path too: a helix height / pitch edit re-sweeps the same
+    # profile face along a new path (a stale end face then matches the
+    # START, which is coplanar with it at whole turns).
+    key = (prof, op._path_edges, getattr(op, "_binormal", None))
     memo = getattr(op, "_origin_faces", None)
-    if memo is not None and memo[0] is prof:
+    if memo is not None and all(a is b for a, b in zip(memo[0], key)):
         return memo[1]
     from cad.operations.sweep import sweep_solid
     try:
@@ -813,7 +1016,7 @@ def _sweep_faces(history, k):
                  and _on_face(m, f.wrapped)]
         if len(walls) == 1:
             out[ent.uid] = walls[0]
-    op._origin_faces = (prof, out)
+    op._origin_faces = (key, out)
     return out
 
 
@@ -844,6 +1047,249 @@ def sweep_origin_for_face(history, body_id: str, occ_face,
             d = _dist_to_face(P, f.wrapped)
             if d is not None and d < _CAP_ON_PLANE:
                 return SweepFaceOrigin(e.entry_id, key)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# loft faces: "the first / last section", "the wall over line <uid>" (an
+# edge is two of these: EdgeOrigin names it through _offset_origin)
+# ---------------------------------------------------------------------------
+
+def _loft_sections(history, k):
+    """The section faces (world, build123d) loft entry k was last built from,
+    or None.  Not a sweep (SketchSweepOp shares SketchLoftOp's execute)."""
+    if k is None:
+        return None
+    e = history._entries[k]
+    op = e.op
+    if type(op).__name__ != "SketchLoftOp" or e.error:
+        return None
+    faces = getattr(op, "_last_faces", None)
+    if faces is None:
+        try:
+            faces = op._resolve_profile_faces(history, k)
+        except Exception:
+            return None
+    return faces or None
+
+
+def _loft_section_sketch(history, k, end):
+    """The sketch entry of the first (end 0) / last (end 1) section when it
+    is a sketch profile, else None (a body-face section has no lines)."""
+    op = history._entries[k].op
+    profs = op.from_profiles
+    if not profs:
+        return None
+    sid = getattr(profs[-1 if end else 0], "sketch_id", None)
+    si = history.id_to_index(sid) if sid else None
+    return history._entries[si].params.get("sketch_entry") if si is not None else None
+
+
+def _loft_cap(history, k, end):
+    secs = _loft_sections(history, k)
+    return None if secs is None else secs[-1 if end else 0]
+
+
+def _loft_line_mid(history, k, uid):
+    """Midpoint of the first section's line uid, now (world), or None."""
+    se = _loft_section_sketch(history, k, 0)
+    fr = _line_frame(se, _line_by_uid(se, uid)) if se is not None else None
+    if fr is None:
+        return None
+    A, L, t, _w, _n = fr
+    return A + 0.5 * L * t
+
+
+@dataclass
+class LoftFaceOrigin:
+    """A face a loft made, named by the loft entry and which face: "cap0" /
+    "cap1" (the first / last section's own face) or "wall:<uid>" (the wall
+    rising from the first section's line uid).  Resolving reads the CURRENT
+    sections, so caps follow their sketch and walls their line."""
+    loft_of: str
+    key:     str
+
+    def to_dict(self) -> dict:
+        return {"loft_of": self.loft_of, "key": self.key}
+
+    def made_at(self, history):
+        return history.id_to_index(self.loft_of)
+
+    def frame(self, history):
+        return _WORLD_FRAME
+
+    def find_in(self, history, shape, at=None):
+        return BM.in_frame(history, shape, at, self.made_at(history),
+                           lambda s: self._find(history, s))
+
+    def _find(self, history, shape):
+        k = self.made_at(history)
+        if self.key in ("cap0", "cap1"):
+            cap = _loft_cap(history, k, self.key == "cap1")
+            if cap is None or _occ_face_normal(cap.wrapped) is None:
+                return None, None
+            return _coplanar_nearest(shape, cap)
+        if not self.key.startswith("wall:"):
+            return None, None
+        got = _loft_line_mid(history, k, self.key[5:])
+        cap = _loft_cap(history, k, 0)
+        if got is None or cap is None:
+            return None, None
+        ci, _ = _coplanar_nearest(shape, cap)
+        hits = [(fi, f) for fi, f in enumerate(shape.faces())
+                if fi != ci and _on_face(got, f.wrapped, 1e-5)]
+        return hits[0] if len(hits) == 1 else (None, None)
+
+
+def _lofts_on(history, body_id, before_index):
+    """(loft entry k, inverse body motion since k) pairs that wrote body_id,
+    most recent first."""
+    for k in range(min(before_index, len(history._entries)) - 1, -1, -1):
+        e = history._entries[k]
+        op = e.op
+        if type(op).__name__ != "SketchLoftOp" or e.error:
+            continue
+        b, T = BM.motion(history, body_id, before_index, k)
+        if b in (e.body_id, op.merge_body_id, op.cut_body_id):
+            yield k, (T.Inverted() if T is not None else None)
+
+
+def loft_origin_for_face(history, body_id: str, occ_face,
+                         before_index: int) -> LoftFaceOrigin | None:
+    """Which loft cap / wall this face is, if any (the last loft wins)."""
+    for k, Ti in _lofts_on(history, body_id, before_index):
+        face0 = BM.moved(occ_face, Ti)
+        c, _ = _occ_face_props(face0)
+        P = _point_on_face(c, face0)
+        N = _occ_face_normal(face0)
+        secs = _loft_sections(history, k) or []
+        for end in (0, 1):
+            if len(secs) < 2 and end:
+                break
+            cap = secs[-1 if end else 0] if secs else None
+            cn = _occ_face_normal(cap.wrapped) if cap is not None else None
+            if cn is None or N is None or abs(float(cn @ N)) < 1 - 1e-6:
+                continue
+            cc, _ = _occ_face_props(cap.wrapped)
+            if P is not None and abs(float((P - cc) @ cn)) < _CAP_ON_PLANE:
+                d = _dist_to_face(P, cap.wrapped)
+                if d is not None and d < _CAP_ON_PLANE:
+                    return LoftFaceOrigin(history._entries[k].entry_id, f"cap{end}")
+        se = _loft_section_sketch(history, k, 0)
+        cap = secs[0] if secs else None
+        for ent in (se.entities if se is not None else ()):
+            uid = getattr(ent, "uid", None)
+            fr = _line_frame(se, ent) if uid and not getattr(ent, "construction", False) else None
+            if fr is None:
+                continue
+            A, L, t, _w, _n = fr
+            m = A + 0.5 * L * t
+            if not _on_face(m, face0, 1e-5):
+                continue
+            # The cap holds its lines too: a wall is the face that isn't it.
+            if cap is not None and N is not None:
+                cn = _occ_face_normal(cap.wrapped)
+                if cn is not None and abs(float(cn @ N)) > 1 - 1e-6:
+                    continue
+            return LoftFaceOrigin(history._entries[k].entry_id, f"wall:{uid}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# coil ends: "the start / far end face of coil X"
+# ---------------------------------------------------------------------------
+
+def _coil_end(history, k, end):
+    """(centre, unit normal) of coil entry k's start (0) / far (1) end face,
+    from its CURRENT axis, height, turns and hand, or None."""
+    if k is None:
+        return None
+    e = history._entries[k]
+    op = e.op
+    if type(op).__name__ != "CoilOp" or e.error:
+        return None
+    try:
+        ax = getattr(op, "_axis", None) or op._resolve_axis(history, k)
+        from cad.operations.coil import helix_edge
+        c, n, x, r = ax
+        h = helix_edge(c, n, x, r, float(op.height), float(op.height) / float(op.turns),
+                       op.left_hand)
+        P = np.array(tuple(h.position_at(float(end))))
+    except Exception:
+        return None
+    # The section lies in the plane through the axis and the helix end
+    # (coil_solid's sec_plane), not square to the helix.
+    n = np.asarray(n, dtype=float) / np.linalg.norm(n)
+    rad = P - np.asarray(c, dtype=float)
+    rad -= float(rad @ n) * n
+    t = np.cross(rad, n)
+    L = float(np.linalg.norm(t))
+    return (P, t / L) if L > 1e-12 else None
+
+
+def _planar_through(shape, P, t):
+    """(index, face) of the one planar face of shape through P normal to t."""
+    hits = []
+    for fi, f in enumerate(shape.faces()):
+        fn = _occ_face_normal(f.wrapped)
+        if fn is None or abs(float(fn @ t)) < _CAP_NORMAL:
+            continue
+        d = _dist_to_face(P, f.wrapped)
+        if d is not None and d < _CAP_ON_PLANE:
+            hits.append((fi, f))
+    return hits[0] if len(hits) == 1 else (None, None)
+
+
+@dataclass
+class CoilFaceOrigin:
+    """An end face of a coil (end 0 = where the helix starts, 1 = its far
+    end): the section's plane, through the helix end and the axis, re-read
+    from the coil's CURRENT circle / cylinder, height, turns and hand."""
+    coil_of: str
+    end:     int
+
+    def to_dict(self) -> dict:
+        return {"coil_of": self.coil_of, "end": self.end}
+
+    def made_at(self, history):
+        return history.id_to_index(self.coil_of)
+
+    def frame(self, history):
+        return _WORLD_FRAME
+
+    def find_in(self, history, shape, at=None):
+        return BM.in_frame(history, shape, at, self.made_at(history),
+                           lambda s: self._find(history, s))
+
+    def _find(self, history, shape):
+        got = _coil_end(history, self.made_at(history), self.end)
+        return (None, None) if got is None else _planar_through(shape, *got)
+
+
+def coil_origin_for_face(history, body_id: str, occ_face,
+                         before_index: int) -> CoilFaceOrigin | None:
+    """Which coil end this planar face is, if any (the last coil wins)."""
+    N = _occ_face_normal(occ_face)
+    if N is None:
+        return None
+    for k in range(min(before_index, len(history._entries)) - 1, -1, -1):
+        e = history._entries[k]
+        op = e.op
+        if type(op).__name__ != "CoilOp" or e.error:
+            continue
+        b, T = BM.motion(history, body_id, before_index, k)
+        if b not in (e.body_id, op.merge_body_id, op.cut_body_id):
+            continue
+        face0 = BM.moved(occ_face, T.Inverted() if T is not None else None)
+        n0 = _occ_face_normal(face0)
+        for end in (1, 0):
+            got = _coil_end(history, k, end)
+            if got is None:
+                continue
+            P, t = got
+            d = _dist_to_face(P, face0)
+            if abs(float(n0 @ t)) > _CAP_NORMAL and d is not None and d < _CAP_ON_PLANE:
+                return CoilFaceOrigin(e.entry_id, end)
     return None
 
 
@@ -1026,15 +1472,23 @@ def face_origin_from_dict(d: dict | None):
     if d and "cap_of_arc" in d:
         return ArcCapOrigin(d["cap_of_arc"], d["uid"], d["extrude_of"], int(d["end"]),
                             float(d["rho"]), float(d["ang"]))
+    if d and "import_of" in d:
+        return ImportFaceOrigin(d["import_of"], tuple(d["p"]),
+                                tuple(d["n"]) if d.get("n") is not None else None)
     if d and "revolve_wall" in d:
         return RevolveWallOrigin(d["revolve_wall"], d["sketch_id"], d["uid"],
-                                 float(d["s"]), float(d["frac"]))
+                                 float(d["s"]), float(d["frac"]),
+                                 d.get("lift_of"), int(d.get("lift_end", 1)))
     if d and "fillet_of" in d:
         return FilletFaceOrigin(d["fillet_of"], int(d["edge"]))
     if d and "wall_of" in d:
         return ArcWallOrigin(d["wall_of"], d["uid"], d["extrude_of"], float(d["ang"]))
     if d and "sweep_of" in d:
         return SweepFaceOrigin(d["sweep_of"], d["key"])
+    if d and "loft_of" in d:
+        return LoftFaceOrigin(d["loft_of"], d["key"])
+    if d and "coil_of" in d:
+        return CoilFaceOrigin(d["coil_of"], int(d["end"]))
     if d and "shell_of" in d:
         return ShellFaceOrigin(d["shell_of"], face_origin_from_dict(d["base"]))
     if d and "chamfer_of" in d:
@@ -1838,6 +2292,79 @@ def _revolve_axis_now(history, entry_id):
     return pt, d / np.linalg.norm(d), float(op.angle_deg)
 
 
+def _profile_entity_at(history, revolve_id, P, tan=None):
+    """ent tuple (sketch_id, uid, s, lift_of, lift_end) of the revolve's
+    profile entity that point P (on the profile, in the revolve's frame)
+    lies on, along it when tan is given; prefers an entity END for a vertex
+    (tan None).  None when there is none."""
+    k = history.id_to_index(revolve_id)
+    if k is None:
+        return None
+    e = history._entries[k]
+    sid, lift_of, lift_end = _revolve_profiles(history, e)
+    si = history.id_to_index(sid) if sid else None
+    se = history._entries[si].params.get("sketch_entry") if si is not None else None
+    if se is None:
+        return None
+    Q = np.asarray(P, dtype=float)
+    if lift_of:
+        lift = _profile_lift(history, lift_of, lift_end, se, k)
+        if lift is None:
+            return None
+        Q = lift[1](Q)
+    best = None
+    for ent in se.entities:
+        if not getattr(ent, "uid", None) or getattr(ent, "construction", False):
+            continue
+        sp = _ent_param(se, ent, Q)
+        if sp is None or sp[1] > 1e-4:
+            continue
+        sv = sp[0]
+        if tan is not None:
+            a, b = _ent_point(se, ent, 0.0), _ent_point(se, ent, 1.0)
+            if a is None or _segment(ent) is None:
+                continue
+            v = b - a
+            if abs(abs(float(v @ np.asarray(tan, dtype=float)))
+                   / max(1e-12, float(np.linalg.norm(v)) * float(np.linalg.norm(tan))) - 1) > 1e-6:
+                continue
+        else:
+            sv = 0.0 if sv < 0.5 else 1.0            # a vertex: the entity's end
+            if abs(sp[0] - sv) > 1e-6:
+                continue
+        if best is None or sp[1] < best[0]:
+            best = (sp[1], ent.uid, round(float(sv), 9))
+    if best is None:
+        return None
+    return (sid, best[1], best[2], lift_of, lift_end)
+
+
+def _profile_entity_now(history, revolve_id, ent):
+    """(point, unit tangent or None) of a profile entity at s, now, in the
+    revolve's frame (lifted for a face profile); None when it is gone."""
+    sid, uid, s_, lift_of, lift_end = ent
+    si = history.id_to_index(sid)
+    se = history._entries[si].params.get("sketch_entry") if si is not None else None
+    e = next((x for x in (se.entities if se else ()) if getattr(x, "uid", None) == uid), None)
+    if e is None:
+        return None
+    Q = _ent_point(se, e, s_)
+    if Q is None:
+        return None
+    a, b = _ent_point(se, e, 0.0), _ent_point(se, e, 1.0)
+    if lift_of:
+        lift = _profile_lift(history, lift_of, lift_end, se, history.id_to_index(revolve_id))
+        if lift is None:
+            return None
+        Q, a, b = lift[0](Q), lift[0](a), lift[0](b)
+    t = None
+    if _segment(e) is not None:
+        v = b - a
+        n = float(np.linalg.norm(v))
+        t = v / n if n > 1e-12 else None
+    return Q, t
+
+
 @dataclass
 class RevolveEdgeOrigin:
     """An edge a revolve made, named through the revolve so it follows angle
@@ -1845,21 +2372,45 @@ class RevolveEdgeOrigin:
       end 0/1 : an edge of that cap (see RevolveCapOrigin); p / t are its
                 midpoint / direction turned back onto the profile's plane.
       end None: the arc profile vertex p swept, from the start cap to the
-                far cap (t unused)."""
+                far cap (t unused).
+      ent     : (sketch_id, uid, s, lift_of, lift_end) of the profile entity
+                p lies on (s along it; a lifted face profile, see
+                RevolveWallOrigin), when there is one: p / t are then re-read
+                from the CURRENT entity, so the edge follows profile edits
+                and a body-face profile's extrude (the stored p / t are the
+                fallback)."""
     revolve_of: str
     profile:    int
     end:        int | None
     p:          tuple
     t:          tuple = (0.0, 0.0, 0.0)
+    ent:        tuple | None = None
 
     def to_dict(self) -> dict:
-        return {"revolve_of": self.revolve_of, "profile": self.profile,
-                "end": self.end, "p": list(self.p), "t": list(self.t)}
+        d = {"revolve_of": self.revolve_of, "profile": self.profile,
+             "end": self.end, "p": list(self.p), "t": list(self.t)}
+        if self.ent:
+            d["ent"] = list(self.ent)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "RevolveEdgeOrigin":
+        ent = d.get("ent")
         return cls(d["revolve_of"], int(d.get("profile", 0)), d.get("end"),
-                   tuple(d["p"]), tuple(d.get("t", (0.0, 0.0, 0.0))))
+                   tuple(d["p"]), tuple(d.get("t", (0.0, 0.0, 0.0))),
+                   (str(ent[0]), str(ent[1]), float(ent[2]), ent[3], int(ent[4]))
+                   if ent else None)
+
+    def _pt(self, history):
+        """(p, t) now: from the profile entity when named, else as stored."""
+        p, t = np.asarray(self.p, dtype=float), np.asarray(self.t, dtype=float)
+        if self.ent:
+            got = _profile_entity_now(history, self.revolve_of, self.ent)
+            if got is not None:
+                p = got[0]
+                if self.end is not None and got[1] is not None:
+                    t = got[1] if float(got[1] @ t) >= 0 else -got[1]
+        return p, t
 
     def faces_apart(self, history, shape, at=None) -> bool:
         return False
@@ -1880,7 +2431,7 @@ class RevolveEdgeOrigin:
             return None
         _pt, d, angle = ax
         _, T = BM.made_since(history, at, self.made_at(history))
-        v = BM.vec(T, _rotate(self.t, d, angle * self.end))
+        v = BM.vec(T, _rotate(self._pt(history)[1], d, angle * self.end))
         n = float(np.linalg.norm(v))
         return v / n if n > 1e-12 else None
 
@@ -1889,16 +2440,16 @@ class RevolveEdgeOrigin:
         if ax is None:
             return None
         pt, d, angle = ax
+        P, T = self._pt(history)
         if self.end is None:
-            return _swept_arc(shape, np.asarray(self.p, dtype=float),
-                              _rotate(self.p, d, angle, pt))
+            return _swept_arc(shape, P, _rotate(P, d, angle, pt))
         _, face = RevolveCapOrigin(self.revolve_of, self.profile, self.end
                                    ).find_in(history, shape)
         if face is None:
             return None
         turn = angle * self.end
-        mid = _rotate(self.p, d, turn, pt)
-        tan = _rotate(self.t, d, turn)
+        mid = _rotate(P, d, turn, pt)
+        tan = _rotate(T, d, turn)
         scored = sorted(((_edge_mid_dist(e, mid), e) for e in face.edges()
                          if _edge_dir_ok(e, tan, _ONE_FACE_DOT)), key=lambda x: x[0])
         if not scored or scored[0][0] > max(1e-3, 1e-4 * float(np.linalg.norm(mid - pt))):
@@ -1948,10 +2499,12 @@ def revolve_edge_origin(history, body_id: str, shape_occ, occ_edge,
         Ti = T.Inverted() if T is not None else None
         mid, tan = BM.pt(Ti, mid_now), BM.vec(Ti, tan_now)
         turn = -angle * o.end
+        p0, t0 = _rotate(mid, d, turn, pt), _rotate(tan, d, turn)
         return RevolveEdgeOrigin(
             o.revolve_of, o.profile, o.end,
-            tuple(round(float(x), 9) for x in _rotate(mid, d, turn, pt)),
-            tuple(round(float(x), 9) for x in _rotate(tan, d, turn)))
+            tuple(round(float(x), 9) for x in p0),
+            tuple(round(float(x), 9) for x in t0),
+            _profile_entity_at(history, o.revolve_of, p0, t0))
     # A swept arc: one end is the other turned through the angle.
     ends_now = _edge_ends(e)
     if ends_now is None:
@@ -1966,7 +2519,8 @@ def revolve_edge_origin(history, body_id: str, shape_occ, occ_edge,
         for a, b in (ends, ends[::-1]):
             if np.linalg.norm(_rotate(a, d, angle, pt) - b) < 1e-6 * scale:
                 return RevolveEdgeOrigin(rev.entry_id, 0, None,
-                                         tuple(round(float(x), 9) for x in a))
+                                         tuple(round(float(x), 9) for x in a),
+                                         ent=_profile_entity_at(history, rev.entry_id, a))
     return None
 
 

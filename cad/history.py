@@ -853,6 +853,11 @@ def _replay_sketch_entry(se, history: History, before_index: int,
         if last_entry_for_body is not None and last_entry_for_body.error:
             return False, f"Sketch plane body '{plane_body_id}' is in an error state"
 
+    if getattr(se.plane_source, "origin", False) is None and se.plane_origin is not None:
+        # An old pick with no provenance: the plane it last resolved to,
+        # so FacePlaneSource can recognise that face and bake an origin.
+        se.plane_source.last_plane = (tuple(map(float, se.plane_origin)),
+                                      tuple(map(float, se.plane_normal)))
     try:
         b3d_plane = se.plane_source.resolve(history, before_index)
     except Exception as ex:

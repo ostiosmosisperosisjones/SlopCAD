@@ -266,6 +266,20 @@ class FaceRef:
         resolve_ledger.note(resolve_ledger.REF, "FaceRef")
         return best_idx, best_face
 
+    def is_exactly(self, face, tol: float = 1e-4) -> bool:
+        """face is the one this ref was taken from, unchanged: same normal
+        sense, area and centroid (to tol mm / mm²).  The geometry it was
+        picked on — safe to bake provenance from (a moved match isn't)."""
+        n = _occ_face_normal(face.wrapped)
+        if n is None or float(np.dot(n, np.array(self.normal))) < 1.0 - 1e-9:
+            return False
+        c, area = _occ_face_props(face.wrapped)
+        along = float(np.dot(c, n))
+        perp = c - along * n
+        return (abs(area - self.area) <= tol * max(1.0, abs(self.area))
+                and abs(along - self.centroid_along) <= tol
+                and float(np.linalg.norm(perp - np.array(self.centroid_perp))) <= tol)
+
     def _find_moved_in(self, shape, normal_tol: float, area_cap: float):
         """Second pass for a face an upstream edit moved in its own plane
         (a polygon side lengthened: its side face grows and its centroid

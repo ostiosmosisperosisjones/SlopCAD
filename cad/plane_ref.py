@@ -86,6 +86,18 @@ class FacePlaneSource(SketchPlaneSource):
                 resolve_ledger.note(resolve_ledger.EXACT, "FacePlaneSource")
         if face is None:
             face_idx, face = self.face_ref.find_in(shape)
+            if face is not None and self.origin is None:
+                self._adopt_origin(history, face, before_index)
+        if face is None and self.origin is None and getattr(self, "last_plane", None):
+            # The FaceRef is older than the sketch's last plane (an upstream
+            # fix can even flip the face's recorded normal): the one face
+            # still exactly on that plane is it.
+            on = [f for f in shape.faces() if self._on_last_plane(f)]
+            if len(on) == 1:
+                face = on[0]
+                resolve_ledger.note(resolve_ledger.FUZZY, "FacePlaneSource",
+                                    "face recognised by the sketch's saved plane")
+                self._adopt_origin(history, face, before_index)
         if face is None and self.face_ref is not None:
             face_idx, face = self.face_ref.find_coplanar_in(shape)
         if face is None:
@@ -112,6 +124,43 @@ class FacePlaneSource(SketchPlaneSource):
                 f"FacePlaneSource: could not relocate face in body "
                 f"'{self.body_id}'{detail}")
         return Plane(face)   # face is a build123d Face object
+
+    def _on_last_plane(self, face, tol: float = 1e-4) -> bool:
+        """face is where the sketch last stood: its centroid is the saved
+        plane origin and its normal the saved plane normal (either sense).
+        A FaceRef can be older than that (taken before an upstream edit and
+        matched as "moved" ever since); the saved plane is the last place
+        the sketch was actually resolved to."""
+        lp = getattr(self, "last_plane", None)
+        if lp is None:
+            return False
+        import numpy as np
+        from cad.face_ref import _occ_face_normal, _occ_face_props
+        n = _occ_face_normal(face.wrapped)
+        if n is None:
+            return False
+        c, _ = _occ_face_props(face.wrapped)
+        o, ln = (np.asarray(v, dtype=float) for v in lp)
+        return (abs(abs(float(n @ ln)) - 1.0) < 1e-9
+                and float(np.linalg.norm(np.asarray(c, dtype=float) - o)) <= tol)
+
+    def _adopt_origin(self, history, face, before_index):
+        """A sketch saved before its face had an origin kind (a revolve's
+        flat side, an imported face, …): while the face is still exactly the
+        one it was picked on, bake the origin now, so later edits follow it
+        instead of drifting the FaceRef match out of range.  Never from a
+        moved match: that would freeze a guess in."""
+        try:
+            if not (self.face_ref.is_exactly(face) or self._on_last_plane(face)):
+                return
+            from cad.face_origin import any_origin_for_face
+            origin = any_origin_for_face(history, self.body_id, face.wrapped, before_index)
+        except Exception as ex:
+            print(f"[Sketch] face provenance upgrade skipped: {ex}")
+            return
+        if origin is not None:
+            self.origin = origin
+            print(f"[Sketch] face plane got provenance: {type(origin).__name__}")
 
     def to_dict(self) -> dict:
         return {"type": "face", "body_id": self.body_id}
