@@ -473,8 +473,41 @@ class SketchMode:
             snap_result = self.snap.resolve(pt2d, self.entities,
                                             self.plane, camera_distance)
             self.last_snap = snap_result
-        result = self._active_tool.handle_click(snap_result, self)
+        tool = self._active_tool
+        if type(tool).__name__ in self._CHECKED_TOOLS:
+            result = self.checked_edit(lambda: tool.handle_click(snap_result, self))
+        else:
+            result = tool.handle_click(snap_result, self)
         self.snap.consume_declared()
+        return result
+
+    # Tools that cut / rejoin existing geometry: each step is checked live
+    # (cad.sketch_integrity), as replay checks a committed sketch.
+    _CHECKED_TOOLS = ("TrimTool", "DivideTool", "JoinTool", "FilletTool")
+    integrity_warning = ""
+
+    def checked_edit(self, fn):
+        """Run one edit-tool step; afterwards integrity_warning is what it
+        broke ("" = nothing): constraints that stopped holding, collapsed
+        entities, ends that met and no longer do.  Problems the sketch had
+        before the step aren't repeated."""
+        from cad.sketch_integrity import integrity_snapshot, check_sketch, warning_text
+        self.integrity_warning = ""
+        try:
+            before = integrity_snapshot(self)
+            old = {(p.kind, p.msg) for p in check_sketch(self)}
+        except Exception as ex:
+            print(f"[Sketch] integrity snapshot failed: {ex}")
+            before = None
+        result = fn()
+        if before is not None:
+            try:
+                new = [p for p in check_sketch(self, before) if (p.kind, p.msg) not in old]
+                self.integrity_warning = warning_text(new)
+            except Exception as ex:
+                print(f"[Sketch] integrity check failed: {ex}")
+        if self.integrity_warning:
+            print(f"[Sketch] {self.integrity_warning}")
         return result
 
     # ------------------------------------------------------------------

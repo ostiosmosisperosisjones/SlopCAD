@@ -54,6 +54,7 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
     selection_changed   = pyqtSignal()
     sketch_mode_changed = pyqtSignal(bool)
     body_selected       = pyqtSignal(object)   # str | None
+    status_message      = pyqtSignal(str)      # transient status-bar text
 
     def __init__(self, workspace: Workspace, history: History):
         super().__init__()
@@ -2289,6 +2290,8 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
                         self._sketch.snap.snap_radius_mm = self._snap_radius_mm()
                         consumed = self._sketch.handle_click(
                             origin, direction, self.camera.distance)
+                        if self._sketch.integrity_warning:
+                            self.status_message.emit(self._sketch.integrity_warning)
                         self.sketch_mode_changed.emit(True)
                         # Open panels when tools transition to SELECTED
                         from cad.sketch import SketchTool

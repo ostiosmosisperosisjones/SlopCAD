@@ -308,8 +308,8 @@ class FilletFaceOrigin:
     between two flat faces).  Resolved by re-finding that edge on the
     fillet's input (EdgeRef → EdgeOrigin) and taking the curved face through
     the rolling ball's touch-down midpoint, for the CURRENT radius — so it
-    follows the edge and radius edits.  Rounds on rims / curved edges have
-    no origin (REF)."""
+    follows the edge and radius edits.  A rim (an edge on a curved face)
+    probes the same way with the faces' normals at the edge midpoint."""
     fillet_of: str       # entry_id of the FaceFilletOp
     edge:      int       # index into that op's edge_refs
 
@@ -363,7 +363,12 @@ def _fillet_probes(history, fillet_of, k):
     if src is None:
         return None
     occ = refs[k].resolve(history, src, at=(op.source_body_id, ci))
-    geo = _chamfer_geometry(src.wrapped, occ) if occ is not None else None
+    geo = None
+    if occ is not None:
+        # A rim (or any edge on a curved face): the round's cross-section
+        # square to the edge is the 2-D fillet of that corner, so the same
+        # probe works with each face's outward normal AT the edge midpoint.
+        geo = _chamfer_geometry(src.wrapped, occ) or _corner_at_mid(src.wrapped, occ)
     if geo is None:
         return None
     M, _tan, n1, n2 = geo
@@ -1537,6 +1542,69 @@ def _chamfer_geometry(src_occ, occ_edge):
         return None
     e = Edge(occ_edge)
     return (np.array(tuple(e.position_at(0.5))), np.array(tuple(e.tangent_at(0.5))), *ns)
+
+
+def _corner_at_mid(src_occ, occ_edge):
+    """(edge midpoint, tangent, n1, n2) of any edge between two faces, the
+    normals each face's outward one at the midpoint, or None."""
+    from build123d import Edge
+    faces = _adjacent_faces(src_occ, occ_edge)
+    if len(faces) != 2:
+        return None
+    e = Edge(occ_edge)
+    M = np.array(tuple(e.position_at(0.5)))
+    ns = [_outward_normal_at(f, src_occ, M) for f in faces]
+    if any(n is None for n in ns):
+        return None
+    return (M, np.array(tuple(e.tangent_at(0.5))), *ns)
+
+
+def _outward_normal_at(occ_face, solid_occ, P):
+    """occ_face's unit normal at (the projection of) P, pointing out of
+    solid_occ, or None.  A plane is _outward_normal's.  For a curved face
+    which way is out is probed at a few points ON the face, not at P: P is
+    on an edge, where a point just off the face can lie on its neighbour
+    (classified ON)."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepTools import BRepTools
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.GeomLProp import GeomLProp_SLProps
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+    from OCP.TopAbs import TopAbs_IN, TopAbs_OUT
+    from OCP.gp import gp_Pnt
+    surf = BRep_Tool.Surface_s(occ_face)
+
+    def normal(u, v):
+        props = GeomLProp_SLProps(surf, u, v, 1, 1e-9)
+        if not props.IsNormalDefined():
+            return None, None
+        d, q = props.Normal(), props.Value()
+        return np.array([d.X(), d.Y(), d.Z()]), np.array([q.X(), q.Y(), q.Z()])
+
+    pr = GeomAPI_ProjectPointOnSurf(gp_Pnt(*map(float, P)), surf)
+    if pr.NbPoints() < 1:
+        return None
+    n, _ = normal(*pr.LowerDistanceParameters())
+    if n is None:
+        return None
+    flat = _outward_normal(occ_face, solid_occ)
+    if flat is not None:
+        return flat
+    u0, u1, v0, v1 = BRepTools.UVBounds_s(occ_face)
+    for fu, fv in ((0.5, 0.5), (0.3, 0.5), (0.7, 0.5), (0.5, 0.3), (0.5, 0.7),
+                   (0.3, 0.3), (0.7, 0.7)):
+        m, Q = normal(u0 + fu * (u1 - u0), v0 + fv * (v1 - v0))
+        if m is None:
+            continue
+        d = _dist_to_face(Q, occ_face)
+        if d is None or d > 1e-7:
+            continue                    # outside a trimmed face's boundary
+        st = BRepClass3d_SolidClassifier(solid_occ, gp_Pnt(*map(float, Q + 1e-3 * m)),
+                                         1e-6).State()
+        if st in (TopAbs_IN, TopAbs_OUT):
+            # The raw normal keeps its side of the face everywhere on it.
+            return -n if st == TopAbs_IN else n
+    return None
 
 
 def _outward_normal(occ_face, solid_occ):

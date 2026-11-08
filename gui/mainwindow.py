@@ -789,6 +789,7 @@ class MainWindow(QMainWindow):
 
         vp.selection_changed.connect(self._update_selection_label)
         vp.sketch_mode_changed.connect(self._on_sketch_mode_changed)
+        vp.status_message.connect(lambda m: self.statusBar().showMessage(m, 8000))
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(sidebar)

@@ -50,7 +50,10 @@ class VpFilletMixin:
         tool = self._sketch._active_tool
         if not isinstance(tool, FilletTool):
             return
-        ok = tool.apply_fillet(radius_mm, self._sketch)
+        sk = self._sketch
+        ok = sk.checked_edit(lambda: tool.apply_fillet(radius_mm, sk))
+        if sk.integrity_warning:
+            self.status_message.emit(sk.integrity_warning)
         if not ok:
             print("[Fillet] Could not apply — radius may be too large for this corner.")
         self._close_fillet_panel()
