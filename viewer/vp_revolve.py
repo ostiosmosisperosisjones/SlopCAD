@@ -385,18 +385,22 @@ class RevolveMixin:
             se = entries[history_idx].params.get("sketch_entry")
             if se is None:
                 return False
-            from cad.sketch import LineEntity
+            # Any straight line: drawn, or included (a straight reference
+            # polyline) — the same test replay uses to follow the axis.
+            from cad.op_revolve_thicken import _axis_line_ends
             ent = se.entities[entity_idx]
-            if not isinstance(ent, LineEntity):
-                print("[Revolve] Axis pick requires a line entity.")
+            ends = _axis_line_ends(se, getattr(ent, "uid", None))
+            if ends is None:
+                print("[Revolve] Axis pick requires a straight line.")
                 return False
+            a, b = ends
 
             origin = np.array(se.plane_origin,  dtype=float)
             x_axis = np.array(se.plane_x_axis,  dtype=float)
             y_axis = np.array(se.plane_y_axis,  dtype=float)
 
-            p0 = origin + float(ent.p0[0]) * x_axis + float(ent.p0[1]) * y_axis
-            p1 = origin + float(ent.p1[0]) * x_axis + float(ent.p1[1]) * y_axis
+            p0 = origin + float(a[0]) * x_axis + float(a[1]) * y_axis
+            p1 = origin + float(b[0]) * x_axis + float(b[1]) * y_axis
             direction = p1 - p0
             norm = np.linalg.norm(direction)
             if norm < 1e-10:
