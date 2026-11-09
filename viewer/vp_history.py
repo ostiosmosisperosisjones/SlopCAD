@@ -262,23 +262,31 @@ class HistoryMixin:
         self._do_delete(index)
 
     def do_reorder(self, src: int, dst: int):
-        """Reorder with undo support via command stack."""
-        entries = self.history.entries
-        if src == dst or src < 0 or src >= len(entries):
+        """Drag-to-reorder with undo support.  Moves the whole action at *src*
+        (a multi-body cut, a cut's hidden split children) to where *dst* is;
+        never refuses — a move that breaks a reference shows up as an error
+        entry on replay, like any other edit."""
+        h = self.history
+        before, cur_before = h.entry_order(), h.cursor
+        lo = h.move_group(src, dst)
+        if lo is None:
             return
-        # A fan-out cut's entries must stay contiguous (one row, one step).
-        # (pop src, insert at dst: moving down shifts the group up by one)
-        span = self.history.fanout_span(src)
-        dspan = self.history.fanout_span(dst)
-        splits = dspan is not None and (dspan[0] < dst <= dspan[1] if src > dst
-                                        else dspan[0] <= dst < dspan[1])
-        if (span is not None and span[0] != span[1]) or splits:
-            print("[History] Can't reorder into or out of a multi-body cut.")
-            return
+        print(f"[History] Reordering entry {src} → {dst}")
         from viewer.history_commands import ReorderCommand
-        cmd = ReorderCommand(src, dst)
-        self._cmd_stack._do_push_no_apply(cmd)
-        self._do_reorder(src, dst)
+        self._cmd_stack._do_push_no_apply(ReorderCommand(
+            src, dst, before, h.entry_order(), cur_before, h.cursor))
+        self._replay_order(lo)
+
+    def _apply_order(self, ids: list, cursor: int):
+        """ReorderCommand undo / redo: restore an exact entry order."""
+        lo = self.history.set_order(ids, cursor)
+        if lo is not None:
+            self._replay_order(lo)
+
+    def _replay_order(self, lo: int):
+        _, _, all_mutated = self.history.replay_all_from(lo)
+        self._rebuild_all_meshes()
+        self.history_changed.emit()
 
     # ------------------------------------------------------------------
     # Global parameters (gui/params_panel.py)

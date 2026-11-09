@@ -121,6 +121,9 @@ class ChamferOp(Op):
             shape, self._faces_now(shape, history, entry_index))
         ref_edges  = self._resolve_edge_refs(shape, history, entry_index)
         edges = _unique_edges(face_edges + ref_edges)
+        if not edges and self.face_indices:
+            from cad.operations.chamfer import no_sharp_edges_error
+            raise no_sharp_edges_error("Chamfer", len(self.face_indices))
         if not edges:
             raise RuntimeError("ChamferOp: no edges to chamfer on replay "
                                 "(face_indices and edge_refs both empty)")

@@ -39,6 +39,17 @@ def _build_edge_to_faces_map(shape_occ):
     return edge_face_map
 
 
+def no_sharp_edges_error(op: str, n_faces: int) -> RuntimeError:
+    """The error for picked faces whose edges all blend smoothly into their
+    neighbours (e.g. the face of an earlier fillet): nothing to blend."""
+    verb = "round" if op == "Fillet" else "chamfer"
+    what = "picked face has" if n_faces == 1 else "picked faces have"
+    return RuntimeError(
+        f"{op}: the {what} no sharp edges to {verb} — "
+        f"{'its' if n_faces == 1 else 'their'} edges all blend smoothly into "
+        f"the faces around {'it' if n_faces == 1 else 'them'}")
+
+
 def smooth_edges(edge_occs, edge_face_map, tol_deg: float = 1.0) -> list:
     """Indices into *edge_occs* of edges whose two faces meet tangentially
     (e.g. where a fillet runs into a flat face).  There is no corner to

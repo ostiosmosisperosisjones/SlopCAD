@@ -34,26 +34,27 @@ class HistoryCommand:
 # ---------------------------------------------------------------------------
 
 class ReorderCommand(HistoryCommand):
-    def __init__(self, src: int, dst: int):
+    def __init__(self, src: int, dst: int, before: list | None = None,
+                 after: list | None = None, cursor_before: int = 0,
+                 cursor_after: int = 0):
+        """*before* / *after*: entry-id orders around the move (a drag moves
+        whole groups, so undo restores the order rather than re-moving)."""
         self.src = src
         self.dst = dst
+        self.before, self.after = before, after
+        self.cursor_before, self.cursor_after = cursor_before, cursor_after
 
     def apply(self, vp) -> None:
-        vp._do_reorder(self.src, self.dst)
+        if self.after is not None:
+            vp._apply_order(self.after, self.cursor_after)
+        else:
+            vp._do_reorder(self.src, self.dst)
 
     def revert(self, vp) -> None:
-        # After apply, the entry that was at src is now at dst.
-        # Reorder maps differently depending on direction; compute the
-        # inverse positions after the original move.
-        src, dst = self.src, self.dst
-        if src < dst:
-            # Entry moved from src to dst; it's now at dst, others shifted left.
-            # To undo: move from dst back to src.
-            vp._do_reorder(dst, src)
+        if self.before is not None:
+            vp._apply_order(self.before, self.cursor_before)
         else:
-            # Entry moved from src to dst (dst < src); it's now at dst.
-            # To undo: move from dst back to src.
-            vp._do_reorder(dst, src)
+            vp._do_reorder(self.dst, self.src)
 
     def describe(self) -> str:
         return f"Reorder {self.src} → {self.dst}"

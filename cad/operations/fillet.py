@@ -63,6 +63,9 @@ def _collect_edges(shape, face_indices, edge_occs):
     for e_occ in explicit:
         _add(e_occ)
 
+    if not unique and face_indices:
+        from cad.operations.chamfer import no_sharp_edges_error
+        raise no_sharp_edges_error("Fillet", len(face_indices))
     return unique
 
 

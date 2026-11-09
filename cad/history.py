@@ -251,6 +251,58 @@ class History:
             self._cursor += 1
         self._cursor = max(0, min(self._cursor, len(self._entries) - 1))
 
+    def move_group(self, src: int, dst: int) -> int | None:
+        """
+        Drag-to-reorder: move everything one user action at *src* produced
+        (op_group: fan-out siblings and hidden split children) to where the
+        action at *dst* is — before its group when moving up, after it when
+        moving down.  Never refuses on dependency grounds: a move that breaks
+        a reference just leaves that entry in error on replay.
+        The cursor stays on the last entry if it was there (dragging rows
+        must not roll the model back), else on the same entry.
+        Returns the lowest index whose position changed, or None if nothing
+        moved.  Caller replays from it.
+        """
+        n = len(self._entries)
+        if not (0 <= src < n and 0 <= dst < n):
+            return None
+        moving = self.op_group(src)
+        target = self.op_group(dst)
+        if set(moving) & set(target):
+            return None
+        before = list(self._entries)
+        at_end = self._cursor >= n - 1
+        cur_entry = before[self._cursor] if 0 <= self._cursor < n else None
+        block = [before[i] for i in moving]
+        rest = [e for i, e in enumerate(before) if i not in set(moving)]
+        anchor = before[target[0]] if dst < src else before[target[-1]]
+        k = next(j for j, e in enumerate(rest) if e is anchor)
+        if dst >= src:
+            k += 1
+        self._entries[:] = rest[:k] + block + rest[k:]
+        if at_end:
+            self._cursor = n - 1
+        elif cur_entry is not None:
+            self._cursor = next(j for j, e in enumerate(self._entries) if e is cur_entry)
+        changed = [j for j in range(n) if self._entries[j] is not before[j]]
+        return min(changed) if changed else None
+
+    def entry_order(self) -> list[str]:
+        """Entry ids in order: what ReorderCommand snapshots for undo."""
+        return [e.entry_id for e in self._entries]
+
+    def set_order(self, ids: list[str], cursor: int) -> int | None:
+        """Put the entries back in the order of *ids* (a permutation of the
+        current ids) with *cursor*.  Returns the lowest moved index."""
+        by_id = {e.entry_id: e for e in self._entries}
+        if set(by_id) != set(ids) or len(ids) != len(self._entries):
+            return None
+        before = list(self._entries)
+        self._entries[:] = [by_id[i] for i in ids]
+        self._cursor = max(0, min(cursor, len(self._entries) - 1))
+        changed = [j for j in range(len(ids)) if self._entries[j] is not before[j]]
+        return min(changed) if changed else None
+
     def step_target(self, delta: int) -> int:
         """Cursor index one undo (-1) / redo (+1) step away.  A fan-out group
         is one step: never land part-way through it."""

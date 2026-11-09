@@ -56,6 +56,15 @@ def shell_body(body_occ, face_occs: list, thickness: float,
     if faces and len(targets) != 1:
         raise RuntimeError("Shell faces must all be on one solid")
 
+    for f in faces:
+        if _wire_count(f) > 1:
+            # OCCT's MakeThickSolid can't open a face with an inner loop;
+            # it fails with every join and flag, so say so up front.
+            raise RuntimeError(
+                "Shell can't open a face that has a hole in it (a pocket or "
+                "hole cut into that face) — pick a face without holes, or "
+                "shell the body before cutting the hole")
+
     offset = thickness if outside else -thickness
     out = []
     for s in solids:
@@ -147,6 +156,16 @@ def _closed_hollow(solid, thickness: float, outside: bool):
                            f"thicker than the part allows")
     e = TopExp_Explorer(cut.Shape(), TopAbs_SOLID)
     return TopoDS.Solid(e.Current()) if e.More() else cut.Shape()
+
+
+def _wire_count(face) -> int:
+    from OCP.TopAbs import TopAbs_WIRE
+    from OCP.TopExp import TopExp_Explorer
+    n, e = 0, TopExp_Explorer(face, TopAbs_WIRE)
+    while e.More():
+        n += 1
+        e.Next()
+    return n
 
 
 def _area(shape) -> float:

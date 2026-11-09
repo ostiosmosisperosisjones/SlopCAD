@@ -322,7 +322,15 @@ class ChamferMixin:
             all_edges.append(e)
             edge_owners.append(('edge', edge_entry_i))
 
+        if not all_edges and face_indices:
+            from cad.operations.chamfer import no_sharp_edges_error
+            _no_sharp = no_sharp_edges_error("Chamfer", len(face_indices))
+        else:
+            _no_sharp = None
+
         def _compute():
+            if _no_sharp is not None:
+                return None, (edge_owners, [], str(_no_sharp))
             # Errors come from chamfer_edges itself — no second validate pass.
             # The list is positionally aligned with all_edges/edge_owners.
             per_edge: list[tuple[int, str | None]] = []
