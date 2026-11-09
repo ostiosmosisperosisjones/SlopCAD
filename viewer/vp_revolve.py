@@ -212,7 +212,23 @@ class RevolveMixin:
         rel_ax  = np.dot(rel, axis_d) * axis_d   # component along axis
         r_perp  = rel - rel_ax                    # component perp to axis
         r       = np.linalg.norm(r_perp)
-        if r < 1e-10:
+        if r < 1e-6:
+            # Centroid on the axis (a profile the axis runs through, revolved
+            # half by half): place the arrow off one half instead.
+            try:
+                from cad.operations.revolve import split_face_at_axis
+                halves = split_face_at_axis(faces[0], axis_pt, axis_d)
+                if len(halves) > 1:
+                    c = halves[0].center()
+                    centroid = np.array([c.X, c.Y, c.Z], dtype=float)
+                    self._revolve_face_centroid = centroid
+                    rel    = centroid - axis_pt
+                    rel_ax = np.dot(rel, axis_d) * axis_d
+                    r_perp = rel - rel_ax
+                    r      = np.linalg.norm(r_perp)
+            except Exception as ex:
+                print(f"[Revolve] arrow: {ex}")
+        if r < 1e-6:
             self._revolve_arrow_origin = None
             self._revolve_arrow_dir    = None
             return
