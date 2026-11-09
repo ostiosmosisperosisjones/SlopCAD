@@ -198,8 +198,8 @@ class SweepMixin:
         if se is None or not (0 <= entity_idx < len(se.entities)):
             return False
         ent = se.entities[entity_idx]
-        if se.entity_edge(ent) is None:
-            print("[Sweep] Path edges must be lines, arcs or splines.")
+        if se.path_edges(ent) is None:
+            print("[Sweep] Path edges must be lines, arcs, splines or included edges.")
             return True
         self._helix_highlight_idx = None
         panel.toggle_path_edge(entries[history_idx].entry_id, ent.uid,

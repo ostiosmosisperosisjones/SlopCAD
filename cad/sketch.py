@@ -3596,6 +3596,141 @@ class SketchEntry:
                     uv_loops.append(open_loop)
         return uv_loops
 
+    def reference_edges(self, ref) -> list:
+        """In-plane world TopoDS_Edges of an included (ReferenceEntity)
+        polyline: its OCCT edges projected onto the sketch plane (lines and
+        circles exactly, anything else sampled), else segments through its
+        baked points.  What build_faces cuts with and what a sweep path
+        follows."""
+        import math as _math
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+        from OCP.Geom import Geom_Circle as _GCircle
+        from OCP.gp import gp_Ax2, gp_Pnt, gp_Dir
+
+        def _uv3d(u, v):
+            return gp_Pnt(*(self.plane_origin
+                            + float(u) * self.plane_x_axis
+                            + float(v) * self.plane_y_axis).tolist())
+
+        def _project_ref_edge(edge):
+            from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC
+            from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Line
+            adp = _BAC(edge)
+            if adp.GetType() == GeomAbs_Line:
+                # Project both endpoints onto the sketch plane so the included
+                # line is coplanar with the drawn geometry.  Without this an
+                # edge that lies even slightly off the plane (e.g. included from
+                # another body) floats above/below the big planar face and the
+                # splitter can't use it to bound a region — no face is built.
+                p0 = adp.Value(adp.FirstParameter())
+                p1 = adp.Value(adp.LastParameter())
+                def _to_uv(p):
+                    d = np.array([p.X(), p.Y(), p.Z()]) - self.plane_origin
+                    return (float(np.dot(d, self.plane_x_axis)),
+                            float(np.dot(d, self.plane_y_axis)))
+                u0, v0 = _to_uv(p0)
+                u1, v1 = _to_uv(p1)
+                em = BRepBuilderAPI_MakeEdge(_uv3d(u0, v0), _uv3d(u1, v1))
+                return em.Edge() if em.IsDone() else None
+
+            if adp.GetType() == GeomAbs_Circle:
+                circ = adp.Circle()
+                # Check if circle is viewed edge-on (its normal is perpendicular
+                # to the sketch normal) — if so, project as a line segment.
+                circ_ax = circ.Axis().Direction()
+                circ_normal = np.array([circ_ax.X(), circ_ax.Y(), circ_ax.Z()])
+                dot_normals = abs(float(np.dot(circ_normal, self.plane_normal)))
+                if dot_normals < 1e-3:
+                    # Edge-on: the circle projects to a line of length 2*radius.
+                    # The axis of the projected line is the cross product of
+                    # circ_normal and sketch_normal, normalised to sketch UV.
+                    line_dir_3d = np.cross(circ_normal, self.plane_normal)
+                    ld_len = float(np.linalg.norm(line_dir_3d))
+                    if ld_len < 1e-9:
+                        return None
+                    line_dir_3d /= ld_len
+                    c3d = circ.Location()
+                    cw  = np.array([c3d.X(), c3d.Y(), c3d.Z()])
+                    delta = cw - self.plane_origin
+                    cu = float(np.dot(delta, self.plane_x_axis))
+                    cv = float(np.dot(delta, self.plane_y_axis))
+                    # line_dir in UV space
+                    ldu = float(np.dot(line_dir_3d, self.plane_x_axis))
+                    ldv = float(np.dot(line_dir_3d, self.plane_y_axis))
+                    r = circ.Radius()
+                    p0 = _uv3d(cu - r * ldu, cv - r * ldv)
+                    p1 = _uv3d(cu + r * ldu, cv + r * ldv)
+                    em = BRepBuilderAPI_MakeEdge(p0, p1)
+                    return em.Edge() if em.IsDone() else None
+
+                c3d  = circ.Location()
+                cw   = np.array([c3d.X(), c3d.Y(), c3d.Z()])
+                delta = cw - self.plane_origin
+                cu = float(np.dot(delta, self.plane_x_axis))
+                cv = float(np.dot(delta, self.plane_y_axis))
+                c_on = (self.plane_origin
+                        + cu * self.plane_x_axis
+                        + cv * self.plane_y_axis)
+                ax2 = gp_Ax2(
+                    gp_Pnt(*c_on.tolist()),
+                    gp_Dir(float(self.plane_normal[0]),
+                           float(self.plane_normal[1]),
+                           float(self.plane_normal[2])),
+                    gp_Dir(float(self.plane_x_axis[0]),
+                           float(self.plane_x_axis[1]),
+                           float(self.plane_x_axis[2])),
+                )
+                new_circ = _GCircle(ax2, circ.Radius())
+                u1, u2 = adp.FirstParameter(), adp.LastParameter()
+                if abs(u2 - u1 - 2 * _math.pi) < 1e-9:
+                    return BRepBuilderAPI_MakeEdge(new_circ).Edge()
+                return BRepBuilderAPI_MakeEdge(new_circ, u1, u2).Edge()
+            return None
+
+        out: list = []
+        valid_occ = [e for e in (ref.occ_edges or []) if e is not None]
+        if valid_occ:
+            for occ_edge in valid_occ:
+                projected = _project_ref_edge(occ_edge)
+                if projected is not None:
+                    out.append(projected)
+                    continue
+                # Polyline fallback for non-circle reference edges
+                try:
+                    from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC2
+                    from OCP.GCPnts import GCPnts_QuasiUniformAbscissa
+                    adp = _BAC2(occ_edge)
+                    sampler = GCPnts_QuasiUniformAbscissa()
+                    sampler.Initialize(adp, 33)
+                    pts_3d = []
+                    for j in range(1, sampler.NbPoints() + 1):
+                        p = adp.Value(sampler.Parameter(j))
+                        pts_3d.append(gp_Pnt(p.X(), p.Y(), p.Z()))
+                    for j in range(len(pts_3d) - 1):
+                        em = BRepBuilderAPI_MakeEdge(pts_3d[j], pts_3d[j+1])
+                        if em.IsDone():
+                            out.append(em.Edge())
+                except Exception:
+                    pass
+        elif len(ref.points) >= 2:
+            # Polyline from tessellated points
+            pts = ref.points
+            for j in range(len(pts) - 1):
+                em = BRepBuilderAPI_MakeEdge(_uv3d(pts[j][0], pts[j][1]),
+                                             _uv3d(pts[j+1][0], pts[j+1][1]))
+                if em.IsDone():
+                    out.append(em.Edge())
+        return out
+
+    def path_edges(self, ent) -> list | None:
+        """World edges a sweep path takes from *ent*: a drawn line / arc /
+        spline (one edge) or an include (its in-plane edges); None for
+        anything else (points, or an include with no usable edges)."""
+        if isinstance(ent, ReferenceEntity):
+            return self.reference_edges(ent) or None
+        e = self.entity_edge(ent)
+        return None if e is None else [e]
+
     def entity_edge(self, ent):
         """World-space TopoDS_Edge of a drawn line / arc / spline, else None.
         Raises if OCCT can't build it."""
@@ -3809,123 +3944,14 @@ class SketchEntry:
                 if w is not None:
                     tools_list.Append(w)
 
-        # ── ReferenceEntity closed loops — add as wire tools ─────────────
-        def _project_ref_edge(edge):
-            from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC
-            from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Line
-            adp = _BAC(edge)
-            if adp.GetType() == GeomAbs_Line:
-                # Project both endpoints onto the sketch plane so the included
-                # line is coplanar with the drawn geometry.  Without this an
-                # edge that lies even slightly off the plane (e.g. included from
-                # another body) floats above/below the big planar face and the
-                # splitter can't use it to bound a region — no face is built.
-                p0 = adp.Value(adp.FirstParameter())
-                p1 = adp.Value(adp.LastParameter())
-                def _to_uv(p):
-                    d = np.array([p.X(), p.Y(), p.Z()]) - self.plane_origin
-                    return (float(np.dot(d, self.plane_x_axis)),
-                            float(np.dot(d, self.plane_y_axis)))
-                u0, v0 = _to_uv(p0)
-                u1, v1 = _to_uv(p1)
-                em = BRepBuilderAPI_MakeEdge(_uv3d(u0, v0), _uv3d(u1, v1))
-                return em.Edge() if em.IsDone() else None
-
-            if adp.GetType() == GeomAbs_Circle:
-                circ = adp.Circle()
-                # Check if circle is viewed edge-on (its normal is perpendicular
-                # to the sketch normal) — if so, project as a line segment.
-                circ_ax = circ.Axis().Direction()
-                circ_normal = np.array([circ_ax.X(), circ_ax.Y(), circ_ax.Z()])
-                dot_normals = abs(float(np.dot(circ_normal, self.plane_normal)))
-                if dot_normals < 1e-3:
-                    # Edge-on: the circle projects to a line of length 2*radius.
-                    # The axis of the projected line is the cross product of
-                    # circ_normal and sketch_normal, normalised to sketch UV.
-                    line_dir_3d = np.cross(circ_normal, self.plane_normal)
-                    ld_len = float(np.linalg.norm(line_dir_3d))
-                    if ld_len < 1e-9:
-                        return None
-                    line_dir_3d /= ld_len
-                    c3d = circ.Location()
-                    cw  = np.array([c3d.X(), c3d.Y(), c3d.Z()])
-                    delta = cw - self.plane_origin
-                    cu = float(np.dot(delta, self.plane_x_axis))
-                    cv = float(np.dot(delta, self.plane_y_axis))
-                    # line_dir in UV space
-                    ldu = float(np.dot(line_dir_3d, self.plane_x_axis))
-                    ldv = float(np.dot(line_dir_3d, self.plane_y_axis))
-                    r = circ.Radius()
-                    p0 = _uv3d(cu - r * ldu, cv - r * ldv)
-                    p1 = _uv3d(cu + r * ldu, cv + r * ldv)
-                    em = BRepBuilderAPI_MakeEdge(p0, p1)
-                    return em.Edge() if em.IsDone() else None
-
-                c3d  = circ.Location()
-                cw   = np.array([c3d.X(), c3d.Y(), c3d.Z()])
-                delta = cw - self.plane_origin
-                cu = float(np.dot(delta, self.plane_x_axis))
-                cv = float(np.dot(delta, self.plane_y_axis))
-                c_on = (self.plane_origin
-                        + cu * self.plane_x_axis
-                        + cv * self.plane_y_axis)
-                ax2 = gp_Ax2(
-                    gp_Pnt(*c_on.tolist()),
-                    gp_Dir(float(self.plane_normal[0]),
-                           float(self.plane_normal[1]),
-                           float(self.plane_normal[2])),
-                    gp_Dir(float(self.plane_x_axis[0]),
-                           float(self.plane_x_axis[1]),
-                           float(self.plane_x_axis[2])),
-                )
-                new_circ = _GCircle(ax2, circ.Radius())
-                u1, u2 = adp.FirstParameter(), adp.LastParameter()
-                if abs(u2 - u1 - 2 * _math.pi) < 1e-9:
-                    return BRepBuilderAPI_MakeEdge(new_circ).Edge()
-                return BRepBuilderAPI_MakeEdge(new_circ, u1, u2).Edge()
-            return None
-
+        # ── ReferenceEntity edges — each its own wire tool ───────────────
         for ei, ref in enumerate(self.entities):
             if not isinstance(ref, ReferenceEntity):
                 continue
-            valid_occ = [e for e in (ref.occ_edges or []) if e is not None]
-            if valid_occ:
-                for occ_edge in valid_occ:
-                    projected = _project_ref_edge(occ_edge)
-                    if projected is not None:
-                        w = _single_edge_wire(projected, ei)
-                        if w is not None:
-                            tools_list.Append(w)
-                    else:
-                        # Polyline fallback for non-circle reference edges
-                        try:
-                            from OCP.BRepAdaptor import BRepAdaptor_Curve as _BAC2
-                            from OCP.GCPnts import GCPnts_QuasiUniformAbscissa
-                            adp = _BAC2(occ_edge)
-                            sampler = GCPnts_QuasiUniformAbscissa()
-                            sampler.Initialize(adp, 33)
-                            pts_3d = []
-                            for j in range(1, sampler.NbPoints() + 1):
-                                p = adp.Value(sampler.Parameter(j))
-                                pts_3d.append(gp_Pnt(p.X(), p.Y(), p.Z()))
-                            for j in range(len(pts_3d) - 1):
-                                em = BRepBuilderAPI_MakeEdge(pts_3d[j], pts_3d[j+1])
-                                if em.IsDone():
-                                    w = _single_edge_wire(em.Edge(), ei)
-                                    if w is not None:
-                                        tools_list.Append(w)
-                        except Exception:
-                            pass
-            elif len(ref.points) >= 2:
-                # Polyline from tessellated points
-                pts = ref.points
-                for j in range(len(pts) - 1):
-                    em = BRepBuilderAPI_MakeEdge(_uv3d(pts[j][0], pts[j][1]),
-                                                 _uv3d(pts[j+1][0], pts[j+1][1]))
-                    if em.IsDone():
-                        w = _single_edge_wire(em.Edge(), ei)
-                        if w is not None:
-                            tools_list.Append(w)
+            for edge in self.reference_edges(ref):
+                w = _single_edge_wire(edge, ei)
+                if w is not None:
+                    tools_list.Append(w)
 
         if tools_list.IsEmpty():
             return [], [], []

@@ -5,7 +5,7 @@ SketchSweepOp — sweep one sketch profile along a path of sketch edges,
 as a new body or fused into / cut from another.  Body handling (new body,
 merge, cut, split children) is SketchLoftOp's; this adds the path.
 
-The path is a set of drawn entities of one sketch, named by entity uid so
+The path is a set of drawn or included entities of one sketch, named by entity uid so
 that edits renumbering the path sketch don't lose it — or a helix entry
 (path_uids == [HELIX_PATH]), swept with the helix axis as binormal so the
 profile doesn't roll.
@@ -81,11 +81,11 @@ class SketchSweepOp(SketchLoftOp):
             raise RuntimeError(
                 f"SketchSweepOp: {len(missing) or 'no'} path edge(s) missing "
                 f"from the path sketch")
-        edges = [se.entity_edge(by_uid[u]) for u in self.path_uids]
-        if any(e is None for e in edges):
-            raise RuntimeError("SketchSweepOp: path edges must be lines, arcs "
-                               "or splines")
-        return edges
+        per_ent = [se.path_edges(by_uid[u]) for u in self.path_uids]
+        if any(e is None for e in per_ent):
+            raise RuntimeError("SketchSweepOp: path edges must be lines, arcs, "
+                               "splines or included edges")
+        return [e for edges in per_ent for e in edges]
 
     def to_params(self) -> dict:
         p = super().to_params()
