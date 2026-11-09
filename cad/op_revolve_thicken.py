@@ -304,7 +304,7 @@ def _axis_fields(viewport, sketch_id, se, axis_pt, axis_dir):
     uid = ref[1] if ref and ref[0] == sketch_id else None
     return axis_in_sketch(se, axis_pt, axis_dir, uid)
 
-def _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle_deg):
+def _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle_deg, side: int = 1):
     """Revolve each face and fuse the results into one tool solid (build123d
     Compound). Shared by commit and replay so the two can't drift."""
     from cad.operations.revolve import revolve_face_direct
@@ -314,7 +314,7 @@ def _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle_deg):
 
     tool = None
     for face in faces:
-        s = revolve_face_direct(None, face, axis_pt, axis_dir, angle_deg)
+        s = revolve_face_direct(None, face, axis_pt, axis_dir, angle_deg, side)
         if tool is None:
             tool = s
         else:
@@ -482,6 +482,8 @@ def _bake_revolve_axis(op, viewport):
 
 
 def _revolve_axis_params(op, p: dict) -> dict:
+    if getattr(op, "axis_side", 1) == -1:
+        p["axis_side"] = -1
     if op.axis_local is not None:
         p["axis_local"] = op.axis_local
     if op.axis_line_uid is not None:
@@ -526,6 +528,7 @@ def _restore_revolve_panel_profiles(vp, op, entry):
         else:
             panel.set_axis(*sketch_axis(se, op.axis_point, op.axis_dir,
                                         op.axis_local, op.axis_line_uid))
+    panel.set_axis_side(getattr(op, "axis_side", 1))
     panel._angle_spinbox.set_binding(
         entry.params.get("exprs", {}).get("angle_deg"), abs(op.angle_deg))
     return panel
@@ -550,6 +553,8 @@ class RevolveOp(Op):
     axis_local     : [u, v, du, dv] in the first sketch's plane — the axis
                      follows that sketch when an upstream edit moves it
     axis_line_uid  : the sketch line the axis follows
+    axis_side      : when the axis runs through a profile, the side of it
+                     revolved: +1 = axis_dir x profile normal, -1 = other
     """
     profiles:      list               = field(default_factory=list)
     angle_deg:     float              = 360.0
@@ -559,6 +564,7 @@ class RevolveOp(Op):
     axis_local:    list[float] | None = None
     axis_line_uid: str | None         = None
     axis_source:   dict | None        = None
+    axis_side:     int                = 1
 
     def __post_init__(self):
         from cad.profile_source import as_profile
@@ -616,7 +622,8 @@ class RevolveOp(Op):
         if not faces:
             raise RuntimeError(f"{name}: no profile faces")
         axis_pt, axis_dir = _revolve_axis(self, history, entry_index)
-        tool = _revolve_faces_to_tool(faces, axis_pt, axis_dir, self.angle_deg)
+        tool = _revolve_faces_to_tool(faces, axis_pt, axis_dir, self.angle_deg,
+                                      self.axis_side)
         if tool is None:
             raise RuntimeError(f"{name}: revolve produced no tool")
 
@@ -670,6 +677,7 @@ class RevolveOp(Op):
         axis_pt  = np.array(self.axis_point, dtype=float)
         axis_dir = np.array(self.axis_dir,   dtype=float)
         angle    = self.angle_deg
+        side     = self.axis_side
         face_ref = _entry_face_ref(viewport, self.profiles)
         host     = self.profiles[0].owner_body_id(viewport.history)
         profiles = list(self.profiles)
@@ -680,7 +688,7 @@ class RevolveOp(Op):
         preserved_body_ids = list(op_params.pop("_preserved_body_ids", []))
 
         def tool():
-            t = _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle)
+            t = _revolve_faces_to_tool(faces, axis_pt, axis_dir, angle, side)
             if t is None:
                 raise RuntimeError("Revolve produced no tool.")
             return t
@@ -774,6 +782,7 @@ class RevolveOp(Op):
             axis_local    = params.get("axis_local"),
             axis_line_uid = params.get("axis_line_uid"),
             axis_source   = params.get("axis_source"),
+            axis_side     = int(params.get("axis_side", 1)),
         )
 
 
@@ -789,7 +798,8 @@ class CrossBodyRevolveCutOp(Op):
 
     cut_body_id : body being cut
     profiles    : ProfileSource list
-    angle_deg, axis_point, axis_dir, axis_local, axis_line_uid : see RevolveOp
+    angle_deg, axis_point, axis_dir, axis_local, axis_line_uid, axis_side :
+                  see RevolveOp
     """
     cut_body_id:   str
     profiles:      list               = field(default_factory=list)
@@ -799,6 +809,7 @@ class CrossBodyRevolveCutOp(Op):
     axis_local:    list[float] | None = None
     axis_line_uid: str | None         = None
     axis_source:   dict | None        = None
+    axis_side:     int                = 1
 
     # Used by Op._push_failed_entry to tag the failed history entry correctly
     # (the base class's fallback otherwise produces "crossbodyrevolvecut").
@@ -844,7 +855,8 @@ class CrossBodyRevolveCutOp(Op):
     def _tool(self, faces, axis_pt, axis_dir):
         import numpy as np
         t = _revolve_faces_to_tool(faces, np.asarray(axis_pt, dtype=float),
-                                   np.asarray(axis_dir, dtype=float), self.angle_deg)
+                                   np.asarray(axis_dir, dtype=float), self.angle_deg,
+                                   self.axis_side)
         if t is None:
             raise RuntimeError("CrossBodyRevolveCutOp: revolve produced no tool")
         return t
@@ -975,4 +987,5 @@ class CrossBodyRevolveCutOp(Op):
             axis_local    = params.get("axis_local"),
             axis_line_uid = params.get("axis_line_uid"),
             axis_source   = params.get("axis_source"),
+            axis_side     = int(params.get("axis_side", 1)),
         )

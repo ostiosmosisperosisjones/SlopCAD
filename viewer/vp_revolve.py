@@ -146,23 +146,43 @@ class RevolveMixin:
             self.update()
             return
 
-        # Re-extract cage wires only when axis or faces change, not every angle tick.
-        cache_key = (tuple(axis_pt), tuple(axis_d), tuple(id(f) for f in faces))
+        panel = getattr(self, '_revolve_panel', None)
+        side = panel.axis_side() if panel is not None else 1
+        self._revolve_side = side
+
+        # Re-extract cage wires only when axis, faces or side change, not
+        # every angle tick.  An axis through a profile revolves one side of
+        # it only (cad/operations/revolve.py profile_side): the cage, arrow
+        # and side checkbox follow that half.
+        cache_key = (tuple(axis_pt), tuple(axis_d), tuple(id(f) for f in faces), side)
         if cache_key != getattr(self, '_revolve_cage_key', None):
-            self._revolve_cage_wires = _extract_face_wires(faces)
+            from cad.operations.revolve import profile_side, split_face_at_axis
+            crossing = False
+            rev_faces = []
+            for f in faces:
+                try:
+                    crossing |= split_face_at_axis(f, axis_pt, axis_d) is not None
+                    rev_faces += profile_side(f, axis_pt, axis_d, side)
+                except Exception as ex:
+                    print(f"[Revolve preview] {ex}")
+                    rev_faces.append(f)
+            if panel is not None:
+                panel.set_side_visible(crossing)
+            self._revolve_rev_faces  = rev_faces
+            self._revolve_cage_wires = _extract_face_wires(rev_faces)
             self._revolve_cage_key   = cache_key
             self._revolve_preview_mesh = None  # axis/face changed — old mesh is wrong
 
         # Store for use by mesh compute on release.
-        self._revolve_last_preview_params = (faces, axis_pt, axis_d, angle)
+        self._revolve_last_preview_params = (faces, axis_pt, axis_d, angle, side)
 
-        self._update_revolve_arrow(faces, axis_pt, axis_d, angle)
+        self._update_revolve_arrow(self._revolve_rev_faces or faces, axis_pt, axis_d, angle)
 
         # During arrow drag show cage only. When not dragging (spinbox, axis pick)
         # kick off a mesh compute so the user sees a proper solid preview.
         if not (getattr(self, '_drag_arrow_active', False)
                 and getattr(self, '_drag_arrow_op', None) == 'revolve'):
-            self._revolve_compute_mesh(faces, axis_pt, axis_d, angle)
+            self._revolve_compute_mesh(faces, axis_pt, axis_d, angle, side)
 
         self.update()
 
@@ -171,12 +191,12 @@ class RevolveMixin:
         return job_for(self, '_revolve_preview_job', self._on_revolve_mesh_done,
                        "Revolve preview")
 
-    def _revolve_compute_mesh(self, faces, axis_pt, axis_d, angle):
+    def _revolve_compute_mesh(self, faces, axis_pt, axis_d, angle, side=1):
         """Build the preview mesh in the background (one worker at a time,
         latest params win — see viewer/preview_job.py)."""
         def _compute():
             from viewer.preview_job import revolve_preview_meshes
-            return revolve_preview_meshes(faces, axis_pt, axis_d, angle)
+            return revolve_preview_meshes(faces, axis_pt, axis_d, angle, side)
         self._revolve_job().submit(_compute)
 
     def _on_revolve_mesh_done(self, result, error):
@@ -218,8 +238,9 @@ class RevolveMixin:
             try:
                 from cad.operations.revolve import split_face_at_axis
                 halves = split_face_at_axis(faces[0], axis_pt, axis_d)
-                if len(halves) > 1:
-                    c = halves[0].center()
+                if halves is not None:
+                    side = getattr(self, '_revolve_side', 1)
+                    c = (halves[0] if side >= 0 else halves[1])[0].center()
                     centroid = np.array([c.X, c.Y, c.Z], dtype=float)
                     self._revolve_face_centroid = centroid
                     rel    = centroid - axis_pt
@@ -585,6 +606,7 @@ class RevolveMixin:
         panel = getattr(self, '_revolve_panel', None)
         self._revolve_commit_extra = exprs_extra(
             angle_deg=panel._angle_spinbox if panel else None)
+        side = panel.axis_side() if panel is not None else 1
 
         # Built before the panel closes (closing clears the sketch selection).
         profiles = self._selection_profiles(sketch_idx, face_pairs)
@@ -608,16 +630,17 @@ class RevolveMixin:
             self._editing_history_idx = editing_idx  # restore for _commit
             self._commit_revolve_edit_from_panel(
                 editing_idx, angle, axis_pt, axis_d, merge_body_id, is_cut,
-                profiles)
+                profiles, side)
             return
 
         # No-target cut: one CrossBodyRevolveCutOp per intersecting body.
         if is_cut and merge_body_id in (None, "__new_body__"):
-            self._do_revolve_cut_all_intersecting(angle, axis_pt, axis_d, profiles)
+            self._do_revolve_cut_all_intersecting(angle, axis_pt, axis_d, profiles,
+                                                  side)
             return
 
         op = self._build_revolve_op(profiles, angle, axis_pt, axis_d,
-                                    merge_body_id, is_cut)
+                                    merge_body_id, is_cut, side)
         extra = getattr(self, '_revolve_commit_extra', None)
         if is_cut:
             op.commit(self, extra)
@@ -625,12 +648,14 @@ class RevolveMixin:
             op.commit_async(self, extra)
 
     @staticmethod
-    def _build_revolve_op(profiles, angle, axis_pt, axis_d, merge_body_id, is_cut):
+    def _build_revolve_op(profiles, angle, axis_pt, axis_d, merge_body_id, is_cut,
+                          side=1):
         """CrossBodyRevolveCutOp into a chosen body, else a RevolveOp
         (merge_body_id None / "__new_body__" → new body)."""
         from cad.op_types import RevolveOp, CrossBodyRevolveCutOp
         common = dict(profiles=profiles, angle_deg=angle,
-                      axis_point=list(axis_pt), axis_dir=list(axis_d))
+                      axis_point=list(axis_pt), axis_dir=list(axis_d),
+                      axis_side=side)
         if is_cut:
             return CrossBodyRevolveCutOp(cut_body_id=merge_body_id, **common)
         new_body = merge_body_id in (None, "__new_body__")
@@ -638,7 +663,7 @@ class RevolveMixin:
                          **common)
 
     def _do_revolve_cut_all_intersecting(self, angle_deg, axis_pt, axis_d,
-                                          profiles):
+                                          profiles, side=1):
         """
         No-target revolve cut: build the revolved tool solid once, fan out
         one CrossBodyRevolveCutOp per workspace body it intersects.  A
@@ -662,7 +687,7 @@ class RevolveMixin:
         try:
             tool_solid = _revolve_faces_to_tool(
                 tool_faces, np.asarray(axis_pt, dtype=float),
-                np.asarray(axis_d, dtype=float), angle_deg)
+                np.asarray(axis_d, dtype=float), angle_deg, side)
         except Exception as ex:
             print(f"[Revolve cut] Tool construction failed: {ex}"); return
         if tool_solid is None:
@@ -675,6 +700,7 @@ class RevolveMixin:
                 angle_deg   = angle_deg,
                 axis_point  = list(axis_pt),
                 axis_dir    = list(axis_d),
+                axis_side   = side,
             )
 
         faces = [p for p in profiles if isinstance(p, BodyFaceProfile)]
@@ -685,7 +711,7 @@ class RevolveMixin:
 
     def _commit_revolve_edit_from_panel(self, editing_idx, angle, axis_pt,
                                          axis_d, merge_body_id, is_cut,
-                                         profiles):
+                                         profiles, side=1):
         """
         Bridge from panel OK to the edit-commit routine: builds the new op
         (or dispatches to fan-out for no-target cuts) so _commit_revolve_edit
@@ -696,7 +722,8 @@ class RevolveMixin:
         if is_cut and merge_body_id in (None, "__new_body__"):
             self._editing_history_idx = None
             self._delete_revolve_edit_group(editing_idx)
-            self._do_revolve_cut_all_intersecting(angle, axis_pt, axis_d, profiles)
+            self._do_revolve_cut_all_intersecting(angle, axis_pt, axis_d, profiles,
+                                                  side)
             new_idx = self.history.cursor
             ok, err, _ = self.history.replay_all_from(new_idx + 1)
             if not ok:
@@ -708,7 +735,7 @@ class RevolveMixin:
             return
 
         self._commit_revolve_edit(editing_idx, self._build_revolve_op(
-            profiles, angle, axis_pt, axis_d, merge_body_id, is_cut))
+            profiles, angle, axis_pt, axis_d, merge_body_id, is_cut, side))
 
     def _delete_revolve_edit_group(self, idx: int) -> list:
         """Seek to idx-1, delete the group, remove created bodies (shared

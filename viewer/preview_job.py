@@ -105,11 +105,12 @@ def job_for(owner, attr: str, on_done: Callable, name: str,
 # starves the UI thread (GIL convoy).
 
 @offload()
-def revolve_preview_meshes(faces, axis_pt, axis_d, angle):
-    """Packed preview (see pack_preview) of every face revolved."""
+def revolve_preview_meshes(faces, axis_pt, axis_d, angle, side=1):
+    """Packed preview (see pack_preview) of every face revolved (one side of
+    the axis where it runs through a face, see RevolveOp.axis_side)."""
     from cad.operations.revolve import _do_revolve_solid
     meshes = [preview_mesh_data(
-                  _do_revolve_solid(f, axis_pt, axis_d, angle).wrapped, 1.0)
+                  _do_revolve_solid(f, axis_pt, axis_d, angle, side).wrapped, 1.0)
               for f in faces]
     return pack_preview([m[0] for m in meshes], [m[1] for m in meshes])
 

@@ -10,7 +10,7 @@ from cad.prefs import prefs
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QButtonGroup, QRadioButton, QFrame, QSizePolicy,
+    QButtonGroup, QRadioButton, QFrame, QSizePolicy, QCheckBox,
 )
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 from gui.fillet3d_panel import _adaptive_delay
@@ -220,6 +220,15 @@ class RevolvePanel(QWidget):
         axis_reset_row.addWidget(reset_axis_btn)
         root.addLayout(axis_reset_row)
 
+        # Shown only while the axis runs through a profile: which side of
+        # the axis is revolved (set_side_visible, from the viewport preview).
+        self._side_chk = QCheckBox("Other side of axis")
+        self._side_chk.setToolTip("The axis runs through the profile: only the "
+                                  "part on one side of it is revolved")
+        self._side_chk.toggled.connect(self._emit_preview)
+        self._side_chk.setVisible(False)
+        root.addWidget(self._side_chk)
+
         root.addWidget(self._separator())
 
         # ── Angle ─────────────────────────────────────────────────────
@@ -358,6 +367,20 @@ class RevolvePanel(QWidget):
         if self._axis_dir is None:
             return None
         return -self._axis_dir if self._flip else self._axis_dir
+
+    def axis_side(self) -> int:
+        """+1 / -1: the side of the axis revolved when it crosses the profile
+        (see RevolveOp.axis_side).  Relative to the effective axis direction,
+        so flipping the direction keeps the same half."""
+        side = -1 if self._side_chk.isChecked() else 1
+        return -side if self._flip else side
+
+    def set_axis_side(self, side: int):
+        """Reopen: *side* relative to the axis as set (flip off)."""
+        self._side_chk.setChecked((side == -1) != bool(self._flip))
+
+    def set_side_visible(self, visible: bool):
+        self._side_chk.setVisible(bool(visible))
 
     def _on_flip(self, checked: bool):
         self._flip = checked
