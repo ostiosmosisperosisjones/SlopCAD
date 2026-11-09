@@ -70,11 +70,15 @@ def shell_body(body_occ, face_occs: list, thickness: float,
             removed.Append(f)
         shape = None
         expect = (_area(s) - sum(_area(f) for f in faces)) * thickness
-        for join in (GeomAbs_Arc, GeomAbs_Intersection):
+        # Intersection=True (offset faces intersected with all others, not
+        # just neighbours) is slower but builds bodies the default misses,
+        # e.g. a union whose coplanar faces were left unmerged.
+        for join, inter in ((GeomAbs_Arc, False), (GeomAbs_Intersection, False),
+                            (GeomAbs_Arc, True), (GeomAbs_Intersection, True)):
             mk = BRepOffsetAPI_MakeThickSolid()
             try:
                 mk.MakeThickSolidByJoin(s, removed, offset, 1e-4,
-                                        BRepOffset_Skin, False, False, join)
+                                        BRepOffset_Skin, inter, False, join)
                 mk.Build()
             except Exception:
                 continue
