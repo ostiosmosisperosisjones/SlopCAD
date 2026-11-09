@@ -338,6 +338,9 @@ class Viewport(AsyncOpMixin, SketchPickMixin, SketchModalMixin, HistoryMixin, Ex
             self._body_visible.setdefault(
                 body_id, body.visible if body is not None else True)
         self.doneCurrent()
+        # Sketch faces too: a just-opened project's sketches must be pickable
+        # without waiting for some history mutation to build them.
+        self._rebuild_sketch_faces()
         self._schedule_refine()
 
     def set_body_visible(self, body_id: str, visible: bool):
