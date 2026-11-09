@@ -255,6 +255,11 @@ class SketchModalMixin:
             entries = self.history.entries
             if editing_idx < len(entries):
                 entries[editing_idx].params["sketch_entry"] = new_se
+                # Replay runs entry.op: left on the old SketchEntry, every
+                # later replay (parameter edits, include follows) updated a
+                # copy nothing shows or saves.
+                if hasattr(entries[editing_idx].op, "sketch_entry"):
+                    entries[editing_idx].op.sketch_entry = new_se
                 self._sketch = None
                 self._editing_sketch_history_idx = None
                 self.sketch_mode_changed.emit(False)

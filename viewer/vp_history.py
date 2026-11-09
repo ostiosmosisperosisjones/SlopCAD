@@ -341,7 +341,27 @@ class HistoryMixin:
                 print("[Params] Parameters > Restore last working values "
                       "gets back to the last good build")
         self._rebuild_bodies(mutated)
+        self._refresh_open_sketch_params()
         self.history_changed.emit()
+
+    def _refresh_open_sketch_params(self):
+        """A sketch open for editing is a copy of its entry: replay doesn't
+        reach it, so re-resolve its parameter-bound dimensions here, or it
+        keeps showing (and on finish, commits) the old values."""
+        mode = getattr(self, "_sketch", None)
+        if mode is None or not any(getattr(c, "expr", None) for c in mode.constraints):
+            return
+        from cad.sketch import SketchEntry
+        from cad.history import _resolve_bound_dimensions
+        tmp = SketchEntry.from_sketch_mode(mode)
+        ok, err = _resolve_bound_dimensions(tmp, self.history)
+        if not ok:
+            print(f"[Params] Open sketch: {err}")
+            return
+        mode.entities, mode.constraints = tmp.entities, tmp.constraints
+        self._rebuild_sketch_faces()
+        self.sketch_mode_changed.emit(True)
+        self.update()
 
     def param_restore_good(self) -> str | None:
         """Undoable: back to the last parameter values that built cleanly.
