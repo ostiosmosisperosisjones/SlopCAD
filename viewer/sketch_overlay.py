@@ -1289,6 +1289,18 @@ class SketchOverlay:
                 entry.entities, [j],
                 entry.plane_origin, entry.plane_x_axis, entry.plane_y_axis,
                 px_per_mm))
+        # Included edges hover / select like drawn lines (their normal look
+        # is _draw_committed_references').
+        for j, ent in enumerate(entry.entities):
+            if (not isinstance(ent, ReferenceEntity) or len(ent.points) < 2
+                    or not (j in sel or j == hov_entity_idx)):
+                continue
+            glColor4f(*(prefs.edge_selected_color if j in sel
+                        else prefs.edge_hovered_color), 1.0)
+            glBegin(GL_LINE_STRIP)
+            for q in ent.points:
+                glVertex3f(*self._pt_from_entry(entry, q[0], q[1]))
+            glEnd()
         glLineWidth(1.0)
 
     def _draw_committed_references(self, entry):

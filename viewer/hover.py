@@ -297,7 +297,8 @@ class HoverState:
         self._sk_stage = []
         if history is not None:
             self._add_sketch_edges(history, _project,
-                                   skip_idx=editing_sketch_idx)
+                                   skip_idx=editing_sketch_idx,
+                                   refs=active_sketch is None)
 
         if active_sketch is not None:
             self._add_active_sketch_edges(active_sketch, _project)
@@ -307,13 +308,14 @@ class HoverState:
         self._ready = True
 
     @staticmethod
-    def _entity_uv_polys(entities):
-        """Return [(entity_idx, (P,2) uv polyline)] for hoverable entities.
+    def _entity_uv_polys(entities, refs: bool = False):
+        """Return [(entity_idx, (P,2) uv polyline)] for hoverable entities;
+        with *refs*, included edges (ReferenceEntity polylines) too.
 
         All arcs are tessellated in one batched trig evaluation — with traced
         sketches (hundreds of arcs) per-arc tessellation dominates rebuild().
         """
-        from cad.sketch import LineEntity, ArcEntity, SplineEntity
+        from cad.sketch import LineEntity, ArcEntity, SplineEntity, ReferenceEntity
         n_seg = HOVER_CURVE_SEGMENTS
         out = []
         arc_js, arc_params = [], []
@@ -326,6 +328,8 @@ class HoverState:
                                    ent.start_angle, ent.end_angle))
             elif isinstance(ent, SplineEntity):
                 out.append((j, ent.tessellate_np(n_seg)))
+            elif refs and isinstance(ent, ReferenceEntity) and len(ent.points) >= 2:
+                out.append((j, np.array([q[:2] for q in ent.points], dtype=np.float64)))
         if arc_js:
             P  = np.array(arc_params, dtype=np.float64)
             t  = np.linspace(0.0, 1.0, n_seg + 1)
@@ -337,12 +341,15 @@ class HoverState:
         return out
 
     def _stage_entry_edges(self, history_idx, entities,
-                           origin, x_axis, y_axis):
+                           origin, x_axis, y_axis, refs=False):
         """Convert one sketch's entities to world polylines and stage them
         for the batched projection pass.  Returns per-line/arc endpoint world
         points (for the sketch-vertex cache)."""
         from cad.sketch import LineEntity, ArcEntity
-        polys = list(self._entity_uv_polys(entities))
+        # refs: committed sketches' includes hover and pick like drawn lines
+        # (a revolve axis, a sweep path) — only while no sketch is open, where
+        # one lying on a body edge would steal that edge from Include.
+        polys = list(self._entity_uv_polys(entities, refs=refs))
         if not polys:
             return []
         counts  = [len(p) for _, p in polys]
@@ -390,8 +397,9 @@ class HoverState:
         self._skb_b3 = pts3d[1:][valid]
         self._skb_seg_ent = ent_id[:-1][valid]
 
-    def _add_sketch_edges(self, history, project_fn, skip_idx=None):
-        """Stage committed sketch LineEntity/ArcEntity objects for the hover cache."""
+    def _add_sketch_edges(self, history, project_fn, skip_idx=None, refs=False):
+        """Stage committed sketch LineEntity/ArcEntity objects for the hover
+        cache; with *refs*, their included edges too."""
         cursor = history.cursor
         for i, entry in enumerate(history.entries):
             if i > cursor:
@@ -407,7 +415,7 @@ class HoverState:
                 continue
             endpoints = self._stage_entry_edges(
                 i, se.entities,
-                se.plane_origin, se.plane_x_axis, se.plane_y_axis)
+                se.plane_origin, se.plane_x_axis, se.plane_y_axis, refs=refs)
             if endpoints:
                 vtx_3d = np.array(endpoints, dtype=np.float32)
                 vtx_2d = project_fn(vtx_3d)
